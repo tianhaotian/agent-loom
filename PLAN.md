@@ -327,4 +327,4 @@ Kafka、NATS 或 Redis Streams 可以在高吞吐事件分发时引入，但必�
 4. 评审并冻结 [ADAPTER_CONTRACT.md](./ADAPTER_CONTRACT.md)，实现 adapter-core trait 与 Fake Server conformance harness。
 5. 评审并冻结 [E2E_SCENARIO.md](./E2E_SCENARIO.md)，据此生成 Workflow fixture、Artifact Schema 和 E2E 测试夹具。
 6. 评审并冻结 [MIGRATION_DESIGN.md](./MIGRATION_DESIGN.md)，生成 PostgreSQL/MySQL 首批迁移和 schema snapshot 测试。
-7. 在已初始化的 Rust workspace 中实现 PostgreSQL `0001`–`0003` 迁移、事务命令骨架与 Mock Agent Server，跑通最小垂直链路，再实现 MySQL 对等 Provider。
+7. 继续实现 PostgreSQL/MySQL `0004_stage_task_checkpoint`，接入 migration runner 与真实数据库 smoke test；随后实现 PostgreSQL 事务命令骨架和 Mock Agent Server，跑通最小垂直链路。
