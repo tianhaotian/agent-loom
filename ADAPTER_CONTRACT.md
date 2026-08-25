@@ -717,4 +717,4 @@ crates/adapter-core/src/error.rs
 crates/adapter-core/src/conformance/
 ```
 
-下一份设计文档 `E2E_SCENARIO.md` 应使用本文规范化能力描述业产研交付，不在 Workflow 中直接写 OpenClaw/Hermes/OpenAI 私有状态或端点。
+[E2E_SCENARIO.md](./E2E_SCENARIO.md) 使用本文规范化能力描述业产研交付，不在 Workflow 中直接写 OpenClaw/Hermes/OpenAI 私有状态或端点。

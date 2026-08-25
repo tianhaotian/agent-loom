@@ -215,14 +215,17 @@ policy_json, started_at, completed_at, created_at, updated_at
 
 ```text
 artifact_id, tenant_id, run_id, stage_execution_id, task_id,
-logical_key, kind, version, uri, digest, media_type, size_bytes,
-metadata_json, produced_by, created_event_id, created_at
+logical_key, kind, contract_version, version, uri, digest, media_type,
+size_bytes, source_artifact_refs_json, metadata_json, produced_by,
+created_event_id, created_at
 ```
 
 - ArtifactRef 只保存引用与完整性元数据，不默认保存代码、设计稿、构建包等大对象。
 - 唯一：`(tenant_id, run_id, logical_key, version)`。
 - `digest` 基于产物内容或外部系统可验证摘要。
+- `contract_version` 固定结构化产物 schema；`source_artifact_refs_json` 保存确定版本的数据血缘引用。
 - ArtifactRef 创建后不可原地覆盖；新内容创建新 version。
+- 首个业产研场景的 logical key、需求等价模型、产物 schema 与追踪约束以 [E2E_SCENARIO.md](./E2E_SCENARIO.md) 为准。
 - URI 返回客户端前必须经过授权检查，敏感 URI 应使用短期签名或间接资源 ID。
 
 推荐索引：

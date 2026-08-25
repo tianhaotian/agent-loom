@@ -264,6 +264,8 @@ POST /v1/runs/{run_id}/cancel
 - 部署属于受控外部副作用，必须记录环境、版本、审批、幂等键、结果与回滚/补偿信息。
 - 首个版本不要求内建原型工具、代码托管和 CI/CD 平台，允许通过 Tool Adapter 或 Agent Server Adapter 对接。
 
+阶段键、需求等价模型、Artifact Contract、质量门禁、返工规则与端到端验收路径以 [E2E_SCENARIO.md](./E2E_SCENARIO.md) 为准。
+
 ## 6. 服务与分布式部署要求
 
 ### 6.1 无状态原则

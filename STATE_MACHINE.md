@@ -256,6 +256,8 @@ planned → active → waiting_approval → succeeded
 
 StageExecution 的业务状态与 Task 技术执行状态分离。一个 Stage 可以包含多个 Task；Task 成功不等于 Stage 成功，必须满足阶段 Artifact Contract 和质量门禁。
 
+下游门禁失败或需求变更要求重做已成功阶段时，不把历史 `succeeded` StageExecution 改回非终态；系统创建相同 `stage_key`、递增 attempt 且关联 parent/causation 的新 StageExecution。Run 完成判定使用每个必需 stage_key 的最新有效 attempt，并验证其输入 Artifact version 未被后续变更失效。
+
 ## 7. WaitSubscription 状态机
 
 ```text
@@ -438,4 +440,4 @@ perform best-effort remote stop after commit
 - `DOMAIN_MODEL.md`：落实字段、关系、索引与唯一约束；
 - [STORE_CONTRACT.md](./STORE_CONTRACT.md)：把事务转换表达为 Rust trait、命令、错误类型和可靠后置动作；
 - [ADAPTER_CONTRACT.md](./ADAPTER_CONTRACT.md)：细化 ToolExecution/AgentExecution 的能力协商与恢复协议；
-- `E2E_SCENARIO.md`：把业产研交付路径映射到 Stage、Task、Wait、Artifact 与 Event。
+- [E2E_SCENARIO.md](./E2E_SCENARIO.md)：把业产研交付路径映射到 Stage、Task、Wait、Artifact 与 Event。
