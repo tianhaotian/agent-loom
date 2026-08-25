@@ -327,4 +327,4 @@ Kafka、NATS 或 Redis Streams 可以在高吞吐事件分发时引入，但必�
 4. 评审并冻结 [ADAPTER_CONTRACT.md](./ADAPTER_CONTRACT.md)，实现 adapter-core trait 与 Fake Server conformance harness。
 5. 评审并冻结 [E2E_SCENARIO.md](./E2E_SCENARIO.md)，据此生成 Workflow fixture、Artifact Schema 和 E2E 测试夹具。
 6. 评审并冻结 [MIGRATION_DESIGN.md](./MIGRATION_DESIGN.md)，生成 PostgreSQL/MySQL 首批迁移和 schema snapshot 测试。
-7. 继续实现 PostgreSQL/MySQL `0006_external_executions`，为 migration runner 接入 Provider executor 与真实数据库 smoke test；随后实现 PostgreSQL `create_run/claim_task/complete_task` 事务路径和 Mock Agent Server，跑通最小垂直链路。
+7. 为 migration runner 接入 PostgreSQL Provider executor 与真实数据库 smoke test，实现 PostgreSQL `create_run/claim_task/complete_task` 事务路径和 Mock Agent Server；通过 conformance 后补齐 MySQL 对等实现，再按部署需求启用可选 `0007_outbox` 与 `0008_runtime_grants`。

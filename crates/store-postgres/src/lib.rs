@@ -49,6 +49,17 @@ pub const MIGRATIONS: &[EmbeddedMigration] = &[
         created_tables: &["wait_subscriptions", "artifact_refs"],
         sql: include_str!("../migrations/0005_wait_artifact.sql"),
     },
+    EmbeddedMigration {
+        logical_id: "0006_external_executions",
+        logical_model_version: 7,
+        created_tables: &[
+            "tool_executions",
+            "tool_execution_attempts",
+            "agent_executions",
+            "agent_event_receipts",
+        ],
+        sql: include_str!("../migrations/0006_external_executions.sql"),
+    },
 ];
 
 pub const fn capabilities() -> StoreCapabilities {
@@ -81,12 +92,13 @@ mod tests {
 
     #[test]
     fn migration_batch_is_embedded() {
-        assert_eq!(MIGRATIONS.len(), 6);
+        assert_eq!(MIGRATIONS.len(), 7);
         assert_eq!(MIGRATIONS[0].logical_id, "0000_migration_meta");
         assert!(MIGRATIONS[0].sql.contains("schema_migrations"));
         assert!(MIGRATIONS[0].sql.contains("timestamptz(6)"));
         assert!(MIGRATIONS[3].sql.contains("terminal_event_id"));
         assert!(MIGRATIONS[4].sql.contains("lease_token"));
         assert!(MIGRATIONS[5].sql.contains("active_slot"));
+        assert!(MIGRATIONS[6].sql.contains("agent_event_receipts"));
     }
 }

@@ -1,4 +1,6 @@
-use agent_loom_domain::{AgentExecutionId, EventId, RunId, TaskId, TaskSnapshot, UnixMicros};
+use agent_loom_domain::{
+    AgentExecutionId, EventId, RunId, TaskId, TaskSnapshot, ToolExecutionId, UnixMicros,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CommandDisposition {
@@ -12,6 +14,8 @@ pub enum DurableFollowUp {
     Task { task_id: TaskId },
     ReconcileAgent { execution_id: AgentExecutionId },
     StopAgent { execution_id: AgentExecutionId },
+    ReconcileTool { execution_id: ToolExecutionId },
+    CompensateTool { execution_id: ToolExecutionId },
     ScanDueWork { not_before: UnixMicros },
 }
 

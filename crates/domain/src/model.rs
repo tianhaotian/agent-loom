@@ -1,7 +1,8 @@
 use crate::{
-    ArtifactId, CheckpointId, Digest, EventId, JsonPayload, LogicalKey, RunId, RunStatus,
-    StageExecutionId, TaskId, TaskStatus, TenantId, UnixMicros, WaitId, WaitStatus,
-    WorkflowVersionId,
+    AgentEventReceiptId, AgentExecutionId, AgentExecutionStatus, AgentVersionId, ArtifactId,
+    CheckpointId, Digest, EndpointId, EventId, JsonPayload, LogicalKey, RunId, RunStatus,
+    StageExecutionId, TaskId, TaskStatus, TenantId, ToolExecutionId, ToolExecutionStatus,
+    UnixMicros, WaitId, WaitStatus, WorkflowVersionId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +124,61 @@ pub struct ArtifactRefSnapshot {
     pub created_at: UnixMicros,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolExecutionSnapshot {
+    pub tenant_id: TenantId,
+    pub tool_execution_id: ToolExecutionId,
+    pub run_id: RunId,
+    pub stage_execution_id: Option<StageExecutionId>,
+    pub task_id: TaskId,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub status: ToolExecutionStatus,
+    pub attempt_count: u32,
+    pub external_ref: Option<String>,
+    pub recovery_action: Option<String>,
+    pub updated_at: UnixMicros,
+}
+
+impl ToolExecutionSnapshot {
+    pub fn recovery_invariant_holds(&self) -> bool {
+        self.status != ToolExecutionStatus::OutcomeUnknown || self.recovery_action.is_some()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentExecutionSnapshot {
+    pub tenant_id: TenantId,
+    pub agent_execution_id: AgentExecutionId,
+    pub run_id: RunId,
+    pub stage_execution_id: Option<StageExecutionId>,
+    pub task_id: TaskId,
+    pub endpoint_id: EndpointId,
+    pub agent_version_id: AgentVersionId,
+    pub status: AgentExecutionStatus,
+    pub version: u64,
+    pub remote_run_ref: Option<String>,
+    pub remote_session_ref: Option<String>,
+    pub event_cursor: Option<String>,
+    pub cursor_version: u64,
+    pub updated_at: UnixMicros,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentEventReceiptRecord {
+    pub tenant_id: TenantId,
+    pub receipt_id: AgentEventReceiptId,
+    pub agent_execution_id: AgentExecutionId,
+    pub run_id: RunId,
+    pub dedupe_key: Digest,
+    pub source_event_id: Option<String>,
+    pub source_sequence: Option<u64>,
+    pub event_kind: String,
+    pub raw_digest: Digest,
+    pub local_event_id: Option<EventId>,
+    pub recorded_at: UnixMicros,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +224,24 @@ mod tests {
         wait.active_slot = None;
         wait.consumed_by_event_id = Some(EventId::from_bytes([6; 16]));
         assert!(wait.active_slot_invariant_holds());
+    }
+
+    #[test]
+    fn unknown_tool_outcome_requires_recovery_action() {
+        let snapshot = ToolExecutionSnapshot {
+            tenant_id: TenantId::from_bytes([1; 16]),
+            tool_execution_id: ToolExecutionId::from_bytes([2; 16]),
+            run_id: RunId::from_bytes([3; 16]),
+            stage_execution_id: None,
+            task_id: TaskId::from_bytes([4; 16]),
+            tool_call_id: "deploy".to_owned(),
+            tool_name: "devops.deploy".to_owned(),
+            status: ToolExecutionStatus::OutcomeUnknown,
+            attempt_count: 1,
+            external_ref: None,
+            recovery_action: None,
+            updated_at: UnixMicros::new(10),
+        };
+        assert!(!snapshot.recovery_invariant_holds());
     }
 }

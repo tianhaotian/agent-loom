@@ -432,7 +432,7 @@ MySQL 8.x 与 PostgreSQL 均支持降序 B-tree key；若某受支持版本的 p
 - UNIQUE `(tenant_id, run_id, sequence)`；
 - FK run、Workflow version、Agent version 和 created Event；
 - `sequence >= 1`、`execution_generation >= 0`；
-- immutable insert-only；
+- 外部调用前 insert，结果返回后以 `request_finished_at IS NULL` 条件 finalize 一次；finalize 后不可修改，禁止 delete；
 - 索引 `(tenant_id, run_id, created_at, checkpoint_id)`。
 
 `runs.current_checkpoint_id` 使用 `(tenant_id, run_id, current_checkpoint_id)` 复合 FK，更新必须与新 Checkpoint 插入同事务，且领域条件要求新 sequence 大于旧 sequence。数据库 FK 保证同 Run 归属，不保证单调性。

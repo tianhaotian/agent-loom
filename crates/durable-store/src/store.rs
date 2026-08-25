@@ -1,10 +1,12 @@
 use std::{future::Future, pin::Pin};
 
-use agent_loom_domain::{RunId, RunSnapshot};
+use agent_loom_domain::{AgentExecutionSnapshot, RunId, RunSnapshot, ToolExecutionSnapshot};
 
 use crate::{
-    ApplyEvent, ClaimTask, ClaimedTask, Committed, CompleteTask, ControlRun, CreateRun,
-    EventCursor, EventPage, FailTask, QueryContext, RenewTaskLease, StoreResult,
+    AgentEventBatchOutcome, AppendAgentEvents, ApplyEvent, ClaimTask, ClaimedTask, Committed,
+    CompleteTask, ControlRun, CreateRun, EventCursor, EventPage, FailTask, PrepareAgentExecution,
+    PrepareToolExecution, QueryContext, RecordAgentOutcome, RecordAgentSubmission,
+    RecordToolOutcome, RenewTaskLease, StoreResult,
 };
 
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = StoreResult<T>> + Send + 'a>>;
@@ -79,6 +81,42 @@ pub trait DurableStore: Send + Sync {
         context: &'a crate::CommandContext,
         command: ApplyEvent,
     ) -> StoreFuture<'a, Committed<RunSnapshot>>;
+
+    fn prepare_tool_execution<'a>(
+        &'a self,
+        context: &'a crate::CommandContext,
+        command: PrepareToolExecution,
+    ) -> StoreFuture<'a, Committed<ToolExecutionSnapshot>>;
+
+    fn record_tool_outcome<'a>(
+        &'a self,
+        context: &'a crate::CommandContext,
+        command: RecordToolOutcome,
+    ) -> StoreFuture<'a, Committed<ToolExecutionSnapshot>>;
+
+    fn prepare_agent_execution<'a>(
+        &'a self,
+        context: &'a crate::CommandContext,
+        command: PrepareAgentExecution,
+    ) -> StoreFuture<'a, Committed<AgentExecutionSnapshot>>;
+
+    fn record_agent_submission<'a>(
+        &'a self,
+        context: &'a crate::CommandContext,
+        command: RecordAgentSubmission,
+    ) -> StoreFuture<'a, Committed<AgentExecutionSnapshot>>;
+
+    fn append_agent_events<'a>(
+        &'a self,
+        context: &'a crate::CommandContext,
+        command: AppendAgentEvents,
+    ) -> StoreFuture<'a, Committed<AgentEventBatchOutcome>>;
+
+    fn record_agent_outcome<'a>(
+        &'a self,
+        context: &'a crate::CommandContext,
+        command: RecordAgentOutcome,
+    ) -> StoreFuture<'a, Committed<AgentExecutionSnapshot>>;
 
     fn pause_run<'a>(
         &'a self,

@@ -88,6 +88,16 @@ pub enum ToolExecutionStatus {
     ManualReview,
 }
 
+impl ToolExecutionStatus {
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Compensated)
+    }
+
+    pub const fn requires_reconciliation(self) -> bool {
+        matches!(self, Self::OutcomeUnknown | Self::Reconciling)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AgentExecutionStatus {
     Planned,
@@ -102,6 +112,16 @@ pub enum AgentExecutionStatus {
     ManualReview,
 }
 
+impl AgentExecutionStatus {
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+
+    pub const fn requires_reconciliation(self) -> bool {
+        matches!(self, Self::OutcomeUnknown | Self::Reconciling)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +132,14 @@ mod tests {
         assert!(RunStatus::Cancelled.is_terminal());
         assert!(!RunStatus::Paused.is_terminal());
         assert!(!RunStatus::Running.is_terminal());
+    }
+
+    #[test]
+    fn external_execution_terminal_and_reconciliation_sets_are_explicit() {
+        assert!(ToolExecutionStatus::Compensated.is_terminal());
+        assert!(ToolExecutionStatus::OutcomeUnknown.requires_reconciliation());
+        assert!(AgentExecutionStatus::Cancelled.is_terminal());
+        assert!(AgentExecutionStatus::Reconciling.requires_reconciliation());
+        assert!(!AgentExecutionStatus::ManualReview.is_terminal());
     }
 }

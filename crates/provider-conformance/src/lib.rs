@@ -25,6 +25,10 @@ mod tests {
         "checkpoints",
         "wait_subscriptions",
         "artifact_refs",
+        "tool_executions",
+        "tool_execution_attempts",
+        "agent_executions",
+        "agent_event_receipts",
     ];
 
     #[test]
@@ -147,6 +151,28 @@ mod tests {
             assert!(sql.contains("tenant_id, run_id, logical_key, version"));
             assert!(sql.contains("source_artifact_refs_json"));
             assert!(sql.contains("ix_artifacts__digest"));
+        }
+    }
+
+    #[test]
+    fn external_execution_idempotency_and_recovery_are_portable() {
+        for migrations in [postgres::MIGRATIONS, mysql::MIGRATIONS] {
+            let sql = migrations[6].sql;
+            assert!(sql.contains("uq_tool_execs__idempotency"));
+            assert!(sql.contains("status <> 'outcome_unknown'"));
+            assert!(sql.contains("uq_agent_execs__idempotency"));
+            assert!(sql.contains("uq_agent_execs__remote_run"));
+        }
+    }
+
+    #[test]
+    fn agent_event_deduplication_and_cursor_indexes_are_portable() {
+        for migrations in [postgres::MIGRATIONS, mysql::MIGRATIONS] {
+            let sql = migrations[6].sql;
+            assert!(sql.contains("uq_agent_receipts__dedupe"));
+            assert!(sql.contains("tenant_id, agent_execution_id, dedupe_key"));
+            assert!(sql.contains("ix_agent_receipts__source_sequence"));
+            assert!(sql.contains("cursor_version"));
         }
     }
 
