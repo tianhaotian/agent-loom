@@ -15,7 +15,7 @@ crates/store-mysql     MySQL/InnoDB Provider 与物理迁移
 
 当前阶段先保持核心 crate 零外部依赖，冻结领域和事务边界；数据库驱动、异步运行时和 HTTP 实现将在 Provider conformance harness 建立后接入。
 
-已实现 `0000_migration_meta` 至 `0003_run_event_idempotency` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event 与 CommandReceipt。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 归属约束、身份键排序规则和 MySQL 强制 CHECK；真实数据库迁移 smoke test 将由后续 migration runner 与 CI 数据库环境执行。
+已实现 `0000_migration_meta` 至 `0004_stage_task_checkpoint` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt 与 Checkpoint。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、claim 索引、身份键排序规则和 MySQL 强制 CHECK；真实数据库迁移 smoke test 将由后续 migration runner 与 CI 数据库环境执行。
 
 ## 设计文档
 

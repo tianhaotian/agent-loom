@@ -19,6 +19,10 @@ mod tests {
         "runs",
         "events",
         "command_receipts",
+        "stage_executions",
+        "tasks",
+        "task_attempts",
+        "checkpoints",
     ];
 
     #[test]
@@ -93,6 +97,30 @@ mod tests {
             assert!(sql.contains("fk_runs__terminal_event"));
             assert!(sql.contains("tenant_id, run_id, terminal_event_id"));
             assert!(sql.contains("tenant_id, run_id, event_id"));
+        }
+    }
+
+    #[test]
+    fn task_lease_and_checkpoint_ownership_are_enforced_by_both_providers() {
+        for migrations in [postgres::MIGRATIONS, mysql::MIGRATIONS] {
+            let sql = migrations[4].sql;
+            assert!(sql.contains("ck_tasks__lease"));
+            assert!(sql.contains("status = 'leased' AND lease_owner IS NOT NULL"));
+            assert!(sql.contains("fk_runs__current_checkpoint"));
+            assert!(sql.contains("tenant_id, run_id, current_checkpoint_id"));
+            assert!(sql.contains("tenant_id, run_id, checkpoint_id"));
+            assert!(sql.contains("fk_runs__parent_task"));
+            assert!(sql.contains("tenant_id, parent_run_id, parent_task_id"));
+        }
+    }
+
+    #[test]
+    fn task_claim_indexes_preserve_portable_ordering() {
+        for migrations in [postgres::MIGRATIONS, mysql::MIGRATIONS] {
+            let sql = migrations[4].sql;
+            assert!(sql.contains("ix_tasks__claim_global"));
+            assert!(sql.contains("status, available_at, priority DESC, task_id"));
+            assert!(sql.contains("ix_tasks__lease_reclaim"));
         }
     }
 

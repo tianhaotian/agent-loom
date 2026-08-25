@@ -422,7 +422,7 @@ MySQL 8.x 与 PostgreSQL 均支持降序 B-tree key；若某受支持版本的 p
 - UNIQUE `(tenant_id, task_id, attempt)`；
 - FK `(tenant_id, task_id) → tasks`、`(tenant_id, run_id) → runs`；
 - `attempt >= 1`；
-- immutable insert-only；
+- 领取时 insert，结束时以 `finished_at IS NULL` 和 Lease 证明条件 finalize 一次；finalize 后不可修改，禁止 delete；
 - 查询索引 `(tenant_id, run_id, task_id, attempt)`。
 
 ### 9.4 `checkpoints`

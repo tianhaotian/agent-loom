@@ -282,7 +282,7 @@ Provider 可以调整 priority 的物理排序方向，但领取结果必须遵�
 
 ### 7.2 `task_attempts`
 
-追加记录每次领取和执行结果：
+每次领取追加一行，并在同一 Lease 所有权下至多完成一次 finalize：
 
 ```text
 task_attempt_id, tenant_id, task_id, run_id, attempt,
@@ -290,7 +290,7 @@ worker_id, lease_token_digest, claimed_at, lease_expires_at,
 finished_at, outcome, error_code, metrics_json
 ```
 
-唯一：`(tenant_id, task_id, attempt)`。Lease token 只保存摘要用于审计，当前有效 token 保存在 Task 热行中。
+唯一：`(tenant_id, task_id, attempt)`。Lease token 只保存摘要用于审计，当前有效 token 保存在 Task 热行中。领取时 `finished_at/outcome` 为空；完成、失败、Lease 过期回收或取消时，以 `finished_at IS NULL` 条件更新一次。finalize 后禁止再次修改，普通 Runtime 禁止删除。
 
 ## 8. Event、Checkpoint 与幂等
 

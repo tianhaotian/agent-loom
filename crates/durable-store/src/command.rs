@@ -1,7 +1,8 @@
 use agent_loom_domain::{
-    AgentVersionId, CheckpointId, CommandId, CorrelationId, Digest, DurationMicros, EventId,
-    IdempotencyKey, JsonPayload, LeaseToken, LogicalKey, RunId, ScopeKey, StageExecutionId, TaskId,
-    TaskKind, TenantId, UnixMicros, WorkerId, WorkflowVersionId,
+    AgentVersionId, ArtifactId, CheckpointId, CommandId, CorrelationId, Digest, DurationMicros,
+    EventId, IdempotencyKey, JsonPayload, LeaseToken, LogicalKey, RunId, RunStatus, ScopeKey,
+    StageExecutionId, StageStatus, TaskId, TaskKind, TenantId, UnixMicros, WaitId, WorkerId,
+    WorkflowVersionId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,7 +58,7 @@ pub struct CreateRun {
     pub input: JsonPayload,
     pub deadline: Option<UnixMicros>,
     pub initial_event_id: EventId,
-    pub initial_checkpoint_id: CheckpointId,
+    pub initial_checkpoint: NewCheckpoint,
     pub initial_tasks: Vec<InitialTask>,
 }
 
@@ -81,8 +82,181 @@ pub struct CompleteTask {
     pub expected_run: ExpectedRun,
     pub lease: LeaseProof,
     pub completion_event_id: EventId,
+    pub checkpoint: NewCheckpoint,
+    pub task_result: TaskResult,
+    pub stage_mutation: Option<StageMutation>,
+    pub artifacts: Vec<NewArtifactRef>,
+    pub next: NextActions,
+}
+
+impl CompleteTask {
+    /// Validates invariants that do not require authoritative database state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompletionShapeError`] when event ownership, generation
+    /// fencing, checkpoint metadata, or a requested terminal result is invalid.
+    pub fn validate_shape(&self) -> Result<(), CompletionShapeError> {
+        if self.checkpoint.created_event_id != self.completion_event_id
+            || self
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.created_event_id != self.completion_event_id)
+            || self.next.created_event_mismatch(self.completion_event_id)
+        {
+            return Err(CompletionShapeError::CreatedEventMismatch);
+        }
+
+        if self.checkpoint.sequence == 0 || self.checkpoint.schema_version == 0 {
+            return Err(CompletionShapeError::InvalidCheckpointMetadata);
+        }
+
+        let generation = self.lease.execution_generation;
+        if self.checkpoint.execution_generation != generation
+            || self
+                .expected_run
+                .execution_generation
+                .is_some_and(|expected| expected != generation)
+            || self.next.generation_mismatch(generation)
+        {
+            return Err(CompletionShapeError::GenerationMismatch);
+        }
+
+        if self
+            .next
+            .final_status()
+            .is_some_and(|status| !status.is_terminal())
+        {
+            return Err(CompletionShapeError::FinishRunRequiresTerminalStatus);
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewCheckpoint {
     pub checkpoint_id: CheckpointId,
-    pub result: JsonPayload,
+    pub sequence: u64,
+    pub schema_version: u32,
+    pub workflow_version_id: Option<WorkflowVersionId>,
+    pub coordinator_agent_version_id: Option<AgentVersionId>,
+    pub execution_generation: u64,
+    pub state: JsonPayload,
+    pub state_digest: Digest,
+    pub created_event_id: EventId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskResult {
+    pub output: JsonPayload,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageMutation {
+    pub stage_execution_id: StageExecutionId,
+    pub expected_version: u64,
+    pub target_status: StageStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewTask {
+    pub task_id: TaskId,
+    pub stage_execution_id: Option<StageExecutionId>,
+    pub logical_key: LogicalKey,
+    pub kind: TaskKind,
+    pub generation: u64,
+    pub based_on_checkpoint_sequence: u64,
+    pub priority: i32,
+    pub available_at: UnixMicros,
+    pub max_attempts: u32,
+    pub input: JsonPayload,
+    pub deadline: Option<UnixMicros>,
+    pub created_event_id: EventId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewWaitSubscription {
+    pub wait_id: WaitId,
+    pub stage_execution_id: Option<StageExecutionId>,
+    pub wait_type: String,
+    pub expected_event_type: String,
+    pub match_key_hash: Digest,
+    pub match_contract: JsonPayload,
+    pub expires_at: Option<UnixMicros>,
+    pub created_event_id: EventId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewRetrySchedule {
+    pub task: NewTask,
+    pub reason_code: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalRunResult {
+    pub status: RunStatus,
+    pub output: JsonPayload,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewArtifactRef {
+    pub artifact_id: ArtifactId,
+    pub stage_execution_id: Option<StageExecutionId>,
+    pub logical_key: LogicalKey,
+    pub kind: String,
+    pub contract_version: u32,
+    pub version: u64,
+    pub uri: String,
+    pub digest: Digest,
+    pub media_type: String,
+    pub size_bytes: u64,
+    pub metadata: JsonPayload,
+    pub produced_by: String,
+    pub created_event_id: EventId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NextActions {
+    Tasks(Vec<NewTask>),
+    Wait(NewWaitSubscription),
+    Retry(NewRetrySchedule),
+    FinishRun(FinalRunResult),
+    NoFurtherWork,
+}
+
+impl NextActions {
+    fn created_event_mismatch(&self, expected: EventId) -> bool {
+        match self {
+            Self::Tasks(tasks) => tasks.iter().any(|task| task.created_event_id != expected),
+            Self::Wait(wait) => wait.created_event_id != expected,
+            Self::Retry(retry) => retry.task.created_event_id != expected,
+            Self::FinishRun(_) | Self::NoFurtherWork => false,
+        }
+    }
+
+    fn generation_mismatch(&self, expected: u64) -> bool {
+        match self {
+            Self::Tasks(tasks) => tasks.iter().any(|task| task.generation != expected),
+            Self::Retry(retry) => retry.task.generation != expected,
+            Self::Wait(_) | Self::FinishRun(_) | Self::NoFurtherWork => false,
+        }
+    }
+
+    const fn final_status(&self) -> Option<RunStatus> {
+        match self {
+            Self::FinishRun(result) => Some(result.status),
+            Self::Tasks(_) | Self::Wait(_) | Self::Retry(_) | Self::NoFurtherWork => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionShapeError {
+    CreatedEventMismatch,
+    InvalidCheckpointMetadata,
+    GenerationMismatch,
+    FinishRunRequiresTerminalStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,4 +290,74 @@ pub struct EventCursor {
     pub run_id: RunId,
     pub after_sequence: u64,
     pub limit: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_task_completion_shape_is_accepted() {
+        assert_eq!(completion().validate_shape(), Ok(()));
+    }
+
+    #[test]
+    fn completion_rejects_non_terminal_finish_and_event_mismatch() {
+        let mut command = completion();
+        command.next = NextActions::FinishRun(FinalRunResult {
+            status: RunStatus::Running,
+            output: json(),
+        });
+        assert_eq!(
+            command.validate_shape(),
+            Err(CompletionShapeError::FinishRunRequiresTerminalStatus)
+        );
+
+        command.next = NextActions::NoFurtherWork;
+        command.checkpoint.created_event_id = EventId::from_bytes([9; 16]);
+        assert_eq!(
+            command.validate_shape(),
+            Err(CompletionShapeError::CreatedEventMismatch)
+        );
+    }
+
+    fn completion() -> CompleteTask {
+        let event_id = EventId::from_bytes([4; 16]);
+        CompleteTask {
+            expected_run: ExpectedRun {
+                run_id: RunId::from_bytes([1; 16]),
+                version: Some(2),
+                execution_generation: Some(3),
+            },
+            lease: LeaseProof {
+                task_id: TaskId::from_bytes([2; 16]),
+                worker_id: WorkerId::from_bytes([3; 16]),
+                token: LeaseToken::from_bytes([5; 32]),
+                execution_generation: 3,
+            },
+            completion_event_id: event_id,
+            checkpoint: NewCheckpoint {
+                checkpoint_id: CheckpointId::from_bytes([6; 16]),
+                sequence: 2,
+                schema_version: 1,
+                workflow_version_id: None,
+                coordinator_agent_version_id: None,
+                execution_generation: 3,
+                state: json(),
+                state_digest: Digest::from_bytes([7; 32]),
+                created_event_id: event_id,
+            },
+            task_result: TaskResult { output: json() },
+            stage_mutation: None,
+            artifacts: Vec::new(),
+            next: NextActions::FinishRun(FinalRunResult {
+                status: RunStatus::Completed,
+                output: json(),
+            }),
+        }
+    }
+
+    fn json() -> JsonPayload {
+        JsonPayload::from_validated_bytes(b"{}".to_vec())
+    }
 }
