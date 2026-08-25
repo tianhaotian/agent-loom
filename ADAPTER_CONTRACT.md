@@ -384,6 +384,8 @@ heartbeat                     # transient
 
 Runtime 把 RemoteEventBatch 交给 `DurableStore.append_agent_events`。本地 Event、AgentExecution cursor、Wait/Task/Artifact 和状态投影必须同事务提交。批次失败时 cursor 不前进。
 
+跨 Provider 的物理去重由 [MIGRATION_DESIGN.md](./MIGRATION_DESIGN.md) 定义的 AgentEventReceipt 守卫承担；Adapter 负责生成稳定 dedupe key，不直接写守卫表。
+
 ## 10. Stop、Pause、Approval 与 Guidance
 
 ### 10.1 Stop

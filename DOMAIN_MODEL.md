@@ -55,7 +55,7 @@ Tenant
     ├── StageExecution
     │   ├── Task ── TaskAttempt
     │   │   ├── ToolExecution ── ToolExecutionAttempt
-    │   │   └── AgentExecution
+    │   │   └── AgentExecution ── AgentEventReceipt
     │   └── ArtifactRef
     ├── Event
     ├── Checkpoint
@@ -303,7 +303,7 @@ correlation_id, causation_id, idempotency_key,
 occurred_at, recorded_at
 ```
 
-- 唯一：`(tenant_id, run_id, sequence)`、`(tenant_id, event_id)`。
+- 唯一：`(tenant_id, run_id, sequence)`、`(tenant_id, event_id)`、`(tenant_id, run_id, event_id)`。
 - Event 创建后禁止 UPDATE；归档与合规删除走独立管理流程。
 - `occurred_at` 是生产者声明时间，`recorded_at` 是数据库接收时间；状态裁决使用后者和数据库当前时间。
 - `causation_id` 指向导致本 Event 的 Event/Command；外部根事件可以为空。
@@ -328,6 +328,7 @@ created_event_id, created_at
 
 - Checkpoint 只追加、不原地更新。
 - 唯一：`(tenant_id, run_id, sequence)`。
+- 候选唯一：`(tenant_id, checkpoint_id)`、`(tenant_id, run_id, checkpoint_id)`，供复合 FK 证明 tenant/Run 归属。
 - `runs.current_checkpoint_id` 只能前进到更大 sequence，普通恢复不得回退。
 - 显式重放或管理员恢复必须产生新 Checkpoint 和审计 Event，不能直接修改 current 指针制造无记录回退。
 - `state_digest` 用于检测损坏和错误迁移，不作为安全签名。
@@ -416,6 +417,23 @@ last_synced_at, created_at, updated_at, completed_at
 
 远程 Agent 进入 running 后，提交 Task 创建 WaitSubscription 或短时 poll Task，并释放 Worker。AgentExecution 的 running 不要求 Run 保持 running；Run 可以投影为 waiting。
 
+### 10.3 `agent_event_receipts`
+
+远程 Event 去重不能依赖 JSON 内 vendor 字段，使用独立守卫表：
+
+```text
+agent_event_receipt_id, tenant_id, agent_execution_id, run_id,
+dedupe_key, source_event_id, source_sequence, source_cursor,
+event_kind, raw_digest, local_event_id, recorded_at
+```
+
+- 唯一：`(tenant_id, agent_execution_id, dedupe_key)`；
+- 候选唯一：`(tenant_id, agent_event_receipt_id)`；
+- `dedupe_key` 是 Adapter 根据远程 event ID，或 sequence/cursor + kind + canonical payload digest 生成的固定摘要；
+- 同一 dedupe key 但 raw digest 不同属于协议冲突，不得视为普通 duplicate；
+- receipt、本地 Event、AgentExecution cursor 和衍生 Artifact/Wait/Task 在同一事务提交；
+- transient/ignored 远程事件可以没有 `local_event_id`，但影响状态的事件必须关联本地 Event。
+
 ## 11. 可选 Outbox
 
 `outbox_messages` 仅在引入消息分发层后启用：
@@ -446,6 +464,7 @@ created_at, published_at
 8. 当前 Checkpoint、terminal Event、Stage、Task、Wait、Artifact 和 Execution 必须属于同一 Run。
 9. Pause/Cancel 后的远程迟到结果可以被记录，但不能更新新 generation 的业务投影。
 10. ToolExecution/AgentExecution 的 outcome_unknown 未解决时，普通 Resume 不得继续可能重复副作用的路径。
+11. 同一 AgentExecution 的远程 dedupe key 只能对应一个 raw digest 和至多一个本地 Event。
 
 数据库 CHECK、UNIQUE 和 FK 只承担单表或简单引用防御；涉及多个当前状态的规则必须由领域事务实现。不得把核心业务状态机隐藏在仅一个 Provider 拥有的触发器或存储过程中。
 
@@ -485,7 +504,7 @@ crates/
 2. runs、events、command_receipts；
 3. stage_executions、tasks、task_attempts、checkpoints；
 4. wait_subscriptions、artifact_refs；
-5. tool_executions/attempts、agent_endpoints、agent_executions；
+5. tool_executions/attempts、agent_endpoints、agent_executions、agent_event_receipts；
 6. outbox_messages（仅在实际引入消息系统时）。
 
 首批迁移不启用事件时间分区、数据库专属通知、全文搜索或复杂 JSON 索引。先通过状态、幂等、Lease、故障恢复和 PostgreSQL/MySQL 对等测试，再根据数据量增加物理优化。
@@ -500,3 +519,5 @@ crates/
 - Tool/Agent 外部执行可以表示 `outcome_unknown`，且不会被普通重试绕过。
 - PostgreSQL 与 MySQL Provider 不向 Runtime 暴露方言类型或 SQL 特性。
 - 两个 Provider 对同一命令历史返回相同领域状态、版本、错误分类和事件顺序。
+
+具体物理类型、DDL 批次、循环外键、事务隔离、Task 领取和在线迁移规则以 [MIGRATION_DESIGN.md](./MIGRATION_DESIGN.md) 为准。

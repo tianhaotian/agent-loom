@@ -470,9 +470,9 @@ prepare_agent_execution（提交 submitting 意图）
 
 `append_agent_events` 必须在一个事务中：
 
-1. 锁定 AgentExecution 并校验 cursor version；
-2. 按远程 event ID 或规范化幂等键去重；
-3. 追加本地 Event；
+1. 按全局锁序先锁定 Run，再锁定 AgentExecution 并校验 cursor version；
+2. 在 AgentEventReceipt 守卫中按远程 event ID 或规范化幂等键检查重复和 raw digest 冲突；
+3. 对新权威事件预生成本地 Event ID，先追加 Event，再插入引用它的 AgentEventReceipt；transient/ignored 事件只插入无 local Event 的 receipt；
 4. 更新持久化 cursor；
 5. 根据事件创建 Wait/Task/Artifact 或完成 Execution；
 6. 保存 Receipt 并提交。
@@ -627,3 +627,5 @@ crates/store-mysql/migrations/
 ```
 
 正式编码前仍需在 Rust workspace 中验证 trait 的对象安全、Send 边界、错误 source 生命周期和序列化格式，但不得改变本文规定的事务及后置动作语义。
+
+Provider 的物理类型、迁移批次、锁/CAS SQL 形状和在线 schema 演进规则以 [MIGRATION_DESIGN.md](./MIGRATION_DESIGN.md) 为准。

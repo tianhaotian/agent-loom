@@ -840,7 +840,7 @@ Run 查询视图至少返回：
 
 本文冻结后，后置动作按以下顺序展开：
 
-1. `MIGRATION_DESIGN.md`：把领域模型落实为 PostgreSQL/MySQL 对等表、索引、约束和迁移顺序。
+1. 评审并冻结 [MIGRATION_DESIGN.md](./MIGRATION_DESIGN.md)，把领域模型落实为 PostgreSQL/MySQL 对等表、索引、约束和迁移顺序。
 2. 初始化 Rust workspace 与 `domain`、`store-core`、`adapter-core` crate。
 3. 生成 `workflow.delivery.v1` 类型化 fixture 和 JSON Schema。
 4. 实现内存 Fake Provider，仅用于快速跑状态机与场景测试，不作为生产语义替代。

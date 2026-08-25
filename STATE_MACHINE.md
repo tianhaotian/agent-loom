@@ -45,14 +45,15 @@
 需要锁定多个已有对象时，统一采用以下顺序，避免不同 Provider 出现相反锁序：
 
 ```text
-Run
+Tenant（命令依赖 tenant active 状态时）
+  → Run
   → StageExecution
   → Task
   → WaitSubscription
   → ToolExecution / AgentExecution
 ```
 
-- 领取 Task 可以先无锁选择候选 ID，但正式领取事务必须按上述顺序锁定 Run 和 Task，并重新检查候选条件。
+- 领取 Task 可以先无锁选择候选 ID，但正式领取事务必须先以共享锁验证 Tenant active，再按上述顺序锁定 Run 和 Task，并重新检查候选条件。
 - 多个同类对象按主键升序锁定。
 - 控制命令优先只更新 Run 控制门和版本；Task/Wait 的批量收尾可以由同事务中的有序更新或后续幂等清理完成，不得引入反向锁序。
 
@@ -441,3 +442,4 @@ perform best-effort remote stop after commit
 - [STORE_CONTRACT.md](./STORE_CONTRACT.md)：把事务转换表达为 Rust trait、命令、错误类型和可靠后置动作；
 - [ADAPTER_CONTRACT.md](./ADAPTER_CONTRACT.md)：细化 ToolExecution/AgentExecution 的能力协商与恢复协议；
 - [E2E_SCENARIO.md](./E2E_SCENARIO.md)：把业产研交付路径映射到 Stage、Task、Wait、Artifact 与 Event。
+- [MIGRATION_DESIGN.md](./MIGRATION_DESIGN.md)：把锁顺序、CAS、唯一约束与终态不变量映射到 PostgreSQL/MySQL 对等 DDL 和事务模板。

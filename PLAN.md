@@ -247,6 +247,7 @@ Kafka、NATS 或 Redis Streams 可以在高吞吐事件分发时引入，但必�
 - 定义 Agent Server/Tool Adapter 契约、能力协商和版本兼容策略。
 - 评审并冻结 [ADAPTER_CONTRACT.md](./ADAPTER_CONTRACT.md) 的提交、续读、停止、审批、指导和未知结果恢复语义。
 - 评审并冻结 [E2E_SCENARIO.md](./E2E_SCENARIO.md) 的业产研阶段、Artifact Contract、质量门禁与验收路径。
+- 评审并冻结 [MIGRATION_DESIGN.md](./MIGRATION_DESIGN.md) 的共享 migration ID、复合约束、锁/CAS SQL 形状和在线演进规则。
 - 编写与实现无关的一致性测试规范。
 
 验收：PostgreSQL/MySQL Provider 在接口层可替换；不存在任何 Runtime 代码直接依赖 SQL 方言；状态竞争和 Adapter 能力降级均有可执行规范。
@@ -325,4 +326,5 @@ Kafka、NATS 或 Redis Streams 可以在高吞吐事件分发时引入，但必�
 3. 评审并冻结 [STORE_CONTRACT.md](./STORE_CONTRACT.md)，生成可编译 trait 骨架和 Provider conformance 测试接口。
 4. 评审并冻结 [ADAPTER_CONTRACT.md](./ADAPTER_CONTRACT.md)，实现 adapter-core trait 与 Fake Server conformance harness。
 5. 评审并冻结 [E2E_SCENARIO.md](./E2E_SCENARIO.md)，据此生成 Workflow fixture、Artifact Schema 和 E2E 测试夹具。
-6. 初始化 Rust workspace，先交付 PostgreSQL + Mock Agent Server 的最小可运行垂直链路，再实现 MySQL 对等 Provider。
+6. 评审并冻结 [MIGRATION_DESIGN.md](./MIGRATION_DESIGN.md)，生成 PostgreSQL/MySQL 首批迁移和 schema snapshot 测试。
+7. 初始化 Rust workspace，先交付 PostgreSQL + Mock Agent Server 的最小可运行垂直链路，再实现 MySQL 对等 Provider。

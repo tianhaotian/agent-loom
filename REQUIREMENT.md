@@ -318,6 +318,7 @@ tool_executions   外部副作用幂等记录
 tool_execution_attempts 外部工具尝试审计
 agent_endpoints   远程 Agent Server 配置与能力
 agent_executions  远程 Agent Run、事件游标、停止与恢复记录
+agent_event_receipts 远程 Agent Event 去重与本地 Event 映射
 wait_subscriptions 外部事件、审批、Timer 与子 Run 等待条件
 artifact_refs     交付物元数据、版本与外部引用
 command_receipts  命令/事件幂等请求摘要与确定结果
@@ -353,6 +354,8 @@ outbox            可选：后续异步分发的可靠投递记录
 | MySQL 8+ / InnoDB | 是 | 必须满足同一事务与并发测试 |
 | SQLite | 仅开发/测试 | 不作为高可用多 Worker 生产方案 |
 | Redis | 否 | 不具备本系统所需的权威审计与事务语义 |
+
+PostgreSQL/MySQL 的物理类型、复合外键、去重守卫、锁/CAS 模板和在线迁移规则以 [MIGRATION_DESIGN.md](./MIGRATION_DESIGN.md) 为准。
 
 ### 7.3 缓存与消息系统
 
