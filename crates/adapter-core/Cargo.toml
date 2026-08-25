@@ -1,0 +1,14 @@
+[package]
+name = "agent-loom-adapter-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agent-loom-domain = { path = "../domain" }
+
+[lints]
+workspace = true
+
