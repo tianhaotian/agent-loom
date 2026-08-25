@@ -321,10 +321,11 @@ Kafka、NATS 或 Redis Streams 可以在高吞吐事件分发时引入，但必�
 
 ## 11. 下一步
 
-1. 评审并冻结 [STATE_MACHINE.md](./STATE_MACHINE.md)，将转换矩阵落实为属性测试与 Provider 黑盒测试。
-2. 评审并冻结 [DOMAIN_MODEL.md](./DOMAIN_MODEL.md)，据此生成 PostgreSQL/MySQL 首批迁移设计。
-3. 评审并冻结 [STORE_CONTRACT.md](./STORE_CONTRACT.md)，生成可编译 trait 骨架和 Provider conformance 测试接口。
-4. 评审并冻结 [ADAPTER_CONTRACT.md](./ADAPTER_CONTRACT.md)，实现 adapter-core trait 与 Fake Server conformance harness。
-5. 评审并冻结 [E2E_SCENARIO.md](./E2E_SCENARIO.md)，据此生成 Workflow fixture、Artifact Schema 和 E2E 测试夹具。
-6. 评审并冻结 [MIGRATION_DESIGN.md](./MIGRATION_DESIGN.md)，生成 PostgreSQL/MySQL 首批迁移和 schema snapshot 测试。
-7. 为 migration runner 接入 PostgreSQL Provider executor 与真实数据库 smoke test，实现 PostgreSQL `create_run/claim_task/complete_task` 事务路径和 Mock Agent Server；通过 conformance 后补齐 MySQL 对等实现，再按部署需求启用可选 `0007_outbox` 与 `0008_runtime_grants`。
+已完成共享领域/Store/Adapter 契约骨架、`0000` 至 `0006` PostgreSQL/MySQL 对等迁移、migration runner/执行状态机，以及 PostgreSQL migration executor 和 `create_run/claim_task/complete_task` 事务垂直切片。后续按以下顺序推进：
+
+1. 在 CI 的 PostgreSQL 16+ 测试库启用 `AGENT_LOOM_TEST_POSTGRES_URL`，执行真实 migration、重复命令、领取和完成 smoke test，并补充取消/完成与多 Worker 领取并发测试。
+2. 为 PostgreSQL 补齐连接池边界与完整 `DurableStore` 实现：`get_run/list_events/renew_task_lease/fail_task/apply_event/pause/resume/cancel`，保持所有状态推进使用 receipt、行锁或 CAS。
+3. 将共享 conformance harness 从 schema 形状测试扩展为 Provider 黑盒行为测试，并实现 MySQL 对等事务路径。
+4. 实现 Scheduler/Worker 最小循环、Lease 回收与数据库时间驱动的 due-work 扫描。
+5. 实现 Mock Agent Server Adapter 和业产研 Workflow fixture，跑通需求分析至部署的模拟 E2E。
+6. 按部署需求选择 `0007_optional_outbox`；将 `0008_runtime_grants` 作为数据库权限加固迁移或等价 IaC，而不是基础领域正确性的前置条件。

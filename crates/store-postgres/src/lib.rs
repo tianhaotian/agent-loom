@@ -1,4 +1,10 @@
-//! PostgreSQL provider bootstrap and embedded migration manifest.
+//! PostgreSQL provider bootstrap, migrations, and transactional execution paths.
+
+mod migration_executor;
+mod transaction_executor;
+
+pub use migration_executor::*;
+pub use transaction_executor::*;
 
 use agent_loom_durable_store::{EmbeddedMigration, StoreCapabilities};
 

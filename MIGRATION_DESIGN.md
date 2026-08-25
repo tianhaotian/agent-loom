@@ -890,7 +890,7 @@ Provider 不能把所有 unique violation 都返回同一模糊错误。迁移�
 - 收紧 append-only 表 UPDATE/DELETE；
 - 校验 migration owner 与 Runtime credential 不同。
 
-每个批次结束运行 schema introspection 和最小插入/回滚 smoke test。直到 `0008` 完成，Provider readiness 为 false。
+每个批次结束运行 schema introspection 和最小插入/回滚 smoke test。基础 Provider 的 schema readiness 以所有必需 migration（当前为 `0000` 至 `0006`）成功且 Provider 黑盒测试通过为准。`0007_optional_outbox` 不进入基础正确性门槛；生产部署还必须通过最小权限检查，权限可以由 `0008_runtime_grants` 或部署平台的等价 IaC 实现。
 
 ## 19. Expand → Backfill → Switch → Contract
 

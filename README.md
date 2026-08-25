@@ -13,9 +13,11 @@ crates/store-postgres  PostgreSQL Provider 与物理迁移
 crates/store-mysql     MySQL/InnoDB Provider 与物理迁移
 ```
 
-当前阶段先保持核心 crate 零外部依赖，冻结领域和事务边界；数据库驱动、异步运行时和 HTTP 实现将在 Provider conformance harness 建立后接入。
+`domain`、`durable-store` 与 `adapter-core` 继续保持零外部依赖；Provider crate 可以引入各自的数据库驱动和异步运行时，但驱动类型不得泄漏到共享领域契约。
 
-已实现 `0000_migration_meta` 至 `0006_external_executions` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt、Checkpoint、Wait、Artifact、ToolExecution 与 AgentExecution。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、Wait 单次消费槽、Artifact 版本血缘、外部执行幂等与 Agent Event 去重。migration runner 已能拒绝 dirty、checksum 漂移、未知 migration 和历史断层，并通过执行状态机强制 journal/DDL/introspection/lock 顺序；真实数据库 executor 与 smoke test 将由后续 Provider 接入。
+已实现 `0000_migration_meta` 至 `0006_external_executions` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt、Checkpoint、Wait、Artifact、ToolExecution 与 AgentExecution。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、Wait 单次消费槽、Artifact 版本血缘、外部执行幂等与 Agent Event 去重。
+
+PostgreSQL 已接入真实驱动执行层：migration executor 使用 SHA-256 physical checksum、session advisory lock、step journal 和逐批 schema introspection；事务垂直切片已覆盖 `create_run`、`claim_task` 与 `complete_task`，包括 receipt 并发幂等闸门、`FOR UPDATE SKIP LOCKED`、Lease fencing、Run version/generation CAS，以及 Event、Checkpoint、Stage、Artifact 和后续动作的原子提交。该切片目前接受连接池借出的 `&mut tokio_postgres::Client`；完整 `DurableStore` Provider 仍需补齐查询、续租、失败、事件应用和控制面操作。
 
 ## 设计文档
 
@@ -36,3 +38,11 @@ cargo check --workspace --all-targets
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+设置测试专用数据库后可同时执行真实 migration 与事务 smoke test：
+
+```bash
+AGENT_LOOM_TEST_POSTGRES_URL='postgresql://...' cargo test -p agent-loom-store-postgres
+```
+
+smoke test 会在目标数据库创建唯一测试 Tenant/Run 作为审计记录；不要指向生产数据库。
