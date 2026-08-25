@@ -437,5 +437,5 @@ perform best-effort remote stop after commit
 
 - `DOMAIN_MODEL.md`：落实字段、关系、索引与唯一约束；
 - [STORE_CONTRACT.md](./STORE_CONTRACT.md)：把事务转换表达为 Rust trait、命令、错误类型和可靠后置动作；
-- `ADAPTER_CONTRACT.md`：细化 ToolExecution/AgentExecution 的能力协商与恢复协议；
+- [ADAPTER_CONTRACT.md](./ADAPTER_CONTRACT.md)：细化 ToolExecution/AgentExecution 的能力协商与恢复协议；
 - `E2E_SCENARIO.md`：把业产研交付路径映射到 Stage、Task、Wait、Artifact 与 Event。

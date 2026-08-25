@@ -127,6 +127,8 @@ expires_at, consumed_by_event_id, idempotency_key, created_at
 
 每次远程 Agent 提交必须创建持久化 `AgentExecution`，记录本地 execution ID、Agent Endpoint、稳定幂等键、远程 Run/Session 引用、状态、事件游标、停止结果与最后同步时间。远程提交成功但本地尚未保存引用即崩溃时，Adapter 必须支持按幂等键查询确认，或将结果标记为 `outcome_unknown` 进入人工/对账恢复，不能直接重复提交。
 
+通用 Agent/Tool trait、能力协商、事件规范化、错误映射与官方 Adapter profile 以 [ADAPTER_CONTRACT.md](./ADAPTER_CONTRACT.md) 为准。
+
 ## 5. 功能需求
 
 ### 5.1 Run 生命周期

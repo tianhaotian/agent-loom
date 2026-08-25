@@ -373,6 +373,8 @@ PostgreSQL 与 MySQL 都允许唯一约束中存在多个 NULL，因此历史终
 
 ## 10. 外部执行模型
 
+外部协议、能力快照、事件映射和 Adapter 错误语义以 [ADAPTER_CONTRACT.md](./ADAPTER_CONTRACT.md) 为准；本节只定义持久化字段与约束。
+
 ### 10.1 `tool_executions`
 
 ```text

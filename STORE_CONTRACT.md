@@ -442,6 +442,8 @@ pub enum DueWorkKind {
 
 ## 8. Tool 与 Agent 外部调用窗口
 
+具体远程协议、能力匹配、规范化事件和 Adapter 错误模型以 [ADAPTER_CONTRACT.md](./ADAPTER_CONTRACT.md) 为准；DurableStore 只接收规范化结果。
+
 ### 8.1 Tool
 
 ```text
