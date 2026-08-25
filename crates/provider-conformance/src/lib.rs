@@ -23,6 +23,8 @@ mod tests {
         "tasks",
         "task_attempts",
         "checkpoints",
+        "wait_subscriptions",
+        "artifact_refs",
     ];
 
     #[test]
@@ -121,6 +123,30 @@ mod tests {
             assert!(sql.contains("ix_tasks__claim_global"));
             assert!(sql.contains("status, available_at, priority DESC, task_id"));
             assert!(sql.contains("ix_tasks__lease_reclaim"));
+        }
+    }
+
+    #[test]
+    fn wait_single_consumption_slot_is_portable() {
+        for migrations in [postgres::MIGRATIONS, mysql::MIGRATIONS] {
+            let sql = migrations[5].sql;
+            assert!(sql.contains("uq_waits__active_slot"));
+            assert!(sql.contains(
+                "tenant_id, run_id, wait_type, expected_event_type, match_key_hash, active_slot"
+            ));
+            assert!(sql.contains("status = 'open' AND active_slot = 1"));
+            assert!(sql.contains("status = 'consumed' AND active_slot IS NULL"));
+        }
+    }
+
+    #[test]
+    fn artifact_versions_and_lineage_are_provider_equivalent() {
+        for migrations in [postgres::MIGRATIONS, mysql::MIGRATIONS] {
+            let sql = migrations[5].sql;
+            assert!(sql.contains("uq_artifacts__logical_version"));
+            assert!(sql.contains("tenant_id, run_id, logical_key, version"));
+            assert!(sql.contains("source_artifact_refs_json"));
+            assert!(sql.contains("ix_artifacts__digest"));
         }
     }
 

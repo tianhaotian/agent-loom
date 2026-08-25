@@ -1,6 +1,7 @@
 use crate::{
-    CheckpointId, EventId, JsonPayload, LogicalKey, RunId, RunStatus, StageExecutionId, TaskId,
-    TaskStatus, TenantId, UnixMicros, WorkflowVersionId,
+    ArtifactId, CheckpointId, Digest, EventId, JsonPayload, LogicalKey, RunId, RunStatus,
+    StageExecutionId, TaskId, TaskStatus, TenantId, UnixMicros, WaitId, WaitStatus,
+    WorkflowVersionId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +65,64 @@ pub struct EventRecord {
     pub recorded_at: UnixMicros,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitSnapshot {
+    pub tenant_id: TenantId,
+    pub wait_id: WaitId,
+    pub run_id: RunId,
+    pub stage_execution_id: Option<StageExecutionId>,
+    pub wait_type: String,
+    pub expected_event_type: String,
+    pub match_key_hash: Digest,
+    pub status: WaitStatus,
+    pub active_slot: Option<u8>,
+    pub expires_at: Option<UnixMicros>,
+    pub consumed_by_event_id: Option<EventId>,
+    pub created_event_id: EventId,
+}
+
+impl WaitSnapshot {
+    pub fn active_slot_invariant_holds(&self) -> bool {
+        match self.status {
+            WaitStatus::Open => self.active_slot == Some(1) && self.consumed_by_event_id.is_none(),
+            WaitStatus::Consumed => {
+                self.active_slot.is_none() && self.consumed_by_event_id.is_some()
+            }
+            WaitStatus::Expired | WaitStatus::Cancelled => {
+                self.active_slot.is_none() && self.consumed_by_event_id.is_none()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ArtifactVersionRef {
+    pub artifact_id: ArtifactId,
+    pub version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactRefSnapshot {
+    pub tenant_id: TenantId,
+    pub artifact_id: ArtifactId,
+    pub run_id: RunId,
+    pub stage_execution_id: Option<StageExecutionId>,
+    pub task_id: Option<TaskId>,
+    pub logical_key: LogicalKey,
+    pub kind: String,
+    pub contract_version: u32,
+    pub version: u64,
+    pub uri: String,
+    pub digest: Digest,
+    pub media_type: String,
+    pub size_bytes: u64,
+    pub sources: Vec<ArtifactVersionRef>,
+    pub metadata: JsonPayload,
+    pub produced_by: String,
+    pub created_event_id: EventId,
+    pub created_at: UnixMicros,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,5 +144,29 @@ mod tests {
             updated_at: UnixMicros::new(10),
         };
         assert!(!snapshot.terminal_invariant_holds());
+    }
+
+    #[test]
+    fn wait_active_slot_tracks_open_and_consumed_states() {
+        let mut wait = WaitSnapshot {
+            tenant_id: TenantId::from_bytes([1; 16]),
+            wait_id: WaitId::from_bytes([2; 16]),
+            run_id: RunId::from_bytes([3; 16]),
+            stage_execution_id: None,
+            wait_type: "approval".to_owned(),
+            expected_event_type: "approval.granted".to_owned(),
+            match_key_hash: Digest::from_bytes([4; 32]),
+            status: WaitStatus::Open,
+            active_slot: Some(1),
+            expires_at: None,
+            consumed_by_event_id: None,
+            created_event_id: EventId::from_bytes([5; 16]),
+        };
+        assert!(wait.active_slot_invariant_holds());
+
+        wait.status = WaitStatus::Consumed;
+        wait.active_slot = None;
+        wait.consumed_by_event_id = Some(EventId::from_bytes([6; 16]));
+        assert!(wait.active_slot_invariant_holds());
     }
 }

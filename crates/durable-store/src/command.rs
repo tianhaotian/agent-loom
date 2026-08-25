@@ -1,8 +1,8 @@
 use agent_loom_domain::{
-    AgentVersionId, ArtifactId, CheckpointId, CommandId, CorrelationId, Digest, DurationMicros,
-    EventId, IdempotencyKey, JsonPayload, LeaseToken, LogicalKey, RunId, RunStatus, ScopeKey,
-    StageExecutionId, StageStatus, TaskId, TaskKind, TenantId, UnixMicros, WaitId, WorkerId,
-    WorkflowVersionId,
+    AgentVersionId, ArtifactId, ArtifactVersionRef, CheckpointId, CommandId, CorrelationId, Digest,
+    DurationMicros, EventId, IdempotencyKey, JsonPayload, LeaseToken, LogicalKey, RunId, RunStatus,
+    ScopeKey, StageExecutionId, StageStatus, TaskId, TaskKind, TenantId, UnixMicros, WaitId,
+    WorkerId, WorkflowVersionId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,6 +111,22 @@ impl CompleteTask {
             return Err(CompletionShapeError::InvalidCheckpointMetadata);
         }
 
+        if self.artifacts.iter().any(|artifact| {
+            artifact.contract_version == 0
+                || artifact.version == 0
+                || artifact.kind.is_empty()
+                || artifact.uri.is_empty()
+                || artifact.media_type.is_empty()
+                || artifact.produced_by.is_empty()
+                || artifact.sources.iter().any(|source| source.version == 0)
+        }) {
+            return Err(CompletionShapeError::InvalidArtifactMetadata);
+        }
+
+        if let Some(error) = self.next.metadata_error() {
+            return Err(error);
+        }
+
         let generation = self.lease.execution_generation;
         if self.checkpoint.execution_generation != generation
             || self
@@ -211,6 +227,7 @@ pub struct NewArtifactRef {
     pub digest: Digest,
     pub media_type: String,
     pub size_bytes: u64,
+    pub sources: Vec<ArtifactVersionRef>,
     pub metadata: JsonPayload,
     pub produced_by: String,
     pub created_event_id: EventId,
@@ -249,12 +266,38 @@ impl NextActions {
             Self::Tasks(_) | Self::Wait(_) | Self::Retry(_) | Self::NoFurtherWork => None,
         }
     }
+
+    fn metadata_error(&self) -> Option<CompletionShapeError> {
+        let invalid_task =
+            |task: &NewTask| task.based_on_checkpoint_sequence == 0 || task.max_attempts == 0;
+        match self {
+            Self::Tasks(tasks) if tasks.iter().any(invalid_task) => {
+                Some(CompletionShapeError::InvalidTaskMetadata)
+            }
+            Self::Wait(wait)
+                if wait.wait_type.is_empty() || wait.expected_event_type.is_empty() =>
+            {
+                Some(CompletionShapeError::InvalidWaitMetadata)
+            }
+            Self::Retry(retry) if retry.reason_code.is_empty() || invalid_task(&retry.task) => {
+                Some(CompletionShapeError::InvalidTaskMetadata)
+            }
+            Self::Tasks(_)
+            | Self::Wait(_)
+            | Self::Retry(_)
+            | Self::FinishRun(_)
+            | Self::NoFurtherWork => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionShapeError {
     CreatedEventMismatch,
     InvalidCheckpointMetadata,
+    InvalidTaskMetadata,
+    InvalidWaitMetadata,
+    InvalidArtifactMetadata,
     GenerationMismatch,
     FinishRunRequiresTerminalStatus,
 }
@@ -318,6 +361,26 @@ mod tests {
         assert_eq!(
             command.validate_shape(),
             Err(CompletionShapeError::CreatedEventMismatch)
+        );
+    }
+
+    #[test]
+    fn completion_rejects_empty_wait_contract_identity() {
+        let mut command = completion();
+        command.next = NextActions::Wait(NewWaitSubscription {
+            wait_id: WaitId::from_bytes([8; 16]),
+            stage_execution_id: None,
+            wait_type: String::new(),
+            expected_event_type: "approval.granted".to_owned(),
+            match_key_hash: Digest::from_bytes([8; 32]),
+            match_contract: json(),
+            expires_at: None,
+            created_event_id: command.completion_event_id,
+        });
+
+        assert_eq!(
+            command.validate_shape(),
+            Err(CompletionShapeError::InvalidWaitMetadata)
         );
     }
 
