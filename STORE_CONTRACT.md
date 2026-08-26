@@ -446,6 +446,8 @@ pub enum DueWorkKind {
 
 `scan_due_work` 是只读候选扫描，不代表候选仍有效。`apply_due_work` 必须重新锁定相关 Run/Task/Wait/Execution，并以当前数据库时间再次校验。
 
+Tool/Agent retry 候选使用数据库 `retry_at <= db_now` 判断，并按 `(due_at, kind, execution_id)` 做稳定 keyset 分页。候选携带 Execution revision，但 revision 只用于后续 CAS；扫描本身不加跨请求锁，也不消费 retry。
+
 ## 7. 原子操作契约
 
 | 操作 | 同一事务必须完成 | 典型 DurableFollowUp | PostCommitHint |

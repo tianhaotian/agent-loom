@@ -2,6 +2,7 @@
 
 mod command;
 pub mod conformance;
+mod due_work;
 mod error;
 mod external_command;
 mod migration;
@@ -11,6 +12,7 @@ mod outcome;
 mod store;
 
 pub use command::*;
+pub use due_work::*;
 pub use error::*;
 pub use external_command::*;
 pub use migration::*;

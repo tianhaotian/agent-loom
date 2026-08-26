@@ -4,9 +4,9 @@ use agent_loom_domain::{AgentExecutionSnapshot, RunId, RunSnapshot, ToolExecutio
 
 use crate::{
     AgentEventBatchOutcome, AppendAgentEvents, ApplyEvent, ClaimTask, ClaimedTask, Committed,
-    CompleteTask, ControlRun, CreateRun, EventCursor, EventPage, FailTask, PrepareAgentExecution,
-    PrepareToolExecution, QueryContext, RecordAgentOutcome, RecordAgentSubmission,
-    RecordToolOutcome, RenewTaskLease, StoreResult,
+    CompleteTask, ControlRun, CreateRun, DueWorkPage, DueWorkQuery, EventCursor, EventPage,
+    FailTask, PrepareAgentExecution, PrepareToolExecution, QueryContext, RecordAgentOutcome,
+    RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, StoreResult,
 };
 
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = StoreResult<T>> + Send + 'a>>;
@@ -51,6 +51,12 @@ pub trait DurableStore: Send + Sync {
         context: &'a QueryContext,
         cursor: EventCursor,
     ) -> StoreFuture<'a, EventPage>;
+
+    fn scan_due_work<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        query: DueWorkQuery,
+    ) -> StoreFuture<'a, DueWorkPage>;
 
     fn claim_task<'a>(
         &'a self,

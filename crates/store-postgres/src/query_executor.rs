@@ -1,8 +1,10 @@
 use agent_loom_domain::{
-    CheckpointId, EventRecord, JsonPayload, RunId, RunSnapshot, TenantId, UnixMicros,
+    AgentExecutionId, CheckpointId, EventRecord, JsonPayload, RunId, RunSnapshot, TenantId,
+    ToolExecutionId, UnixMicros,
 };
 use agent_loom_durable_store::{
-    EventCursor, EventPage, QueryContext, StoreError, StoreErrorCode, StoreResult,
+    DueWorkCandidate, DueWorkKind, DueWorkPage, DueWorkQuery, DueWorkTarget, EventCursor,
+    EventPage, QueryContext, StoreError, StoreErrorCode, StoreResult,
 };
 use serde_json::Value;
 use tokio_postgres::{Client, Row};
@@ -14,6 +16,7 @@ use crate::{
 };
 
 const MAX_EVENT_PAGE_SIZE: u32 = 1_000;
+const MAX_DUE_WORK_PAGE_SIZE: u32 = 1_000;
 
 impl crate::PostgresTransactionExecutor {
     /// Reads the authoritative Run projection for one tenant.
@@ -104,6 +107,100 @@ impl crate::PostgresTransactionExecutor {
             next_after_sequence,
         })
     }
+
+    /// Scans currently due Tool/Agent retry candidates using database time and
+    /// a stable `(due_at, kind, execution_id)` keyset. Candidates are hints;
+    /// the apply transaction must lock and revalidate the target revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable store error for an invalid limit, cursor conversion,
+    /// unavailable PostgreSQL, or an invalid persisted candidate.
+    pub async fn scan_due_work(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        query: DueWorkQuery,
+    ) -> StoreResult<DueWorkPage> {
+        if query.limit == 0 {
+            return Err(StoreError::new(
+                StoreErrorCode::ConstraintViolation,
+                agent_loom_durable_store::RetryClass::Never,
+                "due-work page limit must be positive",
+            ));
+        }
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let after_due = query.after.map(|cursor| cursor.due_at.get());
+        let after_kind = query.after.map(|cursor| due_work_kind(cursor.kind));
+        let after_id = query
+            .after
+            .map(|cursor| Uuid::from_bytes(cursor.execution_id));
+        let page_size = query.limit.min(MAX_DUE_WORK_PAGE_SIZE);
+        let fetch_size = i64::from(page_size) + 1;
+        let rows = client
+            .query(
+                "SELECT kind, execution_id, run_id, due_micros, expected_revision FROM (\
+                    SELECT 'tool_retry'::text AS kind, tool_execution_id AS execution_id, \
+                           run_id, (extract(epoch FROM retry_at) * 1000000)::bigint AS due_micros, \
+                           attempt_count AS expected_revision \
+                    FROM agent_loom.tool_executions \
+                    WHERE tenant_id = $1 AND status = 'retry_scheduled' \
+                      AND retry_at <= transaction_timestamp() \
+                    UNION ALL \
+                    SELECT 'agent_retry'::text AS kind, agent_execution_id AS execution_id, \
+                           run_id, (extract(epoch FROM retry_at) * 1000000)::bigint AS due_micros, \
+                           version AS expected_revision \
+                    FROM agent_loom.agent_executions \
+                    WHERE tenant_id = $1 AND status = 'reconciling' \
+                      AND retry_at IS NOT NULL AND retry_at <= transaction_timestamp()\
+                 ) due \
+                 WHERE $2::bigint IS NULL OR (due_micros, kind, execution_id) > \
+                       ($2::bigint, $3::text, $4::uuid) \
+                 ORDER BY due_micros, kind, execution_id LIMIT $5",
+                &[&tenant_id, &after_due, &after_kind, &after_id, &fetch_size],
+            )
+            .await
+            .map_err(map_database_error)?;
+        let has_more = rows.len() > page_size as usize;
+        let candidates = rows
+            .iter()
+            .take(page_size as usize)
+            .map(|row| decode_due_work(context.tenant_id, row))
+            .collect::<StoreResult<Vec<_>>>()?;
+        let next_cursor = has_more
+            .then(|| candidates.last().copied().map(DueWorkCandidate::cursor))
+            .flatten();
+        Ok(DueWorkPage {
+            candidates,
+            next_cursor,
+        })
+    }
+}
+
+const fn due_work_kind(kind: DueWorkKind) -> &'static str {
+    match kind {
+        DueWorkKind::ToolRetry => "tool_retry",
+        DueWorkKind::AgentRetry => "agent_retry",
+    }
+}
+
+fn decode_due_work(tenant_id: TenantId, row: &Row) -> StoreResult<DueWorkCandidate> {
+    let kind: &str = row.get(0);
+    let execution_id: Uuid = row.get(1);
+    let target = match kind {
+        "tool_retry" => DueWorkTarget::Tool(ToolExecutionId::from_bytes(execution_id.into_bytes())),
+        "agent_retry" => {
+            DueWorkTarget::Agent(AgentExecutionId::from_bytes(execution_id.into_bytes()))
+        }
+        _ => return Err(inconsistent("database returned an unknown due-work kind")),
+    };
+    Ok(DueWorkCandidate {
+        tenant_id,
+        run_id: run_id_from_uuid(row.get(2)),
+        target,
+        due_at: UnixMicros::new(row.get(3)),
+        expected_revision: nonnegative_u64(row.get(4), "due-work revision")?,
+    })
 }
 
 fn decode_run(tenant_id: TenantId, row: &Row) -> StoreResult<RunSnapshot> {
@@ -167,5 +264,14 @@ mod tests {
         assert!(source.contains("AND sequence > $3"));
         assert!(source.contains("ORDER BY sequence LIMIT $4"));
         assert_eq!(MAX_EVENT_PAGE_SIZE, 1_000);
+    }
+
+    #[test]
+    fn due_work_sql_uses_database_time_and_stable_keyset_order() {
+        let source = include_str!("query_executor.rs");
+        assert!(source.contains("retry_at <= transaction_timestamp()"));
+        assert!(source.contains("(due_micros, kind, execution_id) >"));
+        assert!(source.contains("ORDER BY due_micros, kind, execution_id LIMIT $5"));
+        assert_eq!(MAX_DUE_WORK_PAGE_SIZE, 1_000);
     }
 }

@@ -19,7 +19,7 @@ crates/store-mysql     MySQL/InnoDB Provider 与物理迁移
 
 PostgreSQL 已接入真实驱动执行层：migration executor 使用 SHA-256 physical checksum、session advisory lock、step journal 和逐批 schema introspection；事务垂直切片已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 准备/结果记录、AgentExecution 提交/事件/结果记录，以及 Pause/Resume/Cancel。写路径包含 receipt 并发幂等闸门、显式层级锁序、`FOR UPDATE SKIP LOCKED`、Lease fencing、Run version/generation CAS，以及 Event、Checkpoint、Stage、Artifact 和后续动作的原子提交。
 
-续租使用数据库时间校验并延长 Task/TaskAttempt 的同一 Lease，不推进 Run 版本；失败事务会原子完成 attempt、清除 Lease、追加 Event，并区分 retry、不可重试终态与 Dead Letter。外部事件按 Event type 与 `match_key_hash` 单次消费 Wait，并实例化预存恢复计划。Tool 与 Agent 外部调用采用两阶段窗口：先提交 execution/Event 意图，再记录 adapter outcome；不确定结果持久化对账动作，backoff 必须持久化 `retry_at`。Agent 事件批次会原子完成 receipt/raw digest 去重、本地 Event 追加、远端 cursor CAS、Run 序列推进，以及规范化事件声明的 Task/Wait/Artifact/Execution outcome 投影；Pause/Cancel 后的迟到结果保留审计，但业务投影受 Run version/generation/deadline fencing。该切片目前接受连接池借出的 `&mut tokio_postgres::Client`；完整 Provider 仍需补齐连接池封装和 due-work。
+续租使用数据库时间校验并延长 Task/TaskAttempt 的同一 Lease，不推进 Run 版本；失败事务会原子完成 attempt、清除 Lease、追加 Event，并区分 retry、不可重试终态与 Dead Letter。外部事件按 Event type 与 `match_key_hash` 单次消费 Wait，并实例化预存恢复计划。Tool 与 Agent 外部调用采用两阶段窗口：先提交 execution/Event 意图，再记录 adapter outcome；不确定结果持久化对账动作，backoff 必须持久化 `retry_at`。Agent 事件批次会原子完成 receipt/raw digest 去重、本地 Event 追加、远端 cursor CAS、Run 序列推进，以及规范化事件声明的 Task/Wait/Artifact/Execution outcome 投影；Pause/Cancel 后的迟到结果保留审计，但业务投影受 Run version/generation/deadline fencing。Scheduler 已具备 Tool/Agent retry 的数据库时间与稳定 keyset 候选扫描。该切片目前接受连接池借出的 `&mut tokio_postgres::Client`；完整 Provider 仍需补齐连接池封装和 due-work 应用事务。
 
 ## 设计文档
 
