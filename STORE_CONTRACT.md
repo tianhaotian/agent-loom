@@ -507,7 +507,9 @@ Agent 提交拒绝使用与 Tool 相同的 `ExecutionRetryClass`。`SameRequestB
 
 cursor 更新失败时整批回滚，客户端可以安全从旧 cursor 重读。
 
-底层批次事务只接受已规范化事件并维护 receipt/Event/cursor 原子性；将具体 `event_kind` 派生为 Wait、Task、Artifact 或 Execution outcome 的规则属于 Runtime 投影层，必须先生成确定性命令内容后再进入该事务，禁止 Provider 根据 vendor payload 临时推断。
+底层批次事务只接受已规范化事件并维护 receipt/Event/cursor 原子性。每个权威事件可携带显式 `AgentEventProjection { workflow_action, artifacts, execution_outcome }`；将具体 `event_kind` 派生为这些字段的规则属于 Runtime 投影层，禁止 Provider 根据 vendor payload 临时推断。
+
+投影必须满足：transient/ignored 事件无投影；Task/Wait/Artifact 的 `created_event_id` 等于所属本地 Event；一个批次至多有一个调度决策和一个 Execution outcome。Provider 对新 receipt 执行投影，对 duplicate receipt 跳过投影；Run fence 失效时只保存外部事实和 cursor，不创建业务 Task/Wait/Artifact。
 
 ## 9. Scheduler 契约
 

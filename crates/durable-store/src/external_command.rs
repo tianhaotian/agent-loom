@@ -4,7 +4,7 @@ use agent_loom_domain::{
     TaskId, TenantId, ToolAttemptId, ToolExecutionId, ToolExecutionStatus,
 };
 
-use crate::{ExpectedRun, LeaseProof};
+use crate::{ExpectedRun, LeaseProof, NewArtifactRef, NewTask, NewWaitSubscription};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrepareToolExecution {
@@ -135,6 +135,42 @@ pub struct NormalizedAgentEventInput {
     pub local_event_id: Option<EventId>,
     pub payload_schema_version: u32,
     pub payload: JsonPayload,
+    pub projection: AgentEventProjection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentEventProjection {
+    pub workflow_action: AgentWorkflowAction,
+    pub artifacts: Vec<NewArtifactRef>,
+    pub execution_outcome: Option<AgentEventExecutionOutcome>,
+}
+
+impl AgentEventProjection {
+    pub const NONE: Self = Self {
+        workflow_action: AgentWorkflowAction::None,
+        artifacts: Vec::new(),
+        execution_outcome: None,
+    };
+
+    pub fn is_empty(&self) -> bool {
+        self.workflow_action == AgentWorkflowAction::None
+            && self.artifacts.is_empty()
+            && self.execution_outcome.is_none()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentWorkflowAction {
+    None,
+    Tasks(Vec<NewTask>),
+    Wait(Box<NewWaitSubscription>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentEventExecutionOutcome {
+    pub status: AgentExecutionStatus,
+    pub result: Option<JsonPayload>,
+    pub error_code: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,6 +204,12 @@ impl AppendAgentEvents {
             if event.authoritative != event.local_event_id.is_some() {
                 return Err(AgentEventBatchShapeError::AuthorityMismatch { index });
             }
+            if !event.authoritative && !event.projection.is_empty() {
+                return Err(AgentEventBatchShapeError::ProjectionMismatch { index });
+            }
+            if event.authoritative && !projection_matches_event(event) {
+                return Err(AgentEventBatchShapeError::ProjectionMismatch { index });
+            }
             if self.events[..index]
                 .iter()
                 .any(|previous| previous.receipt_id == event.receipt_id)
@@ -188,7 +230,76 @@ impl AppendAgentEvents {
                 return Err(AgentEventBatchShapeError::DuplicateLocalEvent { index });
             }
         }
+        let action_count = self
+            .events
+            .iter()
+            .filter(|event| event.projection.workflow_action != AgentWorkflowAction::None)
+            .count();
+        let outcome_count = self
+            .events
+            .iter()
+            .filter(|event| event.projection.execution_outcome.is_some())
+            .count();
+        if action_count > 1 || outcome_count > 1 {
+            return Err(AgentEventBatchShapeError::ConflictingProjection);
+        }
         Ok(())
+    }
+}
+
+fn projection_matches_event(event: &NormalizedAgentEventInput) -> bool {
+    let Some(local_event_id) = event.local_event_id else {
+        return event.projection.is_empty();
+    };
+    let action_is_valid = match &event.projection.workflow_action {
+        AgentWorkflowAction::None => true,
+        AgentWorkflowAction::Tasks(tasks) => {
+            !tasks.is_empty()
+                && tasks.iter().all(|task| {
+                    task.created_event_id == local_event_id
+                        && task.based_on_checkpoint_sequence > 0
+                        && task.max_attempts > 0
+                })
+        }
+        AgentWorkflowAction::Wait(wait) => {
+            wait.created_event_id == local_event_id
+                && !wait.wait_type.is_empty()
+                && !wait.expected_event_type.is_empty()
+                && wait.resume_task.max_attempts > 0
+        }
+    };
+    let artifacts_are_valid = event.projection.artifacts.iter().all(|artifact| {
+        artifact.created_event_id == local_event_id
+            && artifact.contract_version > 0
+            && artifact.version > 0
+            && !artifact.kind.is_empty()
+            && !artifact.uri.is_empty()
+            && !artifact.media_type.is_empty()
+            && !artifact.produced_by.is_empty()
+    });
+    let outcome_is_valid = event
+        .projection
+        .execution_outcome
+        .as_ref()
+        .is_none_or(agent_event_outcome_shape_is_valid);
+    action_is_valid && artifacts_are_valid && outcome_is_valid
+}
+
+fn agent_event_outcome_shape_is_valid(outcome: &AgentEventExecutionOutcome) -> bool {
+    if outcome.error_code.as_ref().is_some_and(String::is_empty) {
+        return false;
+    }
+    match outcome.status {
+        AgentExecutionStatus::Succeeded => outcome.result.is_some() && outcome.error_code.is_none(),
+        AgentExecutionStatus::Failed => outcome.result.is_none() && outcome.error_code.is_some(),
+        AgentExecutionStatus::Cancelled
+        | AgentExecutionStatus::OutcomeUnknown
+        | AgentExecutionStatus::Reconciling
+        | AgentExecutionStatus::ManualReview => outcome.result.is_none(),
+        AgentExecutionStatus::Planned
+        | AgentExecutionStatus::Submitting
+        | AgentExecutionStatus::Running
+        | AgentExecutionStatus::Stopping => false,
     }
 }
 
@@ -200,6 +311,8 @@ pub enum AgentEventBatchShapeError {
     DuplicateReceipt { index: usize },
     DuplicateDedupeKey { index: usize },
     DuplicateLocalEvent { index: usize },
+    ProjectionMismatch { index: usize },
+    ConflictingProjection,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -289,6 +402,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transient_agent_event_cannot_carry_a_workflow_projection() {
+        let mut transient = event(3, 4);
+        transient.authoritative = false;
+        transient.local_event_id = None;
+        transient.projection = AgentEventProjection {
+            workflow_action: AgentWorkflowAction::Tasks(vec![task(EventId::from_bytes([4; 16]))]),
+            artifacts: Vec::new(),
+            execution_outcome: None,
+        };
+        let batch = batch(vec![transient]);
+
+        assert_eq!(
+            batch.validate_shape(),
+            Err(AgentEventBatchShapeError::ProjectionMismatch { index: 0 })
+        );
+    }
+
+    #[test]
+    fn agent_projection_objects_must_belong_to_the_local_event() {
+        let mut projected = event(3, 4);
+        projected.projection = AgentEventProjection {
+            workflow_action: AgentWorkflowAction::Tasks(vec![task(EventId::from_bytes([9; 16]))]),
+            artifacts: Vec::new(),
+            execution_outcome: None,
+        };
+
+        assert_eq!(
+            batch(vec![projected]).validate_shape(),
+            Err(AgentEventBatchShapeError::ProjectionMismatch { index: 0 })
+        );
+    }
+
+    #[test]
+    fn agent_event_batch_allows_only_one_scheduling_decision() {
+        let mut first = event(3, 4);
+        first.projection = AgentEventProjection {
+            workflow_action: AgentWorkflowAction::Tasks(vec![task(EventId::from_bytes([4; 16]))]),
+            artifacts: Vec::new(),
+            execution_outcome: None,
+        };
+        let mut second = event(5, 6);
+        second.projection = AgentEventProjection {
+            workflow_action: AgentWorkflowAction::Tasks(vec![task(EventId::from_bytes([6; 16]))]),
+            artifacts: Vec::new(),
+            execution_outcome: None,
+        };
+
+        assert_eq!(
+            batch(vec![first, second]).validate_shape(),
+            Err(AgentEventBatchShapeError::ConflictingProjection)
+        );
+    }
+
+    fn batch(events: Vec<NormalizedAgentEventInput>) -> AppendAgentEvents {
+        AppendAgentEvents {
+            expected_run: ExpectedRun {
+                run_id: agent_loom_domain::RunId::from_bytes([1; 16]),
+                version: Some(1),
+                execution_generation: Some(0),
+            },
+            agent_execution_id: AgentExecutionId::from_bytes([2; 16]),
+            expected_cursor_version: 0,
+            next_cursor: Some("cursor-2".to_owned()),
+            events,
+        }
+    }
+
+    fn task(created_event_id: EventId) -> NewTask {
+        NewTask {
+            task_id: TaskId::from_bytes([8; 16]),
+            stage_execution_id: None,
+            logical_key: agent_loom_domain::LogicalKey::parse("agent/projected-task")
+                .expect("logical key"),
+            kind: agent_loom_domain::TaskKind::Model,
+            generation: 0,
+            based_on_checkpoint_sequence: 1,
+            priority: 1,
+            available_at: agent_loom_domain::UnixMicros::new(1),
+            max_attempts: 1,
+            input: JsonPayload::from_validated_bytes(b"{}".to_vec()),
+            deadline: None,
+            created_event_id,
+        }
+    }
+
     fn event(receipt_byte: u8, event_byte: u8) -> NormalizedAgentEventInput {
         NormalizedAgentEventInput {
             receipt_id: AgentEventReceiptId::from_bytes([receipt_byte; 16]),
@@ -302,6 +501,7 @@ mod tests {
             local_event_id: Some(EventId::from_bytes([event_byte; 16])),
             payload_schema_version: 1,
             payload: JsonPayload::from_validated_bytes(b"{}".to_vec()),
+            projection: AgentEventProjection::NONE,
         }
     }
 }

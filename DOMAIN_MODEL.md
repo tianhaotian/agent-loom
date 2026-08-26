@@ -438,6 +438,8 @@ event_kind, raw_digest, local_event_id, recorded_at
 - `dedupe_key` 是 Adapter 根据远程 event ID，或 sequence/cursor + kind + canonical payload digest 生成的固定摘要；
 - 同一 dedupe key 但 raw digest 不同属于协议冲突，不得视为普通 duplicate；
 - receipt、本地 Event、AgentExecution cursor 和衍生 Artifact/Wait/Task 在同一事务提交；
+- Adapter/Runtime 必须把衍生动作编码为显式 `AgentEventProjection`；Provider 不解析 vendor payload 推断工作流动作；
+- 只有新接收的权威事件可以携带投影；投影对象的 `created_event_id` 必须等于该事件的本地 Event ID；
 - transient/ignored 远程事件可以没有 `local_event_id`，但影响状态的事件必须关联本地 Event。
 
 ## 11. 可选 Outbox

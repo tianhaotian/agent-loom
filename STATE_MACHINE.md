@@ -322,6 +322,7 @@ planned → submitting → running → succeeded
 - Adapter 不支持幂等提交或查询确认时，提交窗口故障进入 `outcome_unknown`，禁止自动创建第二个远程 Run。
 - 提交被拒绝且分类为 `SameRequestBackoff` 时进入 `reconciling`，必须在同一事务持久化 `retry_at`；due-work 只能使用数据库时间触发。
 - 事件游标必须持久化；每批远程事件的规范化、游标更新和本地 Event 追加应原子提交。
+- 规范化事件的 Task/Wait/Artifact 业务投影必须通过 Run version、generation、非暂停/非终态和 deadline fence；fence 失效时仅保存事件、receipt、cursor 与 Agent 外部结果事实。
 - `stop` 是请求，不等于远程已经停止。只有 Adapter 明确确认后才能进入 `cancelled`；远程已经完成时应记录真实结果，再由 Run generation 决定该结果能否推进业务状态。
 - Pause/Cancel 后的迟到远程结果可以保存为审计与对账数据，但不能绕过 Run 版本和 generation 校验。
 

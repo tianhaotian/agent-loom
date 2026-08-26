@@ -5,13 +5,14 @@ use agent_loom_domain::{
     ToolExecutionId, ToolExecutionSnapshot, ToolExecutionStatus, UnixMicros, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
-    AgentEventBatchOutcome, AgentSubmissionOutcome, AppendAgentEvents, ApplyEvent, ClaimTask,
-    ClaimedTask, CommandContext, CommandDisposition, Committed, CompleteTask, CompletionShapeError,
-    ControlRun, CreateRun, DurableFollowUp, ExecutionRetryClass, ExpectedRun, FailTask,
-    InitialTask, LeaseProof, NewTask, NextActions, NormalizedAgentEventInput, PostCommitHint,
-    PrepareAgentExecution, PrepareToolExecution, RecordAgentOutcome, RecordAgentSubmission,
-    RecordToolOutcome, RenewTaskLease, SignatureVerification, StoreError, StoreErrorCode,
-    StoreResult, ToolRecordedOutcome,
+    AgentEventBatchOutcome, AgentEventExecutionOutcome, AgentSubmissionOutcome,
+    AgentWorkflowAction, AppendAgentEvents, ApplyEvent, ClaimTask, ClaimedTask, CommandContext,
+    CommandDisposition, Committed, CompleteTask, CompletionShapeError, ControlRun, CreateRun,
+    DurableFollowUp, ExecutionRetryClass, ExpectedRun, FailTask, InitialTask, LeaseProof,
+    NewArtifactRef, NewTask, NewWaitSubscription, NextActions, NormalizedAgentEventInput,
+    PostCommitHint, PrepareAgentExecution, PrepareToolExecution, RecordAgentOutcome,
+    RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, SignatureVerification, StoreError,
+    StoreErrorCode, StoreResult, ToolRecordedOutcome,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1871,6 +1872,7 @@ impl PostgresTransactionExecutor {
                     CommandDisposition::Duplicate,
                     outcome,
                     event_ids,
+                    Vec::new(),
                 ));
             }
             ReceiptGuard::Acquired => {}
@@ -1893,9 +1895,14 @@ impl PostgresTransactionExecutor {
                 "Agent event cursor version changed",
             ));
         }
+        let workflow_projection_allowed =
+            agent_workflow_projection_allowed(&command.expected_run, &run, db_now);
         let mut accepted_receipts = Vec::new();
         let mut duplicate_receipts = Vec::new();
         let mut local_event_ids = Vec::new();
+        let mut durable_follow_ups = Vec::new();
+        let mut projected_run_status = run.status.clone();
+        let mut projected_execution_outcome = None;
         let mut next_sequence = run.next_event_sequence;
         for input in &command.events {
             let receipt_id = uuid(input.receipt_id.into_bytes());
@@ -1947,6 +1954,21 @@ impl PostgresTransactionExecutor {
                     .checked_add(1)
                     .ok_or_else(|| inconsistent("run event sequence overflow"))?;
                 local_event_ids.push(event_id_from_uuid(local_event_id));
+                apply_agent_event_projection(
+                    &transaction,
+                    tenant_id,
+                    run_id,
+                    execution.task_id,
+                    local_event_id,
+                    db_now,
+                    &run,
+                    input,
+                    workflow_projection_allowed,
+                    &mut projected_run_status,
+                    &mut projected_execution_outcome,
+                    &mut durable_follow_ups,
+                )
+                .await?;
             }
             insert_agent_event_receipt(
                 &transaction,
@@ -1969,30 +1991,25 @@ impl PostgresTransactionExecutor {
             .version
             .checked_add(1)
             .ok_or_else(|| inconsistent("Agent execution version overflow"))?;
-        let agent_updated = transaction
-            .execute(
-                "UPDATE agent_loom.agent_executions SET event_cursor = $4, \
-                    cursor_version = $5, version = $6, \
-                    last_synced_at = to_timestamp(($7::bigint)::double precision / 1000000.0), \
-                    updated_at = to_timestamp(($7::bigint)::double precision / 1000000.0) \
-                 WHERE tenant_id = $1 AND agent_execution_id = $2 AND cursor_version = $3",
-                &[
-                    &tenant_id,
-                    &execution_id,
-                    &execution.cursor_version,
-                    &command.next_cursor,
-                    &next_cursor_version,
-                    &next_agent_version,
-                    &db_now,
-                ],
-            )
-            .await
-            .map_err(map_database_error)?;
-        if agent_updated != 1 {
-            return Err(store_error(
-                StoreErrorCode::VersionConflict,
-                "Agent event cursor changed while applying batch",
-            ));
+        update_agent_after_event_batch(
+            &transaction,
+            tenant_id,
+            execution_id,
+            &execution,
+            command.next_cursor.as_ref(),
+            next_cursor_version,
+            next_agent_version,
+            projected_execution_outcome.as_ref(),
+            db_now,
+        )
+        .await?;
+        if projected_execution_outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.status.requires_reconciliation())
+        {
+            durable_follow_ups.push(DurableFollowUp::ReconcileAgent {
+                execution_id: command.agent_execution_id,
+            });
         }
         advance_run_event_batch(
             &transaction,
@@ -2001,6 +2018,7 @@ impl PostgresTransactionExecutor {
             run.version,
             run.execution_generation,
             next_sequence,
+            &projected_run_status,
             db_now,
         )
         .await?;
@@ -2011,7 +2029,7 @@ impl PostgresTransactionExecutor {
             accepted_receipts,
             duplicate_receipts,
             cursor_version: nonnegative_u64(next_cursor_version, "Agent cursor version")?,
-            run_status: parse_run_status(&run.status)?,
+            run_status: parse_run_status(&projected_run_status)?,
         };
         let receipt = encode_agent_batch_receipt(&outcome, &local_event_ids)?;
         finish_receipt(
@@ -2030,6 +2048,7 @@ impl PostgresTransactionExecutor {
             CommandDisposition::Applied,
             outcome,
             local_event_ids,
+            durable_follow_ups,
         ))
     }
 
@@ -2329,7 +2348,15 @@ impl PostgresTransactionExecutor {
             command.stage_mutation,
         )
         .await?;
-        insert_artifacts(&transaction, tenant_id, run_id, task_id, db_now, &command).await?;
+        insert_artifact_refs(
+            &transaction,
+            tenant_id,
+            run_id,
+            task_id,
+            db_now,
+            &command.artifacts,
+        )
+        .await?;
 
         let transition =
             apply_next_actions(&transaction, tenant_id, run_id, event_id, db_now, &command).await?;
@@ -3928,6 +3955,7 @@ async fn insert_agent_event_receipt(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn advance_run_event_batch(
     transaction: &Transaction<'_>,
     tenant_id: Uuid,
@@ -3935,12 +3963,14 @@ async fn advance_run_event_batch(
     version: i64,
     generation: i64,
     next_event_sequence: i64,
+    status: &str,
     db_now: i64,
 ) -> StoreResult<()> {
     let updated = transaction
         .execute(
             "UPDATE agent_loom.runs SET version = version + 1, next_event_sequence = $5, \
-                updated_at = to_timestamp(($6::bigint)::double precision / 1000000.0) \
+                status = $6, \
+                updated_at = to_timestamp(($7::bigint)::double precision / 1000000.0) \
              WHERE tenant_id = $1 AND run_id = $2 AND version = $3 \
                AND execution_generation = $4",
             &[
@@ -3949,6 +3979,7 @@ async fn advance_run_event_batch(
                 &version,
                 &generation,
                 &next_event_sequence,
+                &status,
                 &db_now,
             ],
         )
@@ -4039,6 +4070,186 @@ fn validate_agent_outcome(command: &RecordAgentOutcome) -> StoreResult<()> {
     }
     if let Some(result) = &command.result {
         json_value(result)?;
+    }
+    Ok(())
+}
+
+fn agent_workflow_projection_allowed(
+    expected: &ExpectedRun,
+    run: &LockedEventRun,
+    db_now: i64,
+) -> bool {
+    let fence_matches = expected
+        .version
+        .is_none_or(|value| i64::try_from(value).ok() == Some(run.version))
+        && expected
+            .execution_generation
+            .is_none_or(|value| i64::try_from(value).ok() == Some(run.execution_generation));
+    fence_matches
+        && matches!(
+            run.status.as_str(),
+            "queued" | "running" | "waiting" | "approval_required" | "retrying"
+        )
+        && run.deadline.is_none_or(|deadline| deadline > db_now)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_agent_event_projection(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    task_id: Uuid,
+    event_id: Uuid,
+    db_now: i64,
+    run: &LockedEventRun,
+    input: &NormalizedAgentEventInput,
+    workflow_projection_allowed: bool,
+    projected_run_status: &mut String,
+    projected_execution_outcome: &mut Option<AgentEventExecutionOutcome>,
+    durable_follow_ups: &mut Vec<DurableFollowUp>,
+) -> StoreResult<()> {
+    if let Some(outcome) = &input.projection.execution_outcome {
+        if let Some(result) = &outcome.result {
+            json_value(result)?;
+        }
+        *projected_execution_outcome = Some(outcome.clone());
+    }
+    if !workflow_projection_allowed {
+        return Ok(());
+    }
+    insert_artifact_refs(
+        transaction,
+        tenant_id,
+        run_id,
+        task_id,
+        db_now,
+        &input.projection.artifacts,
+    )
+    .await?;
+    match &input.projection.workflow_action {
+        AgentWorkflowAction::None => {}
+        AgentWorkflowAction::Tasks(tasks) => {
+            let checkpoint_sequence = run
+                .checkpoint_sequence
+                .ok_or_else(|| inconsistent("Agent event projection Run has no checkpoint"))?;
+            for task in tasks {
+                if i64::try_from(task.generation).ok() != Some(run.execution_generation)
+                    || i64::try_from(task.based_on_checkpoint_sequence).ok()
+                        != Some(checkpoint_sequence)
+                {
+                    return Err(invalid_command(
+                        "Agent event Task projection has a stale generation or checkpoint",
+                    ));
+                }
+                insert_new_task(
+                    transaction,
+                    tenant_id,
+                    run_id,
+                    event_id,
+                    db_now,
+                    task,
+                    "queued",
+                )
+                .await?;
+                durable_follow_ups.push(DurableFollowUp::Task {
+                    task_id: task.task_id,
+                });
+            }
+            "queued".clone_into(projected_run_status);
+        }
+        AgentWorkflowAction::Wait(wait) => {
+            insert_new_wait(transaction, tenant_id, run_id, event_id, db_now, wait).await?;
+            *projected_run_status = if wait.wait_type == "approval" {
+                "approval_required".to_owned()
+            } else {
+                "waiting".to_owned()
+            };
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_agent_after_event_batch(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    execution_id: Uuid,
+    execution: &LockedAgentExecution,
+    next_cursor: Option<&String>,
+    next_cursor_version: i64,
+    next_agent_version: i64,
+    projected_outcome: Option<&AgentEventExecutionOutcome>,
+    db_now: i64,
+) -> StoreResult<()> {
+    let updated = if let Some(outcome) = projected_outcome {
+        if !matches!(
+            execution.status.as_str(),
+            "running" | "stopping" | "outcome_unknown" | "reconciling" | "manual_review"
+        ) {
+            return Err(store_error(
+                StoreErrorCode::InvalidTransition,
+                "Agent execution does not accept the projected event outcome",
+            ));
+        }
+        let status = agent_status(outcome.status);
+        let result = outcome.result.as_ref().map(json_value).transpose()?;
+        let terminal = outcome.status.is_terminal();
+        transaction
+            .execute(
+                "UPDATE agent_loom.agent_executions SET event_cursor = $4, \
+                    cursor_version = $5, version = $6, status = $7, result_json = $8, \
+                    error_code = $9, retry_at = NULL, \
+                    completed_at = CASE WHEN $10 THEN \
+                        to_timestamp(($11::bigint)::double precision / 1000000.0) ELSE NULL END, \
+                    last_synced_at = to_timestamp(($11::bigint)::double precision / 1000000.0), \
+                    updated_at = to_timestamp(($11::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND agent_execution_id = $2 AND cursor_version = $3 \
+                   AND version = $12",
+                &[
+                    &tenant_id,
+                    &execution_id,
+                    &execution.cursor_version,
+                    &next_cursor,
+                    &next_cursor_version,
+                    &next_agent_version,
+                    &status,
+                    &result,
+                    &outcome.error_code,
+                    &terminal,
+                    &db_now,
+                    &execution.version,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?
+    } else {
+        transaction
+            .execute(
+                "UPDATE agent_loom.agent_executions SET event_cursor = $4, \
+                    cursor_version = $5, version = $6, \
+                    last_synced_at = to_timestamp(($7::bigint)::double precision / 1000000.0), \
+                    updated_at = to_timestamp(($7::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND agent_execution_id = $2 AND cursor_version = $3 \
+                   AND version = $8",
+                &[
+                    &tenant_id,
+                    &execution_id,
+                    &execution.cursor_version,
+                    &next_cursor,
+                    &next_cursor_version,
+                    &next_agent_version,
+                    &db_now,
+                    &execution.version,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?
+    };
+    if updated != 1 {
+        return Err(store_error(
+            StoreErrorCode::VersionConflict,
+            "Agent event cursor or execution version changed while applying batch",
+        ));
     }
     Ok(())
 }
@@ -5249,15 +5460,15 @@ async fn apply_stage_mutation(
     Ok(())
 }
 
-async fn insert_artifacts(
+async fn insert_artifact_refs(
     transaction: &Transaction<'_>,
     tenant_id: Uuid,
     run_id: Uuid,
     task_id: Uuid,
     db_now: i64,
-    command: &CompleteTask,
+    artifacts: &[NewArtifactRef],
 ) -> StoreResult<()> {
-    for artifact in &command.artifacts {
+    for artifact in artifacts {
         let artifact_id = uuid(artifact.artifact_id.into_bytes());
         let stage_id = artifact.stage_execution_id.map(|id| uuid(id.into_bytes()));
         let contract_version = i64::from(artifact.contract_version);
@@ -5374,54 +5585,7 @@ async fn apply_next_actions(
             })
         }
         NextActions::Wait(wait) => {
-            let wait_id = uuid(wait.wait_id.into_bytes());
-            let stage_id = wait.stage_execution_id.map(|id| uuid(id.into_bytes()));
-            let match_hash = wait.match_key_hash.as_bytes().as_slice();
-            let contract = json_value(&wait.match_contract)?;
-            let expires_at = wait.expires_at.map(UnixMicros::get);
-            let resume_task_id = uuid(wait.resume_task.task_id.into_bytes());
-            let resume_task_kind = task_kind(wait.resume_task.kind);
-            let resume_max_attempts = i64::from(wait.resume_task.max_attempts);
-            let resume_input = json_value(&wait.resume_task.input)?;
-            let resume_deadline = wait.resume_task.deadline.map(UnixMicros::get);
-            transaction
-                .execute(
-                    "INSERT INTO agent_loom.wait_subscriptions (\
-                        wait_id, tenant_id, run_id, stage_execution_id, wait_type, \
-                        expected_event_type, match_key_hash, match_contract_json, status, \
-                        active_slot, expires_at, consumed_by_event_id, created_event_id, \
-                        created_at, consumed_at, updated_at, resume_task_id, \
-                        resume_logical_key, resume_task_kind, resume_priority, \
-                        resume_max_attempts, resume_input_json, resume_deadline\
-                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', 1, \
-                        to_timestamp(($9::bigint)::double precision / 1000000.0), NULL, $10, \
-                        to_timestamp(($11::bigint)::double precision / 1000000.0), NULL, \
-                        to_timestamp(($11::bigint)::double precision / 1000000.0), \
-                        $12, $13, $14, $15, $16, $17, \
-                        to_timestamp(($18::bigint)::double precision / 1000000.0))",
-                    &[
-                        &wait_id,
-                        &tenant_id,
-                        &run_id,
-                        &stage_id,
-                        &wait.wait_type,
-                        &wait.expected_event_type,
-                        &match_hash,
-                        &contract,
-                        &expires_at,
-                        &event_id,
-                        &db_now,
-                        &resume_task_id,
-                        &wait.resume_task.logical_key.as_str(),
-                        &resume_task_kind,
-                        &wait.resume_task.priority,
-                        &resume_max_attempts,
-                        &resume_input,
-                        &resume_deadline,
-                    ],
-                )
-                .await
-                .map_err(map_database_error)?;
+            insert_new_wait(transaction, tenant_id, run_id, event_id, db_now, wait).await?;
             Ok(NextTransition {
                 status: if wait.wait_type == "approval" {
                     "approval_required"
@@ -5443,6 +5607,68 @@ async fn apply_next_actions(
             follow_ups: Vec::new(),
         }),
     }
+}
+
+async fn insert_new_wait(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    event_id: Uuid,
+    db_now: i64,
+    wait: &NewWaitSubscription,
+) -> StoreResult<()> {
+    let wait_id = uuid(wait.wait_id.into_bytes());
+    let stage_id = wait.stage_execution_id.map(|id| uuid(id.into_bytes()));
+    let match_hash = wait.match_key_hash.as_bytes().as_slice();
+    let contract = json_value(&wait.match_contract)?;
+    let expires_at = wait.expires_at.map(UnixMicros::get);
+    let resume_task_id = uuid(wait.resume_task.task_id.into_bytes());
+    let resume_task_kind = task_kind(wait.resume_task.kind);
+    let resume_max_attempts = i64::from(wait.resume_task.max_attempts);
+    let resume_input = json_value(&wait.resume_task.input)?;
+    let resume_deadline = wait.resume_task.deadline.map(UnixMicros::get);
+    let inserted = transaction
+        .execute(
+            "INSERT INTO agent_loom.wait_subscriptions (\
+                wait_id, tenant_id, run_id, stage_execution_id, wait_type, \
+                expected_event_type, match_key_hash, match_contract_json, status, \
+                active_slot, expires_at, consumed_by_event_id, created_event_id, \
+                created_at, consumed_at, updated_at, resume_task_id, \
+                resume_logical_key, resume_task_kind, resume_priority, \
+                resume_max_attempts, resume_input_json, resume_deadline\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', 1, \
+                to_timestamp(($9::bigint)::double precision / 1000000.0), NULL, $10, \
+                to_timestamp(($11::bigint)::double precision / 1000000.0), NULL, \
+                to_timestamp(($11::bigint)::double precision / 1000000.0), \
+                $12, $13, $14, $15, $16, $17, \
+                to_timestamp(($18::bigint)::double precision / 1000000.0))",
+            &[
+                &wait_id,
+                &tenant_id,
+                &run_id,
+                &stage_id,
+                &wait.wait_type,
+                &wait.expected_event_type,
+                &match_hash,
+                &contract,
+                &expires_at,
+                &event_id,
+                &db_now,
+                &resume_task_id,
+                &wait.resume_task.logical_key.as_str(),
+                &resume_task_kind,
+                &wait.resume_task.priority,
+                &resume_max_attempts,
+                &resume_input,
+                &resume_deadline,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if inserted != 1 {
+        return Err(inconsistent("Wait insert did not affect one row"));
+    }
+    Ok(())
 }
 
 async fn insert_new_task(
@@ -5875,6 +6101,7 @@ fn agent_batch_committed(
     disposition: CommandDisposition,
     outcome: AgentEventBatchOutcome,
     event_ids: Vec<EventId>,
+    durable_follow_ups: Vec<DurableFollowUp>,
 ) -> Committed<AgentEventBatchOutcome> {
     let mut post_commit_hints = vec![PostCommitHint::InvalidateRunCache {
         run_id: outcome.run_id,
@@ -5887,11 +6114,17 @@ fn agent_batch_committed(
             },
         );
     }
+    if durable_follow_ups
+        .iter()
+        .any(|follow_up| matches!(follow_up, DurableFollowUp::Task { .. }))
+    {
+        post_commit_hints.push(PostCommitHint::WakeWorkers);
+    }
     Committed {
         disposition,
         value: outcome,
         event_ids,
-        durable_follow_ups: Vec::new(),
+        durable_follow_ups,
         post_commit_hints,
     }
 }
@@ -6433,6 +6666,35 @@ mod tests {
         })
         .expect_err("in-memory-only Agent retry is rejected");
         assert_eq!(error.code, StoreErrorCode::ConstraintViolation);
+    }
+
+    #[test]
+    fn agent_workflow_projection_obeys_run_fences_and_control_states() {
+        let mut run = LockedEventRun {
+            status: "waiting".to_owned(),
+            suspended_from_status: None,
+            version: 3,
+            execution_generation: 2,
+            next_event_sequence: 4,
+            workflow_version_id: None,
+            current_checkpoint_id: None,
+            checkpoint_sequence: Some(1),
+            deadline: Some(100),
+        };
+        let expected = ExpectedRun {
+            run_id: RunId::from_bytes([1; 16]),
+            version: Some(3),
+            execution_generation: Some(2),
+        };
+        assert!(agent_workflow_projection_allowed(&expected, &run, 99));
+
+        run.status = "paused".to_owned();
+        assert!(!agent_workflow_projection_allowed(&expected, &run, 99));
+        run.status = "waiting".to_owned();
+        run.execution_generation = 3;
+        assert!(!agent_workflow_projection_allowed(&expected, &run, 99));
+        run.execution_generation = 2;
+        assert!(!agent_workflow_projection_allowed(&expected, &run, 100));
     }
 
     #[test]
