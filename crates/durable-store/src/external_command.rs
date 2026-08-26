@@ -113,6 +113,7 @@ pub struct PrepareAgentExecution {
     pub agent_version_id: AgentVersionId,
     pub idempotency_key: IdempotencyKey,
     pub request_hash: Digest,
+    pub request: JsonPayload,
     pub capabilities_snapshot: JsonPayload,
     pub prepared_event_id: EventId,
 }

@@ -1760,20 +1760,22 @@ impl PostgresTransactionExecutor {
             .map(|value| uuid(value.into_bytes()));
         let agent_version_id = uuid(command.agent_version_id.into_bytes());
         let request_hash = command.request_hash.as_bytes().as_slice();
+        let request = json_value(&command.request)?;
         let capabilities = json_value(&command.capabilities_snapshot)?;
         transaction
             .execute(
                 "INSERT INTO agent_loom.agent_executions (\
                     agent_execution_id, tenant_id, run_id, stage_execution_id, task_id, \
                     endpoint_id, agent_version_id, idempotency_key, request_hash, \
+                    request_json, \
                     remote_run_ref, remote_session_ref, status, version, \
                     capabilities_snapshot_json, event_cursor, cursor_version, \
                     stop_requested_at, stop_outcome, result_json, error_code, last_synced_at, \
                     created_at, updated_at, completed_at, retry_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, \
-                    'submitting', 0, $10, NULL, 0, NULL, NULL, NULL, NULL, NULL, \
-                    to_timestamp(($11::bigint)::double precision / 1000000.0), \
-                    to_timestamp(($11::bigint)::double precision / 1000000.0), NULL, NULL)",
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, \
+                    'submitting', 0, $11, NULL, 0, NULL, NULL, NULL, NULL, NULL, \
+                    to_timestamp(($12::bigint)::double precision / 1000000.0), \
+                    to_timestamp(($12::bigint)::double precision / 1000000.0), NULL, NULL)",
                 &[
                     &execution_id,
                     &tenant_id,
@@ -1784,6 +1786,7 @@ impl PostgresTransactionExecutor {
                     &agent_version_id,
                     &command.idempotency_key.as_str(),
                     &request_hash,
+                    &request,
                     &capabilities,
                     &db_now,
                 ],
@@ -4296,6 +4299,7 @@ impl LockedAgentExecution {
 }
 
 fn validate_prepare_agent(command: &PrepareAgentExecution) -> StoreResult<()> {
+    json_value(&command.request)?;
     json_value(&command.capabilities_snapshot)?;
     Ok(())
 }

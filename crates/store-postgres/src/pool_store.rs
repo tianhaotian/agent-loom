@@ -1,11 +1,13 @@
+use agent_loom_domain::{AgentExecutionId, ToolExecutionId};
 use agent_loom_domain::{AgentExecutionSnapshot, RunId, RunSnapshot, ToolExecutionSnapshot};
 use agent_loom_durable_store::{
-    AgentEventBatchOutcome, AppendAgentEvents, ApplyDueWork, ApplyEvent, BeginAgentResubmission,
-    BeginToolRetryAttempt, ClaimTask, ClaimedTask, CommandContext, Committed, CompleteTask,
-    ControlRun, CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery, DurableStore, EventCursor,
-    EventPage, FailTask, PrepareAgentExecution, PrepareToolExecution, QueryContext,
-    RecordAgentOutcome, RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, RetryClass,
-    StoreCapabilities, StoreError, StoreErrorCode, StoreFuture, StoreResult,
+    AgentEventBatchOutcome, AgentInvocation, AppendAgentEvents, ApplyDueWork, ApplyEvent,
+    BeginAgentResubmission, BeginToolRetryAttempt, ClaimTask, ClaimedTask, CommandContext,
+    Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery,
+    DurableStore, EventCursor, EventPage, FailTask, PrepareAgentExecution, PrepareToolExecution,
+    QueryContext, RecordAgentOutcome, RecordAgentSubmission, RecordToolOutcome, RenewTaskLease,
+    RetryClass, StoreCapabilities, StoreError, StoreErrorCode, StoreFuture, StoreResult,
+    ToolInvocation,
 };
 use deadpool_postgres::{Object, Pool};
 
@@ -98,6 +100,32 @@ impl DurableStore for PostgresStore {
         Box::pin(async move {
             let client = self.connection().await?;
             self.executor.scan_due_work(&client, context, query).await
+        })
+    }
+
+    fn get_tool_invocation<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        execution_id: ToolExecutionId,
+    ) -> StoreFuture<'a, Option<ToolInvocation>> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor
+                .get_tool_invocation(&client, context, execution_id)
+                .await
+        })
+    }
+
+    fn get_agent_invocation<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        execution_id: AgentExecutionId,
+    ) -> StoreFuture<'a, Option<AgentInvocation>> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor
+                .get_agent_invocation(&client, context, execution_id)
+                .await
         })
     }
 

@@ -1,13 +1,16 @@
 use std::{future::Future, pin::Pin};
 
-use agent_loom_domain::{AgentExecutionSnapshot, RunId, RunSnapshot, ToolExecutionSnapshot};
+use agent_loom_domain::{
+    AgentExecutionId, AgentExecutionSnapshot, RunId, RunSnapshot, ToolExecutionId,
+    ToolExecutionSnapshot,
+};
 
 use crate::{
-    AgentEventBatchOutcome, AppendAgentEvents, ApplyDueWork, ApplyEvent, BeginAgentResubmission,
-    BeginToolRetryAttempt, ClaimTask, ClaimedTask, Committed, CompleteTask, ControlRun, CreateRun,
-    DueWorkOutcome, DueWorkPage, DueWorkQuery, EventCursor, EventPage, FailTask,
-    PrepareAgentExecution, PrepareToolExecution, QueryContext, RecordAgentOutcome,
-    RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, StoreResult,
+    AgentEventBatchOutcome, AgentInvocation, AppendAgentEvents, ApplyDueWork, ApplyEvent,
+    BeginAgentResubmission, BeginToolRetryAttempt, ClaimTask, ClaimedTask, Committed, CompleteTask,
+    ControlRun, CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery, EventCursor, EventPage,
+    FailTask, PrepareAgentExecution, PrepareToolExecution, QueryContext, RecordAgentOutcome,
+    RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, StoreResult, ToolInvocation,
 };
 
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = StoreResult<T>> + Send + 'a>>;
@@ -58,6 +61,18 @@ pub trait DurableStore: Send + Sync {
         context: &'a QueryContext,
         query: DueWorkQuery,
     ) -> StoreFuture<'a, DueWorkPage>;
+
+    fn get_tool_invocation<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        execution_id: ToolExecutionId,
+    ) -> StoreFuture<'a, Option<ToolInvocation>>;
+
+    fn get_agent_invocation<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        execution_id: AgentExecutionId,
+    ) -> StoreFuture<'a, Option<AgentInvocation>>;
 
     fn apply_due_work<'a>(
         &'a self,

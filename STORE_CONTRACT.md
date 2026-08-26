@@ -275,6 +275,11 @@ pub trait DurableStore: Send + Sync {
         cmd: PrepareToolExecution,
     ) -> StoreFuture<'a, Committed<ToolExecutionSnapshot>>;
 
+    fn get_tool_invocation<'a>(
+        &'a self,
+        query: GetToolInvocation,
+    ) -> StoreFuture<'a, Option<ToolInvocation>>;
+
     fn begin_tool_retry_attempt<'a>(
         &'a self,
         cmd: BeginToolRetryAttempt,
@@ -289,6 +294,11 @@ pub trait DurableStore: Send + Sync {
         &'a self,
         cmd: PrepareAgentExecution,
     ) -> StoreFuture<'a, Committed<AgentExecutionSnapshot>>;
+
+    fn get_agent_invocation<'a>(
+        &'a self,
+        query: GetAgentInvocation,
+    ) -> StoreFuture<'a, Option<AgentInvocation>>;
 
     fn begin_agent_resubmission<'a>(
         &'a self,
@@ -512,6 +522,8 @@ prepare_agent_execution（提交 submitting 意图）
   → AgentServerAdapter.submit
   → record_agent_submission（保存 remote_run_ref、Wait/poll）
 ```
+
+Agent 提交意图必须同时保存规范化请求信封、request hash、Endpoint 幂等键和能力快照。恢复 Worker 通过 tenant-scoped `get_agent_invocation` 重新装载同一信封；不得依赖首次提交 Worker 的内存。Tool 使用等价的 `get_tool_invocation` 读取既有 `request_json`。
 
 `submitting` 长时间未保存 remote reference 时必须进入 reconcile，而不是重新 submit。Pause/Cancel 事务把 Execution 标记为 stop requested 并创建稳定 logical key 的 stop Task；PostCommitHint 只唤醒 Worker。
 

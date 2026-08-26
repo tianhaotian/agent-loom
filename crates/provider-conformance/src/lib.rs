@@ -177,6 +177,16 @@ mod tests {
     }
 
     #[test]
+    fn agent_invocation_request_is_persisted_by_both_providers() {
+        for migrations in [postgres::MIGRATIONS, mysql::MIGRATIONS] {
+            let sql = migrations[10].sql;
+            assert!(sql.contains("agent_executions"));
+            assert!(sql.contains("request_json"));
+            assert!(sql.contains("NOT NULL"));
+        }
+    }
+
+    #[test]
     fn artifact_versions_and_lineage_are_provider_equivalent() {
         for migrations in [postgres::MIGRATIONS, mysql::MIGRATIONS] {
             let sql = migrations[5].sql;

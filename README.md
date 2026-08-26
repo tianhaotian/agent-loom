@@ -16,7 +16,7 @@ crates/store-mysql     MySQL/InnoDB Provider 与物理迁移
 
 `domain`、`durable-store` 与 `adapter-core` 继续保持零外部依赖；Provider crate 可以引入各自的数据库驱动和异步运行时，但驱动类型不得泄漏到共享领域契约。
 
-已实现 `0000_migration_meta` 至 `0009_agent_retry_schedule` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt、Checkpoint、Wait、Artifact、ToolExecution 与 AgentExecution。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、Wait 单次消费槽与恢复计划、Tool/Agent 重试时间、Artifact 版本血缘、外部执行幂等与 Agent Event 去重。
+已实现 `0000_migration_meta` 至 `0010_agent_invocation_envelope` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt、Checkpoint、Wait、Artifact、ToolExecution 与 AgentExecution。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、Wait 单次消费槽与恢复计划、Tool/Agent 重试时间、Agent 请求信封、Artifact 版本血缘、外部执行幂等与 Agent Event 去重。
 
 PostgreSQL 已接入真实驱动执行层：migration executor 使用 SHA-256 physical checksum、session advisory lock、step journal 和逐批 schema introspection；`PostgresStore` 通过连接池完整实现对象安全的 `DurableStore`，事务垂直切片已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 准备/结果记录、AgentExecution 提交/事件/结果记录，以及 Pause/Resume/Cancel。写路径包含 receipt 并发幂等闸门、显式层级锁序、`FOR UPDATE SKIP LOCKED`、Lease fencing、Run version/generation CAS，以及 Event、Checkpoint、Stage、Artifact 和后续动作的原子提交。
 

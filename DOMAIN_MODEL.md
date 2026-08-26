@@ -405,7 +405,7 @@ started_at, completed_at, updated_at
 
 ```text
 agent_execution_id, tenant_id, run_id, stage_execution_id, task_id,
-endpoint_id, agent_version_id, idempotency_key, request_hash,
+endpoint_id, agent_version_id, idempotency_key, request_hash, request_json,
 remote_run_ref, remote_session_ref, status, version,
 capabilities_snapshot_json, event_cursor, cursor_version,
 stop_requested_at, stop_outcome, result_json, error_code,
@@ -418,6 +418,7 @@ retry_at, last_synced_at, created_at, updated_at, completed_at
 - 唯一：`(tenant_id, endpoint_id, idempotency_key)`；
 - 非空 remote reference 时应在 Endpoint 作用域唯一；
 - event cursor 更新必须匹配 `cursor_version`，避免两个同步 Worker 互相覆盖；
+- `request_json` 是规范化、可重放的 Agent Server 请求信封；必须与 `request_hash` 一致并在首次提交前持久化，凭据只能保存引用，不能进入请求信封；
 - `SameRequestBackoff` 映射到 `reconciling` 并必须设置数据库时间语义的 `retry_at`；其他 Agent 状态不得残留该字段；
 - `reconciling → submitting` 的自动重提必须由匹配 `agent.retry_due` Event 的已领取恢复 Task 授权，且沿用原 Endpoint 与 idempotency key；
 - capabilities snapshot 创建后不可覆盖，能力重新发现只影响新 AgentExecution。

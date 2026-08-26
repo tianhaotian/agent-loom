@@ -1,10 +1,11 @@
 use agent_loom_domain::{
-    AgentExecutionId, CheckpointId, EventRecord, JsonPayload, RunId, RunSnapshot, TenantId,
-    ToolExecutionId, UnixMicros,
+    AgentExecutionId, AgentVersionId, CheckpointId, Digest, EndpointId, EventRecord,
+    IdempotencyKey, JsonPayload, RunId, RunSnapshot, ScopeKey, TenantId, ToolExecutionId,
+    UnixMicros,
 };
 use agent_loom_durable_store::{
-    DueWorkCandidate, DueWorkKind, DueWorkPage, DueWorkQuery, DueWorkTarget, EventCursor,
-    EventPage, QueryContext, StoreError, StoreErrorCode, StoreResult,
+    AgentInvocation, DueWorkCandidate, DueWorkKind, DueWorkPage, DueWorkQuery, DueWorkTarget,
+    EventCursor, EventPage, QueryContext, StoreError, StoreErrorCode, StoreResult, ToolInvocation,
 };
 use serde_json::Value;
 use tokio_postgres::{Client, Row};
@@ -190,6 +191,103 @@ impl crate::PostgresTransactionExecutor {
             next_cursor,
         })
     }
+
+    /// Loads the immutable Tool Adapter invocation envelope for one execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error when PostgreSQL is unavailable or persisted
+    /// identity/request data violates the portable contract.
+    pub async fn get_tool_invocation(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        execution_id: ToolExecutionId,
+    ) -> StoreResult<Option<ToolInvocation>> {
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let execution_id = uuid(execution_id.into_bytes());
+        let row = client
+            .query_opt(
+                "SELECT run_id, tool_name, idempotency_scope, idempotency_key, \
+                        request_hash, request_json \
+                 FROM agent_loom.tool_executions \
+                 WHERE tenant_id = $1 AND tool_execution_id = $2",
+                &[&tenant_id, &execution_id],
+            )
+            .await
+            .map_err(map_database_error)?;
+        row.map(|row| {
+            Ok(ToolInvocation {
+                tenant_id: context.tenant_id,
+                tool_execution_id: ToolExecutionId::from_bytes(execution_id.into_bytes()),
+                run_id: run_id_from_uuid(row.get(0)),
+                tool_name: row.get(1),
+                idempotency_scope: ScopeKey::parse(row.get::<_, String>(2))
+                    .map_err(|_| inconsistent("Tool invocation has an invalid scope"))?,
+                idempotency_key: IdempotencyKey::parse(row.get::<_, String>(3))
+                    .map_err(|_| inconsistent("Tool invocation has an invalid idempotency key"))?,
+                request_hash: decode_digest(row.get(4), "Tool invocation request hash")?,
+                request: decode_json_payload(&row.get(5))?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Loads the immutable Agent Server invocation envelope for one execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error when PostgreSQL is unavailable or persisted
+    /// identity/request data violates the portable contract.
+    pub async fn get_agent_invocation(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        execution_id: AgentExecutionId,
+    ) -> StoreResult<Option<AgentInvocation>> {
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let execution_id = uuid(execution_id.into_bytes());
+        let row = client
+            .query_opt(
+                "SELECT run_id, endpoint_id, agent_version_id, idempotency_key, \
+                        request_hash, request_json, capabilities_snapshot_json \
+                 FROM agent_loom.agent_executions \
+                 WHERE tenant_id = $1 AND agent_execution_id = $2",
+                &[&tenant_id, &execution_id],
+            )
+            .await
+            .map_err(map_database_error)?;
+        row.map(|row| {
+            let endpoint_id: Uuid = row.get(1);
+            let agent_version_id: Uuid = row.get(2);
+            Ok(AgentInvocation {
+                tenant_id: context.tenant_id,
+                agent_execution_id: AgentExecutionId::from_bytes(execution_id.into_bytes()),
+                run_id: run_id_from_uuid(row.get(0)),
+                endpoint_id: EndpointId::from_bytes(endpoint_id.into_bytes()),
+                agent_version_id: AgentVersionId::from_bytes(agent_version_id.into_bytes()),
+                idempotency_key: IdempotencyKey::parse(row.get::<_, String>(3))
+                    .map_err(|_| inconsistent("Agent invocation has an invalid idempotency key"))?,
+                request_hash: decode_digest(row.get(4), "Agent invocation request hash")?,
+                request: decode_json_payload(&row.get(5))?,
+                capabilities_snapshot: decode_json_payload(&row.get(6))?,
+            })
+        })
+        .transpose()
+    }
+}
+
+fn decode_digest(value: Vec<u8>, field: &str) -> StoreResult<Digest> {
+    let bytes: [u8; 32] = value
+        .try_into()
+        .map_err(|_| inconsistent(&format!("{field} has an invalid length")))?;
+    Ok(Digest::from_bytes(bytes))
+}
+
+fn decode_json_payload(value: &Value) -> StoreResult<JsonPayload> {
+    serde_json::to_vec(value)
+        .map(JsonPayload::from_validated_bytes)
+        .map_err(|_| inconsistent("failed to encode persisted invocation JSON"))
 }
 
 const fn due_work_kind(kind: DueWorkKind) -> &'static str {
@@ -300,5 +398,14 @@ mod tests {
         assert!(source.contains("(due_micros, kind, execution_id) >"));
         assert!(source.contains("ORDER BY due_micros, kind, execution_id LIMIT $5"));
         assert_eq!(MAX_DUE_WORK_PAGE_SIZE, 1_000);
+    }
+
+    #[test]
+    fn invocation_queries_are_tenant_scoped_and_load_requests() {
+        let source = include_str!("query_executor.rs");
+        assert!(source.contains("WHERE tenant_id = $1 AND tool_execution_id = $2"));
+        assert!(source.contains("WHERE tenant_id = $1 AND agent_execution_id = $2"));
+        assert!(source.contains("request_hash, request_json"));
+        assert!(source.contains("capabilities_snapshot_json"));
     }
 }
