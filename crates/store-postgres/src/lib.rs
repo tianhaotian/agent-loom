@@ -1,6 +1,7 @@
 //! PostgreSQL provider bootstrap, migrations, and transactional execution paths.
 
 mod migration_executor;
+mod query_executor;
 mod transaction_executor;
 
 pub use migration_executor::*;
