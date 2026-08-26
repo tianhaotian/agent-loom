@@ -6,6 +6,7 @@ pub enum ConformanceCase {
     CreateRunAtomicity,
     CommandIdempotency,
     ConcurrentTaskClaim,
+    LeaseExpiryRetry,
     LeaseRenewReclaimCompleteRace,
     WaitSingleConsumption,
     PauseGenerationFence,
@@ -27,6 +28,7 @@ impl ConformanceCase {
             Self::CreateRunAtomicity => "create_run_atomicity",
             Self::CommandIdempotency => "command_idempotency",
             Self::ConcurrentTaskClaim => "concurrent_task_claim",
+            Self::LeaseExpiryRetry => "lease_expiry_retry",
             Self::LeaseRenewReclaimCompleteRace => "lease_renew_reclaim_complete_race",
             Self::WaitSingleConsumption => "wait_single_consumption",
             Self::PauseGenerationFence => "pause_generation_fence",
@@ -48,6 +50,7 @@ pub const CORE_CASES: &[ConformanceCase] = &[
     ConformanceCase::CreateRunAtomicity,
     ConformanceCase::CommandIdempotency,
     ConformanceCase::ConcurrentTaskClaim,
+    ConformanceCase::LeaseExpiryRetry,
     ConformanceCase::LeaseRenewReclaimCompleteRace,
     ConformanceCase::WaitSingleConsumption,
     ConformanceCase::PauseGenerationFence,
@@ -72,6 +75,7 @@ mod tests {
     fn case_keys_are_unique_and_stable() {
         let keys: HashSet<_> = CORE_CASES.iter().map(|case| case.stable_key()).collect();
         assert_eq!(keys.len(), CORE_CASES.len());
+        assert!(keys.contains("lease_expiry_retry"));
         assert!(keys.contains("unique_terminal_event"));
         assert!(keys.contains("delivery_workflow_equivalence"));
     }

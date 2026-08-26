@@ -25,7 +25,7 @@ runtime/src/service/    有界轮询、退避、关闭信号与 Job 接线
 
 `domain`、`durable-store` 与 `adapter-core` 继续保持零外部依赖；Provider crate 可以引入各自的数据库驱动和异步运行时，但驱动类型不得泄漏到共享领域契约。
 
-已实现 `0000_migration_meta` 至 `0010_agent_invocation_envelope` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt、Checkpoint、Wait、Artifact、ToolExecution 与 AgentExecution。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、Wait 单次消费槽与恢复计划、Tool/Agent 重试时间、Agent 请求信封、Artifact 版本血缘、外部执行幂等与 Agent Event 去重。
+已实现 `0000_migration_meta` 至 `0010_agent_invocation_envelope` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt、Checkpoint、Wait、Artifact、ToolExecution 与 AgentExecution。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、Wait 单次消费槽与恢复计划、Tool/Agent 重试时间、Agent 请求信封、Artifact 版本血缘、外部执行幂等与 Agent Event 去重；同时提供只依赖 `dyn DurableStore` 的黑盒行为场景，首个场景覆盖 Lease 续租与回收幂等、过期重试投影、attempt 递增与再次领取。
 
 PostgreSQL 已接入真实驱动执行层：migration executor 使用 SHA-256 physical checksum、session advisory lock、step journal 和逐批 schema introspection；`PostgresStore` 通过连接池完整实现对象安全的 `DurableStore`，事务垂直切片已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 准备/结果记录、AgentExecution 提交/事件/结果记录，以及 Pause/Resume/Cancel。写路径包含 receipt 并发幂等闸门、显式层级锁序、`FOR UPDATE SKIP LOCKED`、Lease fencing、Run version/generation CAS，以及 Event、Checkpoint、Stage、Artifact 和后续动作的原子提交。
 
@@ -54,9 +54,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 设置测试专用数据库后可同时执行真实 migration 与事务 smoke test；后者还覆盖查询分页、续租与失败幂等、Lease fencing、Wait 单次消费与恢复 Task、暂停/恢复/取消幂等，以及 `cancel`/`complete_task` 并发终态唯一性：
 
 ```bash
-AGENT_LOOM_TEST_POSTGRES_URL='postgresql://...' cargo test -p agent-loom-store-postgres
+AGENT_LOOM_TEST_POSTGRES_URL='postgresql://...' cargo test \
+  -p agent-loom-store-postgres \
+  -p agent-loom-provider-conformance \
+  -- --test-threads=1
 ```
 
-smoke test 会在目标数据库创建唯一测试 Tenant/Run 作为审计记录；不要指向生产数据库。
+数据库测试会在目标库创建唯一测试 Tenant/Run 作为审计记录；不要指向生产数据库。
 
-GitHub Actions 会分别执行 workspace 质量门禁和 PostgreSQL 16 真实事务测试。数据库 Job 通过 `AGENT_LOOM_TEST_POSTGRES_URL` 启用 migration 与事务垂直切片，并使用单线程测试避免同库迁移用例并发干扰。
+GitHub Actions 会分别执行 workspace 质量门禁和 PostgreSQL 16 真实事务测试。数据库 Job 通过 `AGENT_LOOM_TEST_POSTGRES_URL` 启用 migration、事务垂直切片和 Provider 黑盒场景，并使用单线程测试避免同库迁移用例并发干扰。

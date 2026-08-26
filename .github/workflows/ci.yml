@@ -71,4 +71,8 @@ jobs:
           rustup default 1.98.0
 
       - name: Run PostgreSQL migration and transaction tests
-        run: cargo test -p agent-loom-store-postgres --all-targets -- --test-threads=1
+        run: >-
+          cargo test
+          -p agent-loom-store-postgres
+          -p agent-loom-provider-conformance
+          --all-targets -- --test-threads=1

@@ -1,5 +1,12 @@
 //! Provider-neutral migration and behavior contract tests.
 
+mod behavior;
+
+pub use behavior::*;
+
+#[cfg(test)]
+mod postgres_behavior_tests;
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;

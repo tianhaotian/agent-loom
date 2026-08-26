@@ -21,7 +21,7 @@ impl RunStatus {
     }
 
     pub const fn accepts_task_claim(self) -> bool {
-        matches!(self, Self::Queued | Self::Running)
+        matches!(self, Self::Queued | Self::Running | Self::Retrying)
     }
 }
 
@@ -132,6 +132,15 @@ mod tests {
         assert!(RunStatus::Cancelled.is_terminal());
         assert!(!RunStatus::Paused.is_terminal());
         assert!(!RunStatus::Running.is_terminal());
+    }
+
+    #[test]
+    fn retrying_run_accepts_the_scheduled_retry_claim() {
+        assert!(RunStatus::Queued.accepts_task_claim());
+        assert!(RunStatus::Running.accepts_task_claim());
+        assert!(RunStatus::Retrying.accepts_task_claim());
+        assert!(!RunStatus::Waiting.accepts_task_claim());
+        assert!(!RunStatus::Paused.accepts_task_claim());
     }
 
     #[test]

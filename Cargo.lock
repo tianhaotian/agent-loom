@@ -24,9 +24,14 @@ dependencies = [
 name = "agent-loom-provider-conformance"
 version = "0.1.0"
 dependencies = [
+ "agent-loom-domain",
  "agent-loom-durable-store",
  "agent-loom-store-mysql",
  "agent-loom-store-postgres",
+ "deadpool-postgres",
+ "tokio",
+ "tokio-postgres",
+ "uuid",
 ]
 
 [[package]]
