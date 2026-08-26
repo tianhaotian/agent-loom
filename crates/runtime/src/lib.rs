@@ -1,9 +1,11 @@
 //! Runtime orchestration that depends only on portable Store and Adapter boundaries.
 
-mod dispatcher;
+mod adapter;
+mod recovery;
 mod scheduler;
-mod worker;
+mod service;
 
-pub use dispatcher::*;
+pub use adapter::*;
+pub use recovery::*;
 pub use scheduler::*;
-pub use worker::*;
+pub use service::*;

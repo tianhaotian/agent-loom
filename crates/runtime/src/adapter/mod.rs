@@ -912,5 +912,5 @@ fn dispatch_error(message: &str) -> ExternalDispatchError {
 }
 
 #[cfg(test)]
-#[path = "dispatcher_tests.rs"]
+#[path = "tests.rs"]
 mod tests;

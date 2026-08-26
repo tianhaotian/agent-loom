@@ -321,10 +321,10 @@ Kafka、NATS 或 Redis Streams 可以在高吞吐事件分发时引入，但必�
 
 ## 11. 下一步
 
-已完成共享领域/Store/Adapter 契约骨架、`0000` 至 `0010` PostgreSQL/MySQL 对等迁移、migration runner/执行状态机，以及 PostgreSQL migration executor。PostgreSQL 事务垂直切片现已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 两阶段记录、AgentExecution 提交/事件/结果记录和 Pause/Resume/Cancel；连接池封装已完整实现对象安全的 `DurableStore`。Worker、事件、外部执行与控制命令统一使用显式层级锁序。失败路径已区分 retry、fatal 与 Dead Letter，Wait 持久化恢复计划，Tool/Agent backoff 持久化 due time，Agent event receipt、local Event、cursor 与 Run sequence 同事务提交。Tool/Agent due-work 扫描、确定性 Runtime Scheduler tick、原子应用与恢复 Worker 已贯通到实际 Adapter 调用与结果回写：dispatcher 按 tenant 装载 invocation envelope，通过 Registry 解析服务端 Adapter，由可注入工厂解析短期凭据/trace/deadline，并在重放前校验 Tool 副作用等级与 Agent submission 幂等能力快照。外部结果使用提交后的 Run fence 和确定性 Command/Event 身份回写。后续按以下顺序推进：
+已完成共享领域/Store/Adapter 契约骨架、`0000` 至 `0010` PostgreSQL/MySQL 对等迁移、migration runner/执行状态机，以及 PostgreSQL migration executor。PostgreSQL 事务垂直切片现已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 两阶段记录、AgentExecution 提交/事件/结果记录和 Pause/Resume/Cancel；连接池封装已完整实现对象安全的 `DurableStore`。Worker、事件、外部执行与控制命令统一使用显式层级锁序。失败路径已区分 retry、fatal 与 Dead Letter，Wait 持久化恢复计划，Tool/Agent backoff 持久化 due time，Agent event receipt、local Event、cursor 与 Run sequence 同事务提交。Tool/Agent due-work 扫描、确定性 Runtime Scheduler tick、原子应用与恢复 Worker 已贯通到实际 Adapter 调用与结果回写：dispatcher 按 tenant 装载 invocation envelope，通过 Registry 解析服务端 Adapter，由可注入工厂解析短期凭据/trace/deadline，并在重放前校验 Tool 副作用等级与 Agent submission 幂等能力快照。外部结果使用提交后的 Run fence 和确定性 Command/Event 身份回写。Runtime 已按 adapter/recovery/scheduler/service 重组；通用 PollingService 提供有界并发、分级退避、进度报告和优雅停机，Scheduler 与 Recovery Worker 通过数据库无关 Job 接入。恢复启动事务会原子完成一次性 reconcile Task，外部调用不再泄漏 Lease。后续按以下顺序推进：
 
 1. 在 CI 的 PostgreSQL 16+ 测试库启用 `AGENT_LOOM_TEST_POSTGRES_URL`，持续执行真实 migration、重复命令、领取/续租/完成/失败、暂停/恢复/取消和 cancel/complete 竞争 smoke test；继续补充多 Worker 领取、续租/回收竞争与故障注入测试。
-2. 将现有有界 Scheduler/Recovery Worker tick 和 Adapter dispatcher 接入常驻服务循环，补齐 Lease 续租、过期 Lease 回收、优雅停机和有界并发。
+2. 实现数据库权威时间驱动的通用过期 Lease 回收；长时普通 Task 使用续租，一次性 recovery Task 在启动事务内完成，不跨外部调用持有 Lease。
 3. 将共享 conformance harness 从 schema 形状测试扩展为 Provider 黑盒行为测试，并实现 MySQL 对等事务路径。
 4. 补齐 stale external execution、Wait timeout 与 Run deadline 的扫描及应用事务。
 5. 实现 Mock Agent Server Adapter 和业产研 Workflow fixture，跑通需求分析至部署的模拟 E2E。

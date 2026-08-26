@@ -1357,6 +1357,18 @@ impl PostgresTransactionExecutor {
             )
             .await
             .map_err(map_database_error)?;
+        complete_recovery_task(
+            &transaction,
+            tenant_id,
+            &locked,
+            db_now,
+            &json!({
+                "tool_execution_id": execution_id,
+                "attempt": next_attempt,
+                "outcome": "retry_attempt_started",
+            }),
+        )
+        .await?;
         let event_id = uuid(command.started_event_id.into_bytes());
         let event_payload = json!({
             "tool_execution_id": execution_id,
@@ -1969,6 +1981,18 @@ impl PostgresTransactionExecutor {
                 "Agent resubmission was started concurrently",
             ));
         }
+        complete_recovery_task(
+            &transaction,
+            tenant_id,
+            &locked,
+            db_now,
+            &json!({
+                "agent_execution_id": execution_id,
+                "version": next_version,
+                "outcome": "resubmission_started",
+            }),
+        )
+        .await?;
         let event_id = uuid(command.started_event_id.into_bytes());
         let event_payload = json!({
             "agent_execution_id": execution_id,
@@ -6192,6 +6216,56 @@ async fn finalize_task(
     Ok(())
 }
 
+async fn complete_recovery_task(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    locked: &LockedWorkerTask,
+    db_now: i64,
+    result: &Value,
+) -> StoreResult<()> {
+    let updated = transaction
+        .execute(
+            "UPDATE agent_loom.tasks SET status = 'succeeded', result_json = $4, \
+                lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, \
+                updated_at = to_timestamp(($5::bigint)::double precision / 1000000.0), \
+                completed_at = to_timestamp(($5::bigint)::double precision / 1000000.0) \
+             WHERE tenant_id = $1 AND task_id = $2 AND attempt = $3 \
+               AND status = 'leased'",
+            &[
+                &tenant_id,
+                &locked.task_id,
+                &locked.attempt,
+                &result,
+                &db_now,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if updated != 1 {
+        return Err(store_error(
+            StoreErrorCode::LeaseLost,
+            "recovery Task Lease changed while starting external execution",
+        ));
+    }
+    let attempt_updated = transaction
+        .execute(
+            "UPDATE agent_loom.task_attempts SET \
+                finished_at = to_timestamp(($4::bigint)::double precision / 1000000.0), \
+                outcome = 'succeeded' \
+             WHERE tenant_id = $1 AND task_id = $2 AND attempt = $3 \
+               AND finished_at IS NULL",
+            &[&tenant_id, &locked.task_id, &locked.attempt, &db_now],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if attempt_updated != 1 {
+        return Err(inconsistent(
+            "leased recovery Task has no open matching attempt",
+        ));
+    }
+    Ok(())
+}
+
 async fn apply_stage_mutation(
     transaction: &Transaction<'_>,
     tenant_id: Uuid,
@@ -7738,6 +7812,8 @@ mod tests {
         assert!(source.contains("retry_at <= to_timestamp"));
         assert!(source.contains("tool.retry_attempt_started"));
         assert!(source.contains("agent.resubmission_started"));
+        assert!(source.matches("complete_recovery_task(").count() >= 3);
+        assert!(source.contains("leased recovery Task has no open matching attempt"));
         assert!(source.contains("recovery Task was not authorized"));
         assert!(source.contains("($4::text IS NULL OR t.kind = $4)"));
     }
