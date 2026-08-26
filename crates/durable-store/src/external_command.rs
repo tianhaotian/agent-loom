@@ -42,6 +42,7 @@ pub enum ToolRecordedOutcome {
     Failed {
         error_code: String,
         retry: ExecutionRetryClass,
+        retry_at: Option<agent_loom_domain::UnixMicros>,
     },
     Uncertain {
         external_ref: Option<String>,

@@ -1,13 +1,14 @@
 use agent_loom_domain::{
     AgentExecutionId, CheckpointId, EventId, JsonPayload, LogicalKey, RunId, RunSnapshot,
     RunStatus, StageExecutionId, StageStatus, TaskId, TaskKind, TaskSnapshot, TaskStatus, TenantId,
-    ToolExecutionId, UnixMicros, WorkflowVersionId,
+    ToolExecutionId, ToolExecutionSnapshot, ToolExecutionStatus, UnixMicros, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
     ApplyEvent, ClaimTask, ClaimedTask, CommandContext, CommandDisposition, Committed,
-    CompleteTask, CompletionShapeError, ControlRun, CreateRun, DurableFollowUp, ExpectedRun,
-    FailTask, InitialTask, LeaseProof, NewTask, NextActions, PostCommitHint, RenewTaskLease,
-    SignatureVerification, StoreError, StoreErrorCode, StoreResult,
+    CompleteTask, CompletionShapeError, ControlRun, CreateRun, DurableFollowUp,
+    ExecutionRetryClass, ExpectedRun, FailTask, InitialTask, LeaseProof, NewTask, NextActions,
+    PostCommitHint, PrepareToolExecution, RecordToolOutcome, RenewTaskLease, SignatureVerification,
+    StoreError, StoreErrorCode, StoreResult, ToolRecordedOutcome,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -986,6 +987,460 @@ impl PostgresTransactionExecutor {
             snapshot,
             Some(command.event_id),
             (!paused).then_some(wait.resume_task_id),
+        ))
+    }
+
+    /// Persists Tool execution intent and its first adapter attempt before an
+    /// external side effect is performed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable store error for malformed metadata, a stale/lost
+    /// lease, conflicting Tool idempotency identity, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn prepare_tool_execution(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: PrepareToolExecution,
+    ) -> StoreResult<Committed<ToolExecutionSnapshot>> {
+        validate_prepare_tool(&command)?;
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        match acquire_receipt(
+            &transaction,
+            context,
+            db_now,
+            self.config.receipt_ttl_micros,
+        )
+        .await?
+        {
+            ReceiptGuard::Existing(receipt) => {
+                let snapshot = decode_tool_receipt(context.tenant_id, &receipt.outcome)?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(tool_committed(
+                    CommandDisposition::Duplicate,
+                    snapshot,
+                    receipt.event_id.map(event_id),
+                    Vec::new(),
+                ));
+            }
+            ReceiptGuard::Acquired => {}
+        }
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let locked = lock_worker_task(
+            &transaction,
+            tenant_id,
+            uuid(command.expected_run.run_id.into_bytes()),
+            uuid(command.lease.task_id.into_bytes()),
+        )
+        .await?;
+        validate_worker_fences(
+            &command.expected_run,
+            &command.lease,
+            &locked,
+            db_now,
+            "tool preparation",
+        )?;
+        if locked.stage_execution_id
+            != command
+                .stage_execution_id
+                .map(|value| uuid(value.into_bytes()))
+        {
+            return Err(invalid_command(
+                "tool execution stage does not match the leased task",
+            ));
+        }
+        if let Some(existing) = lock_tool_by_idempotency(
+            &transaction,
+            tenant_id,
+            command.idempotency_scope.as_str(),
+            command.idempotency_key.as_str(),
+        )
+        .await?
+        {
+            validate_existing_tool(&command, &locked, &existing)?;
+            let snapshot = existing.snapshot(context.tenant_id)?;
+            let outcome = encode_tool_receipt(&snapshot)?;
+            finish_receipt(
+                &transaction,
+                context,
+                "no_op",
+                &outcome,
+                None,
+                Some((
+                    "tool_execution",
+                    existing.tool_execution_id,
+                    existing.attempt_count,
+                )),
+            )
+            .await?;
+            transaction.commit().await.map_err(map_database_error)?;
+            return Ok(tool_committed(
+                CommandDisposition::NoOp,
+                snapshot,
+                None,
+                Vec::new(),
+            ));
+        }
+        let execution_id = uuid(command.tool_execution_id.into_bytes());
+        let attempt_id = uuid(command.tool_attempt_id.into_bytes());
+        let stage_id = command
+            .stage_execution_id
+            .map(|value| uuid(value.into_bytes()));
+        let request = json_value(&command.request)?;
+        let request_hash = command.request_hash.as_bytes().as_slice();
+        transaction
+            .execute(
+                "INSERT INTO agent_loom.tool_executions (\
+                    tool_execution_id, tenant_id, run_id, stage_execution_id, task_id, \
+                    tool_call_id, tool_name, idempotency_scope, idempotency_key, request_hash, \
+                    status, attempt_count, request_json, result_json, error_code, \
+                    recovery_action, external_ref, started_at, created_at, updated_at, \
+                    completed_at, retry_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'executing', 1, \
+                    $11, NULL, NULL, NULL, NULL, \
+                    to_timestamp(($12::bigint)::double precision / 1000000.0), \
+                    to_timestamp(($12::bigint)::double precision / 1000000.0), \
+                    to_timestamp(($12::bigint)::double precision / 1000000.0), NULL, NULL)",
+                &[
+                    &execution_id,
+                    &tenant_id,
+                    &locked.run_id,
+                    &stage_id,
+                    &locked.task_id,
+                    &command.tool_call_id,
+                    &command.tool_name,
+                    &command.idempotency_scope.as_str(),
+                    &command.idempotency_key.as_str(),
+                    &request_hash,
+                    &request,
+                    &db_now,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        transaction
+            .execute(
+                "INSERT INTO agent_loom.tool_execution_attempts (\
+                    tool_attempt_id, tenant_id, tool_execution_id, run_id, attempt, \
+                    request_started_at, request_finished_at, adapter_error_code, retry_class, \
+                    remote_request_id, external_ref, response_digest, outcome, metrics_json\
+                 ) VALUES ($1, $2, $3, $4, 1, \
+                    to_timestamp(($5::bigint)::double precision / 1000000.0), \
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, '{}'::jsonb)",
+                &[
+                    &attempt_id,
+                    &tenant_id,
+                    &execution_id,
+                    &locked.run_id,
+                    &db_now,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        let event_id = uuid(command.prepared_event_id.into_bytes());
+        let event_payload = json!({
+            "tool_execution_id": execution_id,
+            "task_id": locked.task_id,
+            "tool_call_id": &command.tool_call_id,
+            "tool_name": &command.tool_name,
+            "attempt": 1,
+        });
+        insert_event(
+            &transaction,
+            EventInsert {
+                event_id,
+                tenant_id,
+                run_id: locked.run_id,
+                sequence: locked.next_event_sequence,
+                event_type: "tool.execution_prepared",
+                payload: &event_payload,
+                payload_schema_version: 1,
+                producer: "worker",
+                context,
+                correlation_id: uuid(context.correlation_id.into_bytes()),
+                occurred_at: None,
+                recorded_at: db_now,
+            },
+        )
+        .await?;
+        advance_run_event_cursor(
+            &transaction,
+            tenant_id,
+            locked.run_id,
+            locked.run_version,
+            locked.execution_generation,
+            db_now,
+        )
+        .await?;
+        let snapshot = ToolExecutionSnapshot {
+            tenant_id: context.tenant_id,
+            tool_execution_id: command.tool_execution_id,
+            run_id: run_id_from_uuid(locked.run_id),
+            stage_execution_id: command.stage_execution_id,
+            task_id: command.lease.task_id,
+            tool_call_id: command.tool_call_id,
+            tool_name: command.tool_name,
+            status: ToolExecutionStatus::Executing,
+            attempt_count: 1,
+            external_ref: None,
+            recovery_action: None,
+            retry_at: None,
+            updated_at: UnixMicros::new(db_now),
+        };
+        let outcome = encode_tool_receipt(&snapshot)?;
+        finish_receipt(
+            &transaction,
+            context,
+            "applied",
+            &outcome,
+            Some(event_id),
+            Some(("tool_execution", execution_id, 1)),
+        )
+        .await?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(tool_committed(
+            CommandDisposition::Applied,
+            snapshot,
+            Some(command.prepared_event_id),
+            Vec::new(),
+        ))
+    }
+
+    /// Finalizes one Tool adapter attempt while preserving late or uncertain
+    /// external evidence even when the Run generation has already been fenced.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable store error for malformed outcome metadata, a stale
+    /// attempt, mismatched execution ownership, idempotency misuse, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn record_tool_outcome(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: RecordToolOutcome,
+    ) -> StoreResult<Committed<ToolExecutionSnapshot>> {
+        let projection = project_tool_outcome(&command.outcome)?;
+        if command
+            .remote_request_id
+            .as_ref()
+            .is_some_and(String::is_empty)
+        {
+            return Err(invalid_command("remote request ID must not be empty"));
+        }
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        match acquire_receipt(
+            &transaction,
+            context,
+            db_now,
+            self.config.receipt_ttl_micros,
+        )
+        .await?
+        {
+            ReceiptGuard::Existing(receipt) => {
+                let snapshot = decode_tool_receipt(context.tenant_id, &receipt.outcome)?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(tool_committed(
+                    CommandDisposition::Duplicate,
+                    snapshot,
+                    receipt.event_id.map(event_id),
+                    Vec::new(),
+                ));
+            }
+            ReceiptGuard::Acquired => {}
+        }
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_id = uuid(command.expected_run.run_id.into_bytes());
+        let run = lock_event_run(&transaction, tenant_id, run_id).await?;
+        let task_id = uuid(command.task_id.into_bytes());
+        let task = transaction
+            .query_opt(
+                "SELECT run_id, generation FROM agent_loom.tasks \
+                 WHERE tenant_id = $1 AND task_id = $2 FOR UPDATE",
+                &[&tenant_id, &task_id],
+            )
+            .await
+            .map_err(map_database_error)?
+            .ok_or_else(|| store_error(StoreErrorCode::NotFound, "task was not found"))?;
+        let task_run_id: Uuid = task.get(0);
+        let task_generation: i64 = task.get(1);
+        if task_run_id != run_id {
+            return Err(store_error(
+                StoreErrorCode::NotFound,
+                "tool task belongs to another run",
+            ));
+        }
+        let execution_id = uuid(command.tool_execution_id.into_bytes());
+        let execution = lock_tool_by_id(&transaction, tenant_id, execution_id).await?;
+        if execution.run_id != run_id || execution.task_id != task_id {
+            return Err(store_error(
+                StoreErrorCode::NotFound,
+                "tool execution belongs to another task or run",
+            ));
+        }
+        if i64::from(command.expected_attempt) != execution.attempt_count {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "tool execution attempt changed",
+            ));
+        }
+        if !matches!(execution.status.as_str(), "executing" | "reconciling") {
+            return Err(store_error(
+                StoreErrorCode::InvalidTransition,
+                "tool execution does not accept an adapter outcome",
+            ));
+        }
+        let persisted_external_ref = projection
+            .external_ref
+            .clone()
+            .or_else(|| execution.external_ref.clone());
+        let attempt_updated = transaction
+            .execute(
+                "UPDATE agent_loom.tool_execution_attempts SET \
+                    request_finished_at = to_timestamp(($7::bigint)::double precision / 1000000.0), \
+                    adapter_error_code = $4, retry_class = $5, remote_request_id = $6, \
+                    external_ref = $8, response_digest = $9, outcome = $10 \
+                 WHERE tenant_id = $1 AND tool_execution_id = $2 AND attempt = $3 \
+                   AND request_finished_at IS NULL",
+                &[
+                    &tenant_id,
+                    &execution_id,
+                    &execution.attempt_count,
+                    &projection.error_code,
+                    &projection.retry_class,
+                    &command.remote_request_id,
+                    &db_now,
+                    &persisted_external_ref,
+                    &command.response_digest.map(|value| value.as_bytes().to_vec()),
+                    &projection.attempt_outcome,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if attempt_updated != 1 {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "tool attempt was already finalized",
+            ));
+        }
+        let terminal = projection.status.is_terminal();
+        let status = tool_status(projection.status);
+        let updated = transaction
+            .execute(
+                "UPDATE agent_loom.tool_executions SET status = $3, result_json = $4, \
+                    error_code = $5, recovery_action = $6, external_ref = $7, \
+                    retry_at = to_timestamp(($8::bigint)::double precision / 1000000.0), \
+                    completed_at = CASE WHEN $9 THEN \
+                        to_timestamp(($10::bigint)::double precision / 1000000.0) ELSE NULL END, \
+                    updated_at = to_timestamp(($10::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND tool_execution_id = $2 \
+                   AND status IN ('executing', 'reconciling')",
+                &[
+                    &tenant_id,
+                    &execution_id,
+                    &status,
+                    &projection.result,
+                    &projection.error_code,
+                    &projection.recovery_action,
+                    &persisted_external_ref,
+                    &projection.retry_at,
+                    &terminal,
+                    &db_now,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if updated != 1 {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "tool execution changed while recording outcome",
+            ));
+        }
+        let fenced = i64::try_from(command.execution_generation).ok()
+            != Some(run.execution_generation)
+            || i64::try_from(command.execution_generation).ok() != Some(task_generation);
+        let event_id = uuid(command.outcome_event_id.into_bytes());
+        let event_payload = json!({
+            "tool_execution_id": execution_id,
+            "task_id": task_id,
+            "status": status,
+            "attempt": execution.attempt_count,
+            "fenced": fenced,
+            "error_code": &projection.error_code,
+            "external_ref": &persisted_external_ref,
+        });
+        insert_event(
+            &transaction,
+            EventInsert {
+                event_id,
+                tenant_id,
+                run_id,
+                sequence: run.next_event_sequence,
+                event_type: projection.event_type,
+                payload: &event_payload,
+                payload_schema_version: 1,
+                producer: "tool-adapter",
+                context,
+                correlation_id: uuid(context.correlation_id.into_bytes()),
+                occurred_at: None,
+                recorded_at: db_now,
+            },
+        )
+        .await?;
+        advance_run_event_cursor(
+            &transaction,
+            tenant_id,
+            run_id,
+            run.version,
+            run.execution_generation,
+            db_now,
+        )
+        .await?;
+        let snapshot = ToolExecutionSnapshot {
+            tenant_id: context.tenant_id,
+            tool_execution_id: command.tool_execution_id,
+            run_id: command.expected_run.run_id,
+            stage_execution_id: execution.stage_execution_id.map(stage_id_from_uuid),
+            task_id: command.task_id,
+            tool_call_id: execution.tool_call_id,
+            tool_name: execution.tool_name,
+            status: projection.status,
+            attempt_count: command.expected_attempt,
+            external_ref: persisted_external_ref,
+            recovery_action: projection.recovery_action.clone(),
+            retry_at: projection.retry_at.map(UnixMicros::new),
+            updated_at: UnixMicros::new(db_now),
+        };
+        let mut follow_ups = Vec::new();
+        if projection.status.requires_reconciliation() {
+            follow_ups.push(DurableFollowUp::ReconcileTool {
+                execution_id: command.tool_execution_id,
+            });
+        }
+        if let Some(not_before) = projection.retry_at {
+            follow_ups.push(DurableFollowUp::ScanDueWork {
+                not_before: UnixMicros::new(not_before),
+            });
+        }
+        let outcome = encode_tool_receipt(&snapshot)?;
+        finish_receipt(
+            &transaction,
+            context,
+            "applied",
+            &outcome,
+            Some(event_id),
+            Some(("tool_execution", execution_id, execution.attempt_count)),
+        )
+        .await?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(tool_committed(
+            CommandDisposition::Applied,
+            snapshot,
+            Some(command.outcome_event_id),
+            follow_ups,
         ))
     }
 
@@ -2157,6 +2612,303 @@ async fn run_has_leased_task(
         .await
         .map(|row| row.get(0))
         .map_err(map_database_error)
+}
+
+#[derive(Debug)]
+struct LockedToolExecution {
+    tool_execution_id: Uuid,
+    run_id: Uuid,
+    stage_execution_id: Option<Uuid>,
+    task_id: Uuid,
+    tool_call_id: String,
+    tool_name: String,
+    request_hash: Vec<u8>,
+    status: String,
+    attempt_count: i64,
+    external_ref: Option<String>,
+    recovery_action: Option<String>,
+    retry_at: Option<i64>,
+    updated_at: i64,
+}
+
+impl LockedToolExecution {
+    fn snapshot(&self, tenant_id: TenantId) -> StoreResult<ToolExecutionSnapshot> {
+        Ok(ToolExecutionSnapshot {
+            tenant_id,
+            tool_execution_id: ToolExecutionId::from_bytes(self.tool_execution_id.into_bytes()),
+            run_id: run_id_from_uuid(self.run_id),
+            stage_execution_id: self.stage_execution_id.map(stage_id_from_uuid),
+            task_id: task_id_from_uuid(self.task_id),
+            tool_call_id: self.tool_call_id.clone(),
+            tool_name: self.tool_name.clone(),
+            status: parse_tool_status(&self.status)?,
+            attempt_count: positive_u32(self.attempt_count, "tool attempt count")?,
+            external_ref: self.external_ref.clone(),
+            recovery_action: self.recovery_action.clone(),
+            retry_at: self.retry_at.map(UnixMicros::new),
+            updated_at: UnixMicros::new(self.updated_at),
+        })
+    }
+}
+
+fn validate_prepare_tool(command: &PrepareToolExecution) -> StoreResult<()> {
+    if command.tool_call_id.is_empty() || command.tool_name.is_empty() {
+        return Err(invalid_command(
+            "tool call identity and tool name must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+async fn lock_tool_by_idempotency(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    scope: &str,
+    key: &str,
+) -> StoreResult<Option<LockedToolExecution>> {
+    transaction
+        .query_opt(
+            "SELECT tool_execution_id, run_id, stage_execution_id, task_id, tool_call_id, \
+                    tool_name, request_hash, status, attempt_count, external_ref, \
+                    recovery_action, CASE WHEN retry_at IS NULL THEN NULL \
+                        ELSE (extract(epoch FROM retry_at) * 1000000)::bigint END, \
+                    (extract(epoch FROM updated_at) * 1000000)::bigint \
+             FROM agent_loom.tool_executions \
+             WHERE tenant_id = $1 AND idempotency_scope = $2 AND idempotency_key = $3 \
+             FOR UPDATE",
+            &[&tenant_id, &scope, &key],
+        )
+        .await
+        .map(|row| {
+            row.map(|row| LockedToolExecution {
+                tool_execution_id: row.get(0),
+                run_id: row.get(1),
+                stage_execution_id: row.get(2),
+                task_id: row.get(3),
+                tool_call_id: row.get(4),
+                tool_name: row.get(5),
+                request_hash: row.get(6),
+                status: row.get(7),
+                attempt_count: row.get(8),
+                external_ref: row.get(9),
+                recovery_action: row.get(10),
+                retry_at: row.get(11),
+                updated_at: row.get(12),
+            })
+        })
+        .map_err(map_database_error)
+}
+
+async fn lock_tool_by_id(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    execution_id: Uuid,
+) -> StoreResult<LockedToolExecution> {
+    let row = transaction
+        .query_opt(
+            "SELECT tool_execution_id, run_id, stage_execution_id, task_id, tool_call_id, \
+                    tool_name, request_hash, status, attempt_count, external_ref, \
+                    recovery_action, CASE WHEN retry_at IS NULL THEN NULL \
+                        ELSE (extract(epoch FROM retry_at) * 1000000)::bigint END, \
+                    (extract(epoch FROM updated_at) * 1000000)::bigint \
+             FROM agent_loom.tool_executions \
+             WHERE tenant_id = $1 AND tool_execution_id = $2 FOR UPDATE",
+            &[&tenant_id, &execution_id],
+        )
+        .await
+        .map_err(map_database_error)?
+        .ok_or_else(|| store_error(StoreErrorCode::NotFound, "tool execution was not found"))?;
+    Ok(LockedToolExecution {
+        tool_execution_id: row.get(0),
+        run_id: row.get(1),
+        stage_execution_id: row.get(2),
+        task_id: row.get(3),
+        tool_call_id: row.get(4),
+        tool_name: row.get(5),
+        request_hash: row.get(6),
+        status: row.get(7),
+        attempt_count: row.get(8),
+        external_ref: row.get(9),
+        recovery_action: row.get(10),
+        retry_at: row.get(11),
+        updated_at: row.get(12),
+    })
+}
+
+#[derive(Debug)]
+struct ProjectedToolOutcome {
+    status: ToolExecutionStatus,
+    result: Option<Value>,
+    error_code: Option<String>,
+    retry_class: Option<&'static str>,
+    recovery_action: Option<String>,
+    external_ref: Option<String>,
+    retry_at: Option<i64>,
+    attempt_outcome: &'static str,
+    event_type: &'static str,
+}
+
+#[allow(clippy::too_many_lines)]
+fn project_tool_outcome(outcome: &ToolRecordedOutcome) -> StoreResult<ProjectedToolOutcome> {
+    let projected = match outcome {
+        ToolRecordedOutcome::Completed { result } => ProjectedToolOutcome {
+            status: ToolExecutionStatus::Succeeded,
+            result: Some(json_value(result)?),
+            error_code: None,
+            retry_class: None,
+            recovery_action: None,
+            external_ref: None,
+            retry_at: None,
+            attempt_outcome: "completed",
+            event_type: "tool.execution_succeeded",
+        },
+        ToolRecordedOutcome::Accepted { external_ref } => {
+            if external_ref.is_empty() {
+                return Err(invalid_command("accepted Tool outcome has no external ref"));
+            }
+            ProjectedToolOutcome {
+                status: ToolExecutionStatus::Executing,
+                result: None,
+                error_code: None,
+                retry_class: None,
+                recovery_action: None,
+                external_ref: Some(external_ref.clone()),
+                retry_at: None,
+                attempt_outcome: "accepted",
+                event_type: "tool.execution_accepted",
+            }
+        }
+        ToolRecordedOutcome::Failed {
+            error_code,
+            retry,
+            retry_at,
+        } => {
+            if error_code.is_empty() {
+                return Err(invalid_command("failed Tool outcome has no error code"));
+            }
+            let (status, retry_class, recovery_action) = match retry {
+                ExecutionRetryClass::Never => (ToolExecutionStatus::Failed, "never", None),
+                ExecutionRetryClass::SameRequestBackoff => (
+                    ToolExecutionStatus::RetryScheduled,
+                    "same_request_backoff",
+                    Some("retry_same_request".to_owned()),
+                ),
+                ExecutionRetryClass::ReconnectAndResume => (
+                    ToolExecutionStatus::Reconciling,
+                    "reconnect_and_resume",
+                    Some("reconnect_and_resume".to_owned()),
+                ),
+                ExecutionRetryClass::QueryOutcome => (
+                    ToolExecutionStatus::Reconciling,
+                    "query_outcome",
+                    Some("query_outcome".to_owned()),
+                ),
+                ExecutionRetryClass::ManualReview => (
+                    ToolExecutionStatus::ManualReview,
+                    "manual_review",
+                    Some("manual_review".to_owned()),
+                ),
+            };
+            let retry_at = retry_at.map(UnixMicros::get);
+            if (status == ToolExecutionStatus::RetryScheduled) != retry_at.is_some() {
+                return Err(invalid_command(
+                    "Tool retry time must be present only for scheduled backoff",
+                ));
+            }
+            ProjectedToolOutcome {
+                status,
+                result: None,
+                error_code: Some(error_code.clone()),
+                retry_class: Some(retry_class),
+                recovery_action,
+                external_ref: None,
+                retry_at,
+                attempt_outcome: "failed",
+                event_type: "tool.execution_failed",
+            }
+        }
+        ToolRecordedOutcome::Uncertain {
+            external_ref,
+            recovery_action,
+        } => {
+            if external_ref.as_ref().is_some_and(String::is_empty) || recovery_action.is_empty() {
+                return Err(invalid_command(
+                    "uncertain Tool outcome has invalid recovery metadata",
+                ));
+            }
+            ProjectedToolOutcome {
+                status: ToolExecutionStatus::OutcomeUnknown,
+                result: None,
+                error_code: None,
+                retry_class: Some("query_outcome"),
+                recovery_action: Some(recovery_action.clone()),
+                external_ref: external_ref.clone(),
+                retry_at: None,
+                attempt_outcome: "uncertain",
+                event_type: "tool.execution_outcome_unknown",
+            }
+        }
+        ToolRecordedOutcome::Compensated { result } => ProjectedToolOutcome {
+            status: ToolExecutionStatus::Compensated,
+            result: Some(json_value(result)?),
+            error_code: None,
+            retry_class: None,
+            recovery_action: None,
+            external_ref: None,
+            retry_at: None,
+            attempt_outcome: "completed",
+            event_type: "tool.execution_compensated",
+        },
+    };
+    Ok(projected)
+}
+
+fn validate_existing_tool(
+    command: &PrepareToolExecution,
+    task: &LockedWorkerTask,
+    existing: &LockedToolExecution,
+) -> StoreResult<()> {
+    if existing.run_id != task.run_id
+        || existing.task_id != task.task_id
+        || existing.stage_execution_id != task.stage_execution_id
+        || existing.tool_call_id != command.tool_call_id
+        || existing.tool_name != command.tool_name
+        || existing.request_hash.as_slice() != command.request_hash.as_bytes().as_slice()
+    {
+        return Err(store_error(
+            StoreErrorCode::IdempotencyKeyReused,
+            "tool idempotency key was reused for a different request",
+        ));
+    }
+    Ok(())
+}
+
+async fn advance_run_event_cursor(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    version: i64,
+    generation: i64,
+    db_now: i64,
+) -> StoreResult<()> {
+    let updated = transaction
+        .execute(
+            "UPDATE agent_loom.runs SET version = version + 1, \
+                next_event_sequence = next_event_sequence + 1, \
+                updated_at = to_timestamp(($5::bigint)::double precision / 1000000.0) \
+             WHERE tenant_id = $1 AND run_id = $2 AND version = $3 \
+               AND execution_generation = $4",
+            &[&tenant_id, &run_id, &version, &generation, &db_now],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if updated != 1 {
+        return Err(store_error(
+            StoreErrorCode::VersionConflict,
+            "run changed while appending an execution event",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3723,6 +4475,37 @@ fn parse_task_kind(value: &str) -> StoreResult<TaskKind> {
     }
 }
 
+fn parse_tool_status(value: &str) -> StoreResult<ToolExecutionStatus> {
+    match value {
+        "planned" => Ok(ToolExecutionStatus::Planned),
+        "executing" => Ok(ToolExecutionStatus::Executing),
+        "retry_scheduled" => Ok(ToolExecutionStatus::RetryScheduled),
+        "succeeded" => Ok(ToolExecutionStatus::Succeeded),
+        "failed" => Ok(ToolExecutionStatus::Failed),
+        "outcome_unknown" => Ok(ToolExecutionStatus::OutcomeUnknown),
+        "reconciling" => Ok(ToolExecutionStatus::Reconciling),
+        "compensated" => Ok(ToolExecutionStatus::Compensated),
+        "manual_review" => Ok(ToolExecutionStatus::ManualReview),
+        _ => Err(inconsistent(
+            "database contains an unknown tool execution status",
+        )),
+    }
+}
+
+const fn tool_status(value: ToolExecutionStatus) -> &'static str {
+    match value {
+        ToolExecutionStatus::Planned => "planned",
+        ToolExecutionStatus::Executing => "executing",
+        ToolExecutionStatus::RetryScheduled => "retry_scheduled",
+        ToolExecutionStatus::Succeeded => "succeeded",
+        ToolExecutionStatus::Failed => "failed",
+        ToolExecutionStatus::OutcomeUnknown => "outcome_unknown",
+        ToolExecutionStatus::Reconciling => "reconciling",
+        ToolExecutionStatus::Compensated => "compensated",
+        ToolExecutionStatus::ManualReview => "manual_review",
+    }
+}
+
 const fn stage_status(status: StageStatus) -> &'static str {
     match status {
         StageStatus::Planned => "planned",
@@ -3837,6 +4620,25 @@ fn event_committed(
     }
 }
 
+fn tool_committed(
+    disposition: CommandDisposition,
+    snapshot: ToolExecutionSnapshot,
+    event_id: Option<EventId>,
+    durable_follow_ups: Vec<DurableFollowUp>,
+) -> Committed<ToolExecutionSnapshot> {
+    let run_id = snapshot.run_id;
+    Committed {
+        disposition,
+        value: snapshot,
+        event_ids: event_id.into_iter().collect(),
+        durable_follow_ups,
+        post_commit_hints: vec![
+            PostCommitHint::RunEventsAvailable { run_id },
+            PostCommitHint::InvalidateRunCache { run_id },
+        ],
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct RunReceipt {
     #[serde(rename = "type")]
@@ -3903,6 +4705,70 @@ fn decode_run_receipt(tenant_id: TenantId, value: &Value) -> StoreResult<RunSnap
             .map(|id| CheckpointId::from_bytes(id.into_bytes())),
         terminal_event_id: receipt.terminal_event_id.map(event_id_from_uuid),
         deadline: receipt.deadline.map(UnixMicros::new),
+        updated_at: UnixMicros::new(receipt.updated_at),
+    })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolReceipt {
+    #[serde(rename = "type")]
+    outcome_type: String,
+    tool_execution_id: Uuid,
+    run_id: Uuid,
+    stage_execution_id: Option<Uuid>,
+    task_id: Uuid,
+    tool_call_id: String,
+    tool_name: String,
+    status: String,
+    attempt_count: u32,
+    external_ref: Option<String>,
+    recovery_action: Option<String>,
+    retry_at: Option<i64>,
+    updated_at: i64,
+}
+
+fn encode_tool_receipt(snapshot: &ToolExecutionSnapshot) -> StoreResult<Value> {
+    serde_json::to_value(ToolReceipt {
+        outcome_type: "tool_execution".to_owned(),
+        tool_execution_id: uuid(snapshot.tool_execution_id.into_bytes()),
+        run_id: uuid(snapshot.run_id.into_bytes()),
+        stage_execution_id: snapshot
+            .stage_execution_id
+            .map(|value| uuid(value.into_bytes())),
+        task_id: uuid(snapshot.task_id.into_bytes()),
+        tool_call_id: snapshot.tool_call_id.clone(),
+        tool_name: snapshot.tool_name.clone(),
+        status: tool_status(snapshot.status).to_owned(),
+        attempt_count: snapshot.attempt_count,
+        external_ref: snapshot.external_ref.clone(),
+        recovery_action: snapshot.recovery_action.clone(),
+        retry_at: snapshot.retry_at.map(UnixMicros::get),
+        updated_at: snapshot.updated_at.get(),
+    })
+    .map_err(|_| inconsistent("failed to encode ToolExecution receipt"))
+}
+
+fn decode_tool_receipt(tenant_id: TenantId, value: &Value) -> StoreResult<ToolExecutionSnapshot> {
+    let receipt: ToolReceipt = serde_json::from_value(value.clone())
+        .map_err(|_| inconsistent("stored command receipt is not a ToolExecution outcome"))?;
+    if receipt.outcome_type != "tool_execution" {
+        return Err(inconsistent(
+            "stored command receipt has the wrong outcome type",
+        ));
+    }
+    Ok(ToolExecutionSnapshot {
+        tenant_id,
+        tool_execution_id: ToolExecutionId::from_bytes(receipt.tool_execution_id.into_bytes()),
+        run_id: run_id_from_uuid(receipt.run_id),
+        stage_execution_id: receipt.stage_execution_id.map(stage_id_from_uuid),
+        task_id: task_id_from_uuid(receipt.task_id),
+        tool_call_id: receipt.tool_call_id,
+        tool_name: receipt.tool_name,
+        status: parse_tool_status(&receipt.status)?,
+        attempt_count: receipt.attempt_count,
+        external_ref: receipt.external_ref,
+        recovery_action: receipt.recovery_action,
+        retry_at: receipt.retry_at.map(UnixMicros::new),
         updated_at: UnixMicros::new(receipt.updated_at),
     })
 }
@@ -4094,6 +4960,51 @@ mod tests {
                 .expect_err("mismatched payload is rejected")
                 .code,
             StoreErrorCode::WaitMismatch
+        );
+    }
+
+    #[test]
+    fn tool_retry_projection_requires_a_durable_due_time() {
+        let retry_at = UnixMicros::new(123);
+        let projected = project_tool_outcome(&ToolRecordedOutcome::Failed {
+            error_code: "busy".to_owned(),
+            retry: ExecutionRetryClass::SameRequestBackoff,
+            retry_at: Some(retry_at),
+        })
+        .expect("valid retry projection");
+        assert_eq!(projected.status, ToolExecutionStatus::RetryScheduled);
+        assert_eq!(projected.retry_at, Some(123));
+
+        let error = project_tool_outcome(&ToolRecordedOutcome::Failed {
+            error_code: "busy".to_owned(),
+            retry: ExecutionRetryClass::SameRequestBackoff,
+            retry_at: None,
+        })
+        .expect_err("in-memory-only retry is rejected");
+        assert_eq!(error.code, StoreErrorCode::ConstraintViolation);
+    }
+
+    #[test]
+    fn tool_receipt_round_trip_preserves_retry_schedule() {
+        let snapshot = ToolExecutionSnapshot {
+            tenant_id: TenantId::from_bytes([1; 16]),
+            tool_execution_id: ToolExecutionId::from_bytes([2; 16]),
+            run_id: RunId::from_bytes([3; 16]),
+            stage_execution_id: None,
+            task_id: TaskId::from_bytes([4; 16]),
+            tool_call_id: "deploy-1".to_owned(),
+            tool_name: "devops.deploy".to_owned(),
+            status: ToolExecutionStatus::RetryScheduled,
+            attempt_count: 2,
+            external_ref: Some("job-1".to_owned()),
+            recovery_action: Some("retry_same_request".to_owned()),
+            retry_at: Some(UnixMicros::new(500)),
+            updated_at: UnixMicros::new(400),
+        };
+        let encoded = encode_tool_receipt(&snapshot).expect("encode Tool receipt");
+        assert_eq!(
+            decode_tool_receipt(snapshot.tenant_id, &encoded).expect("decode Tool receipt"),
+            snapshot
         );
     }
 

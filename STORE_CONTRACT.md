@@ -479,6 +479,8 @@ prepare_tool_execution（提交 executing 意图）
 
 Worker 在外部调用后、本地记录前崩溃时，Scheduler 根据 stale executing 生成持久化 reconcile Task。只有 Adapter 能证明幂等重放安全时才能重发调用。
 
+`SameRequestBackoff` 结果必须携带 `retry_at`，并与 ToolExecution 的 `retry_scheduled` 状态同事务持久化；其他结果不得残留 retry time。
+
 ### 8.2 Agent Server
 
 ```text

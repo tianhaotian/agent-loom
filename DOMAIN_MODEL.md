@@ -389,7 +389,7 @@ PostgreSQL 与 MySQL 都允许唯一约束中存在多个 NULL，因此历史终
 tool_execution_id, tenant_id, run_id, stage_execution_id, task_id,
 tool_call_id, tool_name, idempotency_scope, idempotency_key, request_hash,
 status, attempt_count, request_json, result_json,
-error_code, recovery_action, external_ref,
+error_code, recovery_action, external_ref, retry_at,
 started_at, completed_at, updated_at
 ```
 
@@ -397,6 +397,7 @@ started_at, completed_at, updated_at
 - 唯一：`(tenant_id, idempotency_scope, idempotency_key)`；Adapter 必须稳定定义 scope，不能依赖调用方临时拼接；
 - 已 succeeded 的调用不得再次执行；
 - `outcome_unknown` 必须设置 recovery_action 或进入人工队列。
+- `retry_scheduled` 必须设置数据库时间语义的 `retry_at`；其他状态不得残留该字段。
 
 `tool_execution_attempts` 在外部调用前追加请求开始记录，并在同一 attempt 下以 `request_finished_at IS NULL` 条件 finalize 一次，保存结束时间、Adapter 错误分类、外部 request ID 与响应摘要。finalize 后不可再次修改。重试使用同一 ToolExecution 和幂等键，不创建新的逻辑调用。
 

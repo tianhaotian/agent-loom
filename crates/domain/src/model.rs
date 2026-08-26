@@ -137,12 +137,14 @@ pub struct ToolExecutionSnapshot {
     pub attempt_count: u32,
     pub external_ref: Option<String>,
     pub recovery_action: Option<String>,
+    pub retry_at: Option<UnixMicros>,
     pub updated_at: UnixMicros,
 }
 
 impl ToolExecutionSnapshot {
     pub fn recovery_invariant_holds(&self) -> bool {
-        self.status != ToolExecutionStatus::OutcomeUnknown || self.recovery_action.is_some()
+        (self.status != ToolExecutionStatus::OutcomeUnknown || self.recovery_action.is_some())
+            && ((self.status == ToolExecutionStatus::RetryScheduled) == self.retry_at.is_some())
     }
 }
 
@@ -240,6 +242,7 @@ mod tests {
             attempt_count: 1,
             external_ref: None,
             recovery_action: None,
+            retry_at: None,
             updated_at: UnixMicros::new(10),
         };
         assert!(!snapshot.recovery_invariant_holds());

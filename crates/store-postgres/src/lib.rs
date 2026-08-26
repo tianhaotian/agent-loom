@@ -73,6 +73,12 @@ pub const MIGRATIONS: &[EmbeddedMigration] = &[
         created_tables: &[],
         sql: include_str!("../migrations/0007_wait_resume_plan.sql"),
     },
+    EmbeddedMigration {
+        logical_id: "0008_tool_retry_schedule",
+        logical_model_version: 9,
+        created_tables: &[],
+        sql: include_str!("../migrations/0008_tool_retry_schedule.sql"),
+    },
 ];
 
 pub const fn capabilities() -> StoreCapabilities {
@@ -105,7 +111,7 @@ mod tests {
 
     #[test]
     fn migration_batch_is_embedded() {
-        assert_eq!(MIGRATIONS.len(), 8);
+        assert_eq!(MIGRATIONS.len(), 9);
         assert_eq!(MIGRATIONS[0].logical_id, "0000_migration_meta");
         assert!(MIGRATIONS[0].sql.contains("schema_migrations"));
         assert!(MIGRATIONS[0].sql.contains("timestamptz(6)"));
@@ -114,5 +120,6 @@ mod tests {
         assert!(MIGRATIONS[5].sql.contains("active_slot"));
         assert!(MIGRATIONS[6].sql.contains("agent_event_receipts"));
         assert!(MIGRATIONS[7].sql.contains("resume_task_id"));
+        assert!(MIGRATIONS[8].sql.contains("retry_at"));
     }
 }
