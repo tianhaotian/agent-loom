@@ -139,20 +139,33 @@ impl crate::PostgresTransactionExecutor {
         let fetch_size = i64::from(page_size) + 1;
         let rows = client
             .query(
-                "SELECT kind, execution_id, run_id, due_micros, expected_revision FROM (\
-                    SELECT 'tool_retry'::text AS kind, tool_execution_id AS execution_id, \
-                           run_id, (extract(epoch FROM retry_at) * 1000000)::bigint AS due_micros, \
-                           attempt_count AS expected_revision \
-                    FROM agent_loom.tool_executions \
-                    WHERE tenant_id = $1 AND status = 'retry_scheduled' \
-                      AND retry_at <= transaction_timestamp() \
+                "SELECT kind, execution_id, run_id, due_micros, expected_revision, \
+                        run_version, execution_generation, checkpoint_sequence FROM (\
+                    SELECT 'tool_retry'::text AS kind, x.tool_execution_id AS execution_id, \
+                           x.run_id, (extract(epoch FROM x.retry_at) * 1000000)::bigint AS due_micros, \
+                           x.attempt_count AS expected_revision, r.version AS run_version, \
+                           r.execution_generation, c.sequence AS checkpoint_sequence \
+                    FROM agent_loom.tool_executions x \
+                    JOIN agent_loom.runs r ON r.tenant_id = x.tenant_id AND r.run_id = x.run_id \
+                    JOIN agent_loom.checkpoints c ON c.tenant_id = r.tenant_id \
+                      AND c.run_id = r.run_id AND c.checkpoint_id = r.current_checkpoint_id \
+                    WHERE x.tenant_id = $1 AND x.status = 'retry_scheduled' \
+                      AND x.retry_at <= transaction_timestamp() \
+                      AND r.status IN ('queued', 'running', 'waiting', 'approval_required', \
+                                       'retrying', 'paused') \
                     UNION ALL \
-                    SELECT 'agent_retry'::text AS kind, agent_execution_id AS execution_id, \
-                           run_id, (extract(epoch FROM retry_at) * 1000000)::bigint AS due_micros, \
-                           version AS expected_revision \
-                    FROM agent_loom.agent_executions \
-                    WHERE tenant_id = $1 AND status = 'reconciling' \
-                      AND retry_at IS NOT NULL AND retry_at <= transaction_timestamp()\
+                    SELECT 'agent_retry'::text AS kind, x.agent_execution_id AS execution_id, \
+                           x.run_id, (extract(epoch FROM x.retry_at) * 1000000)::bigint AS due_micros, \
+                           x.version AS expected_revision, r.version AS run_version, \
+                           r.execution_generation, c.sequence AS checkpoint_sequence \
+                    FROM agent_loom.agent_executions x \
+                    JOIN agent_loom.runs r ON r.tenant_id = x.tenant_id AND r.run_id = x.run_id \
+                    JOIN agent_loom.checkpoints c ON c.tenant_id = r.tenant_id \
+                      AND c.run_id = r.run_id AND c.checkpoint_id = r.current_checkpoint_id \
+                    WHERE x.tenant_id = $1 AND x.status = 'reconciling' \
+                      AND x.retry_at IS NOT NULL AND x.retry_at <= transaction_timestamp() \
+                      AND r.status IN ('queued', 'running', 'waiting', 'approval_required', \
+                                       'retrying', 'paused')\
                  ) due \
                  WHERE $2::bigint IS NULL OR (due_micros, kind, execution_id) > \
                        ($2::bigint, $3::text, $4::uuid) \
@@ -194,12 +207,21 @@ fn decode_due_work(tenant_id: TenantId, row: &Row) -> StoreResult<DueWorkCandida
         }
         _ => return Err(inconsistent("database returned an unknown due-work kind")),
     };
+    let checkpoint_sequence = nonnegative_u64(row.get(7), "due-work checkpoint sequence")?;
+    if checkpoint_sequence == 0 {
+        return Err(inconsistent(
+            "database due-work candidate has no checkpoint sequence",
+        ));
+    }
     Ok(DueWorkCandidate {
         tenant_id,
         run_id: run_id_from_uuid(row.get(2)),
         target,
         due_at: UnixMicros::new(row.get(3)),
         expected_revision: nonnegative_u64(row.get(4), "due-work revision")?,
+        run_version: nonnegative_u64(row.get(5), "due-work Run version")?,
+        execution_generation: nonnegative_u64(row.get(6), "due-work generation")?,
+        checkpoint_sequence,
     })
 }
 

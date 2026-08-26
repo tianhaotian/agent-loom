@@ -448,6 +448,8 @@ pub enum DueWorkKind {
 
 Tool/Agent retry 候选使用数据库 `retry_at <= db_now` 判断，并按 `(due_at, kind, execution_id)` 做稳定 keyset 分页。候选携带 Execution revision，但 revision 只用于后续 CAS；扫描本身不加跨请求锁，也不消费 retry。
 
+`apply_due_work` 对外部 retry 必须按 Run → Execution 锁序重新验证 Run version/generation/checkpoint、Execution revision/status、原始 `retry_at` 与数据库当前时间。获胜事务消费 `retry_at`、追加 due Event、创建 `reconcile` Task 并推进 Run；暂停 Run 创建 `scheduled` Task，恢复时再转为 queued。重复命令通过 Receipt 返回原结果，不生成第二个恢复 Task。
+
 ## 7. 原子操作契约
 
 | 操作 | 同一事务必须完成 | 典型 DurableFollowUp | PostCommitHint |

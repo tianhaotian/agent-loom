@@ -3,10 +3,10 @@ use std::{future::Future, pin::Pin};
 use agent_loom_domain::{AgentExecutionSnapshot, RunId, RunSnapshot, ToolExecutionSnapshot};
 
 use crate::{
-    AgentEventBatchOutcome, AppendAgentEvents, ApplyEvent, ClaimTask, ClaimedTask, Committed,
-    CompleteTask, ControlRun, CreateRun, DueWorkPage, DueWorkQuery, EventCursor, EventPage,
-    FailTask, PrepareAgentExecution, PrepareToolExecution, QueryContext, RecordAgentOutcome,
-    RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, StoreResult,
+    AgentEventBatchOutcome, AppendAgentEvents, ApplyDueWork, ApplyEvent, ClaimTask, ClaimedTask,
+    Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery,
+    EventCursor, EventPage, FailTask, PrepareAgentExecution, PrepareToolExecution, QueryContext,
+    RecordAgentOutcome, RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, StoreResult,
 };
 
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = StoreResult<T>> + Send + 'a>>;
@@ -57,6 +57,12 @@ pub trait DurableStore: Send + Sync {
         context: &'a QueryContext,
         query: DueWorkQuery,
     ) -> StoreFuture<'a, DueWorkPage>;
+
+    fn apply_due_work<'a>(
+        &'a self,
+        context: &'a crate::CommandContext,
+        command: ApplyDueWork,
+    ) -> StoreFuture<'a, Committed<DueWorkOutcome>>;
 
     fn claim_task<'a>(
         &'a self,

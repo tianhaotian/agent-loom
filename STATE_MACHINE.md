@@ -303,7 +303,7 @@ planned → executing → succeeded
 - 外部调用前先持久化 `planned/executing` 意图，调用后再以短事务保存结果。
 - 进程在外部响应与本地提交之间崩溃时，执行进入或被恢复器判定为 `outcome_unknown`。
 - `outcome_unknown` 只能通过外部查询、幂等重放、补偿或人工决定退出，不能由普通 Task 自动重试。
-- `retry_scheduled` 必须持久化 `retry_at` 并由数据库时间驱动的 due-work 转换创建下一 attempt；不得依赖进程内定时器。
+- `retry_scheduled` 必须持久化 `retry_at`；数据库时间驱动的 due-work 先原子消费时间并进入 `reconciling`、创建恢复 Task，再由持有 Lease 的恢复 Task 开启下一 attempt，不得依赖进程内定时器。
 - 已 `succeeded` 的调用在 Task 重试时直接复用结果。
 
 ## 9. AgentExecution 状态机

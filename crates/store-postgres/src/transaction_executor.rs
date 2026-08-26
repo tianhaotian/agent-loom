@@ -6,13 +6,13 @@ use agent_loom_domain::{
 };
 use agent_loom_durable_store::{
     AgentEventBatchOutcome, AgentEventExecutionOutcome, AgentSubmissionOutcome,
-    AgentWorkflowAction, AppendAgentEvents, ApplyEvent, ClaimTask, ClaimedTask, CommandContext,
-    CommandDisposition, Committed, CompleteTask, CompletionShapeError, ControlRun, CreateRun,
-    DurableFollowUp, ExecutionRetryClass, ExpectedRun, FailTask, InitialTask, LeaseProof,
-    NewArtifactRef, NewTask, NewWaitSubscription, NextActions, NormalizedAgentEventInput,
-    PostCommitHint, PrepareAgentExecution, PrepareToolExecution, RecordAgentOutcome,
-    RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, SignatureVerification, StoreError,
-    StoreErrorCode, StoreResult, ToolRecordedOutcome,
+    AgentWorkflowAction, AppendAgentEvents, ApplyDueWork, ApplyEvent, ClaimTask, ClaimedTask,
+    CommandContext, CommandDisposition, Committed, CompleteTask, CompletionShapeError, ControlRun,
+    CreateRun, DueWorkOutcome, DueWorkTarget, DurableFollowUp, ExecutionRetryClass, ExpectedRun,
+    FailTask, InitialTask, LeaseProof, NewArtifactRef, NewTask, NewWaitSubscription, NextActions,
+    NormalizedAgentEventInput, PostCommitHint, PrepareAgentExecution, PrepareToolExecution,
+    RecordAgentOutcome, RecordAgentSubmission, RecordToolOutcome, RenewTaskLease,
+    SignatureVerification, StoreError, StoreErrorCode, StoreResult, ToolRecordedOutcome,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -2235,6 +2235,148 @@ impl PostgresTransactionExecutor {
         ))
     }
 
+    /// Atomically consumes one due external retry and creates its durable
+    /// reconciliation Task after locking and revalidating Run and Execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable store error for malformed recovery Tasks, stale Run or
+    /// Execution revisions, retry times that are not due, terminal Runs,
+    /// idempotency misuse, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn apply_due_work(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: ApplyDueWork,
+    ) -> StoreResult<Committed<DueWorkOutcome>> {
+        if !command.shape_is_valid() || command.candidate.tenant_id != context.tenant_id {
+            return Err(invalid_command("invalid external due-work command shape"));
+        }
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        match acquire_receipt(
+            &transaction,
+            context,
+            db_now,
+            self.config.receipt_ttl_micros,
+        )
+        .await?
+        {
+            ReceiptGuard::Existing(receipt) => {
+                let outcome = decode_due_work_receipt(context.tenant_id, &receipt.outcome)?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(due_work_committed(
+                    CommandDisposition::Duplicate,
+                    outcome,
+                    receipt.event_id.map(event_id),
+                    false,
+                ));
+            }
+            ReceiptGuard::Acquired => {}
+        }
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_id = uuid(command.candidate.run_id.into_bytes());
+        let run = lock_event_run(&transaction, tenant_id, run_id).await?;
+        validate_due_work_run(&command, &run, db_now)?;
+        let consumed =
+            consume_external_due_work(&transaction, tenant_id, run_id, db_now, &command).await?;
+        if command
+            .recovery_task
+            .stage_execution_id
+            .map(|value| uuid(value.into_bytes()))
+            != consumed.stage_execution_id
+        {
+            return Err(invalid_command(
+                "due-work recovery Task stage does not match the Execution",
+            ));
+        }
+        let event_id = uuid(command.applied_event_id.into_bytes());
+        let event_payload = json!({
+            "due_work_kind": consumed.kind,
+            "execution_id": uuid(command.candidate.execution_id_bytes()),
+            "expected_revision": command.candidate.expected_revision,
+            "next_revision": consumed.next_revision,
+            "retry_at_micros": command.candidate.due_at.get(),
+            "recovery_task_id": uuid(command.recovery_task.task_id.into_bytes()),
+        });
+        insert_event(
+            &transaction,
+            EventInsert {
+                event_id,
+                tenant_id,
+                run_id,
+                sequence: run.next_event_sequence,
+                event_type: consumed.event_type,
+                payload: &event_payload,
+                payload_schema_version: 1,
+                producer: "scheduler",
+                context,
+                correlation_id: uuid(context.correlation_id.into_bytes()),
+                occurred_at: None,
+                recorded_at: db_now,
+            },
+        )
+        .await?;
+        let paused = run.status == "paused";
+        insert_new_task(
+            &transaction,
+            tenant_id,
+            run_id,
+            event_id,
+            db_now,
+            &command.recovery_task,
+            if paused { "scheduled" } else { "queued" },
+        )
+        .await?;
+        let next_sequence = run
+            .next_event_sequence
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("run event sequence overflow"))?;
+        let projected_status = if paused { "paused" } else { "queued" };
+        advance_run_event_batch(
+            &transaction,
+            tenant_id,
+            run_id,
+            run.version,
+            run.execution_generation,
+            next_sequence,
+            projected_status,
+            db_now,
+        )
+        .await?;
+        let outcome = DueWorkOutcome {
+            tenant_id: context.tenant_id,
+            run_id: command.candidate.run_id,
+            target: command.candidate.target,
+            recovery_task_id: command.recovery_task.task_id,
+            run_status: parse_run_status(projected_status)?,
+            execution_revision: consumed.next_revision,
+            applied_at: UnixMicros::new(db_now),
+        };
+        let receipt = encode_due_work_receipt(&outcome)?;
+        finish_receipt(
+            &transaction,
+            context,
+            "applied",
+            &receipt,
+            Some(event_id),
+            Some((
+                consumed.resource_kind,
+                consumed.execution_id,
+                consumed.next_revision_i64,
+            )),
+        )
+        .await?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(due_work_committed(
+            CommandDisposition::Applied,
+            outcome,
+            Some(command.applied_event_id),
+            !paused,
+        ))
+    }
+
     /// Atomically validates the lease and Run fence, appends the completion
     /// Event and Checkpoint, finalizes the Task, applies stage/artifact writes,
     /// schedules the next action, and advances the Run projection.
@@ -4254,6 +4396,194 @@ async fn update_agent_after_event_batch(
     Ok(())
 }
 
+#[derive(Debug)]
+struct ConsumedDueWork {
+    kind: &'static str,
+    event_type: &'static str,
+    resource_kind: &'static str,
+    execution_id: Uuid,
+    stage_execution_id: Option<Uuid>,
+    next_revision: u64,
+    next_revision_i64: i64,
+}
+
+fn validate_due_work_run(
+    command: &ApplyDueWork,
+    run: &LockedEventRun,
+    db_now: i64,
+) -> StoreResult<()> {
+    if !matches!(
+        run.status.as_str(),
+        "queued" | "running" | "waiting" | "approval_required" | "retrying" | "paused"
+    ) {
+        return Err(store_error(StoreErrorCode::TerminalRun, "run is terminal"));
+    }
+    if i64::try_from(command.candidate.run_version).ok() != Some(run.version)
+        || i64::try_from(command.candidate.execution_generation).ok()
+            != Some(run.execution_generation)
+    {
+        return Err(store_error(
+            StoreErrorCode::VersionConflict,
+            "Run changed after the due-work scan",
+        ));
+    }
+    if i64::try_from(command.candidate.checkpoint_sequence).ok() != run.checkpoint_sequence {
+        return Err(store_error(
+            StoreErrorCode::VersionConflict,
+            "Run checkpoint changed after the due-work scan",
+        ));
+    }
+    if command.candidate.due_at.get() > db_now {
+        return Err(store_error(
+            StoreErrorCode::InvalidTransition,
+            "external retry is not due",
+        ));
+    }
+    if run.deadline.is_some_and(|deadline| deadline <= db_now)
+        || command
+            .recovery_task
+            .deadline
+            .is_some_and(|deadline| deadline.get() <= db_now)
+    {
+        return Err(store_error(
+            StoreErrorCode::DeadlineExceeded,
+            "due-work Run or recovery Task deadline elapsed",
+        ));
+    }
+    if command.recovery_task.available_at.get() > db_now {
+        return Err(invalid_command(
+            "due-work recovery Task must be immediately available",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn consume_external_due_work(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    db_now: i64,
+    command: &ApplyDueWork,
+) -> StoreResult<ConsumedDueWork> {
+    let expected_revision = to_i64(command.candidate.expected_revision, "due-work revision")?;
+    let due_at = command.candidate.due_at.get();
+    match command.candidate.target {
+        DueWorkTarget::Tool(execution_id) => {
+            let execution_id = uuid(execution_id.into_bytes());
+            let execution = lock_tool_by_id(transaction, tenant_id, execution_id).await?;
+            if execution.run_id != run_id {
+                return Err(store_error(
+                    StoreErrorCode::NotFound,
+                    "Tool due-work belongs to another run",
+                ));
+            }
+            if execution.status != "retry_scheduled"
+                || execution.attempt_count != expected_revision
+                || execution.retry_at != Some(due_at)
+            {
+                return Err(store_error(
+                    StoreErrorCode::VersionConflict,
+                    "Tool retry changed after the due-work scan",
+                ));
+            }
+            let updated = transaction
+                .execute(
+                    "UPDATE agent_loom.tool_executions SET status = 'reconciling', \
+                        recovery_action = 'retry_same_request', retry_at = NULL, \
+                        updated_at = to_timestamp(($6::bigint)::double precision / 1000000.0) \
+                     WHERE tenant_id = $1 AND tool_execution_id = $2 \
+                       AND status = 'retry_scheduled' AND attempt_count = $3 \
+                       AND retry_at = to_timestamp(($4::bigint)::double precision / 1000000.0) \
+                       AND retry_at <= to_timestamp(($5::bigint)::double precision / 1000000.0)",
+                    &[
+                        &tenant_id,
+                        &execution_id,
+                        &expected_revision,
+                        &due_at,
+                        &db_now,
+                        &db_now,
+                    ],
+                )
+                .await
+                .map_err(map_database_error)?;
+            if updated != 1 {
+                return Err(store_error(
+                    StoreErrorCode::VersionConflict,
+                    "Tool retry was consumed concurrently",
+                ));
+            }
+            Ok(ConsumedDueWork {
+                kind: "tool_retry",
+                event_type: "tool.retry_due",
+                resource_kind: "tool_execution",
+                execution_id,
+                stage_execution_id: execution.stage_execution_id,
+                next_revision: command.candidate.expected_revision,
+                next_revision_i64: expected_revision,
+            })
+        }
+        DueWorkTarget::Agent(execution_id) => {
+            let execution_id = uuid(execution_id.into_bytes());
+            let execution = lock_agent_by_id(transaction, tenant_id, execution_id).await?;
+            if execution.run_id != run_id {
+                return Err(store_error(
+                    StoreErrorCode::NotFound,
+                    "Agent due-work belongs to another run",
+                ));
+            }
+            if execution.status != "reconciling"
+                || execution.version != expected_revision
+                || execution.retry_at != Some(due_at)
+            {
+                return Err(store_error(
+                    StoreErrorCode::VersionConflict,
+                    "Agent retry changed after the due-work scan",
+                ));
+            }
+            let next_revision_i64 = execution
+                .version
+                .checked_add(1)
+                .ok_or_else(|| inconsistent("Agent execution version overflow"))?;
+            let updated = transaction
+                .execute(
+                    "UPDATE agent_loom.agent_executions SET version = $5, retry_at = NULL, \
+                        updated_at = to_timestamp(($7::bigint)::double precision / 1000000.0) \
+                     WHERE tenant_id = $1 AND agent_execution_id = $2 \
+                       AND status = 'reconciling' AND version = $3 \
+                       AND retry_at = to_timestamp(($4::bigint)::double precision / 1000000.0) \
+                       AND retry_at <= to_timestamp(($6::bigint)::double precision / 1000000.0)",
+                    &[
+                        &tenant_id,
+                        &execution_id,
+                        &expected_revision,
+                        &due_at,
+                        &next_revision_i64,
+                        &db_now,
+                        &db_now,
+                    ],
+                )
+                .await
+                .map_err(map_database_error)?;
+            if updated != 1 {
+                return Err(store_error(
+                    StoreErrorCode::VersionConflict,
+                    "Agent retry was consumed concurrently",
+                ));
+            }
+            Ok(ConsumedDueWork {
+                kind: "agent_retry",
+                event_type: "agent.retry_due",
+                resource_kind: "agent_execution",
+                execution_id,
+                stage_execution_id: execution.stage_execution_id,
+                next_revision: nonnegative_u64(next_revision_i64, "Agent execution version")?,
+                next_revision_i64,
+            })
+        }
+    }
+}
+
 fn validate_existing_tool(
     command: &PrepareToolExecution,
     task: &LockedWorkerTask,
@@ -6129,6 +6459,38 @@ fn agent_batch_committed(
     }
 }
 
+fn due_work_committed(
+    disposition: CommandDisposition,
+    outcome: DueWorkOutcome,
+    event_id: Option<EventId>,
+    wake_workers: bool,
+) -> Committed<DueWorkOutcome> {
+    let mut post_commit_hints = vec![
+        PostCommitHint::RunEventsAvailable {
+            run_id: outcome.run_id,
+        },
+        PostCommitHint::InvalidateRunCache {
+            run_id: outcome.run_id,
+        },
+    ];
+    if wake_workers {
+        post_commit_hints.push(PostCommitHint::WakeWorkers);
+    }
+    let durable_follow_ups = (disposition == CommandDisposition::Applied)
+        .then_some(DurableFollowUp::Task {
+            task_id: outcome.recovery_task_id,
+        })
+        .into_iter()
+        .collect();
+    Committed {
+        disposition,
+        value: outcome,
+        event_ids: event_id.into_iter().collect(),
+        durable_follow_ups,
+        post_commit_hints,
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct RunReceipt {
     #[serde(rename = "type")]
@@ -6344,6 +6706,69 @@ struct AgentBatchReceipt {
     cursor_version: u64,
     run_status: String,
     event_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DueWorkReceipt {
+    #[serde(rename = "type")]
+    outcome_type: String,
+    run_id: Uuid,
+    target_kind: String,
+    execution_id: Uuid,
+    recovery_task_id: Uuid,
+    run_status: String,
+    execution_revision: u64,
+    applied_at: i64,
+}
+
+fn encode_due_work_receipt(outcome: &DueWorkOutcome) -> StoreResult<Value> {
+    let (target_kind, execution_id) = match outcome.target {
+        DueWorkTarget::Tool(id) => ("tool", uuid(id.into_bytes())),
+        DueWorkTarget::Agent(id) => ("agent", uuid(id.into_bytes())),
+    };
+    serde_json::to_value(DueWorkReceipt {
+        outcome_type: "external_due_work".to_owned(),
+        run_id: uuid(outcome.run_id.into_bytes()),
+        target_kind: target_kind.to_owned(),
+        execution_id,
+        recovery_task_id: uuid(outcome.recovery_task_id.into_bytes()),
+        run_status: run_status(outcome.run_status).to_owned(),
+        execution_revision: outcome.execution_revision,
+        applied_at: outcome.applied_at.get(),
+    })
+    .map_err(|_| inconsistent("failed to encode due-work receipt"))
+}
+
+fn decode_due_work_receipt(tenant_id: TenantId, value: &Value) -> StoreResult<DueWorkOutcome> {
+    let receipt: DueWorkReceipt = serde_json::from_value(value.clone())
+        .map_err(|_| inconsistent("stored receipt is not a due-work outcome"))?;
+    if receipt.outcome_type != "external_due_work" {
+        return Err(inconsistent(
+            "stored command receipt has the wrong outcome type",
+        ));
+    }
+    let target = match receipt.target_kind.as_str() {
+        "tool" => DueWorkTarget::Tool(ToolExecutionId::from_bytes(
+            receipt.execution_id.into_bytes(),
+        )),
+        "agent" => DueWorkTarget::Agent(AgentExecutionId::from_bytes(
+            receipt.execution_id.into_bytes(),
+        )),
+        _ => {
+            return Err(inconsistent(
+                "stored due-work receipt has an unknown target",
+            ));
+        }
+    };
+    Ok(DueWorkOutcome {
+        tenant_id,
+        run_id: run_id_from_uuid(receipt.run_id),
+        target,
+        recovery_task_id: task_id_from_uuid(receipt.recovery_task_id),
+        run_status: parse_run_status(&receipt.run_status)?,
+        execution_revision: receipt.execution_revision,
+        applied_at: UnixMicros::new(receipt.applied_at),
+    })
 }
 
 fn encode_agent_batch_receipt(
@@ -6744,6 +7169,36 @@ mod tests {
     }
 
     #[test]
+    fn due_work_receipt_round_trip_preserves_target_revision() {
+        let outcome = DueWorkOutcome {
+            tenant_id: TenantId::from_bytes([1; 16]),
+            run_id: RunId::from_bytes([2; 16]),
+            target: DueWorkTarget::Agent(AgentExecutionId::from_bytes([3; 16])),
+            recovery_task_id: TaskId::from_bytes([4; 16]),
+            run_status: RunStatus::Paused,
+            execution_revision: 6,
+            applied_at: UnixMicros::new(7),
+        };
+        let encoded = encode_due_work_receipt(&outcome).expect("encode due-work receipt");
+        assert_eq!(
+            decode_due_work_receipt(outcome.tenant_id, &encoded).expect("decode due-work receipt"),
+            outcome
+        );
+        let committed = due_work_committed(
+            CommandDisposition::Applied,
+            outcome,
+            Some(EventId::from_bytes([5; 16])),
+            false,
+        );
+        assert_eq!(committed.durable_follow_ups.len(), 1);
+        assert!(
+            !committed
+                .post_commit_hints
+                .contains(&PostCommitHint::WakeWorkers)
+        );
+    }
+
+    #[test]
     fn receipt_round_trip_preserves_original_run_snapshot() {
         let snapshot = RunSnapshot {
             tenant_id: TenantId::from_bytes([1; 16]),
@@ -6788,6 +7243,9 @@ mod tests {
         let legacy_from_timestamp = ["timestamptz", "_to_", "micros"].concat();
         assert!(!source.contains(&legacy_to_timestamp));
         assert!(!source.contains(&legacy_from_timestamp));
+        assert!(source.contains("Tool retry changed after the due-work scan"));
+        assert!(source.contains("Agent retry changed after the due-work scan"));
+        assert!(source.contains("retry_at <= to_timestamp"));
     }
 
     #[tokio::test]
