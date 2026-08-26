@@ -139,10 +139,11 @@ impl crate::PostgresTransactionExecutor {
         let fetch_size = i64::from(page_size) + 1;
         let rows = client
             .query(
-                "SELECT kind, execution_id, run_id, due_micros, expected_revision, \
+                "SELECT kind, execution_id, run_id, stage_execution_id, due_micros, expected_revision, \
                         run_version, execution_generation, checkpoint_sequence FROM (\
                     SELECT 'tool_retry'::text AS kind, x.tool_execution_id AS execution_id, \
-                           x.run_id, (extract(epoch FROM x.retry_at) * 1000000)::bigint AS due_micros, \
+                           x.run_id, x.stage_execution_id, \
+                           (extract(epoch FROM x.retry_at) * 1000000)::bigint AS due_micros, \
                            x.attempt_count AS expected_revision, r.version AS run_version, \
                            r.execution_generation, c.sequence AS checkpoint_sequence \
                     FROM agent_loom.tool_executions x \
@@ -155,7 +156,8 @@ impl crate::PostgresTransactionExecutor {
                                        'retrying', 'paused') \
                     UNION ALL \
                     SELECT 'agent_retry'::text AS kind, x.agent_execution_id AS execution_id, \
-                           x.run_id, (extract(epoch FROM x.retry_at) * 1000000)::bigint AS due_micros, \
+                           x.run_id, x.stage_execution_id, \
+                           (extract(epoch FROM x.retry_at) * 1000000)::bigint AS due_micros, \
                            x.version AS expected_revision, r.version AS run_version, \
                            r.execution_generation, c.sequence AS checkpoint_sequence \
                     FROM agent_loom.agent_executions x \
@@ -207,7 +209,7 @@ fn decode_due_work(tenant_id: TenantId, row: &Row) -> StoreResult<DueWorkCandida
         }
         _ => return Err(inconsistent("database returned an unknown due-work kind")),
     };
-    let checkpoint_sequence = nonnegative_u64(row.get(7), "due-work checkpoint sequence")?;
+    let checkpoint_sequence = nonnegative_u64(row.get(8), "due-work checkpoint sequence")?;
     if checkpoint_sequence == 0 {
         return Err(inconsistent(
             "database due-work candidate has no checkpoint sequence",
@@ -216,11 +218,14 @@ fn decode_due_work(tenant_id: TenantId, row: &Row) -> StoreResult<DueWorkCandida
     Ok(DueWorkCandidate {
         tenant_id,
         run_id: run_id_from_uuid(row.get(2)),
+        stage_execution_id: row
+            .get::<_, Option<Uuid>>(3)
+            .map(|id| agent_loom_domain::StageExecutionId::from_bytes(id.into_bytes())),
         target,
-        due_at: UnixMicros::new(row.get(3)),
-        expected_revision: nonnegative_u64(row.get(4), "due-work revision")?,
-        run_version: nonnegative_u64(row.get(5), "due-work Run version")?,
-        execution_generation: nonnegative_u64(row.get(6), "due-work generation")?,
+        due_at: UnixMicros::new(row.get(4)),
+        expected_revision: nonnegative_u64(row.get(5), "due-work revision")?,
+        run_version: nonnegative_u64(row.get(6), "due-work Run version")?,
+        execution_generation: nonnegative_u64(row.get(7), "due-work generation")?,
         checkpoint_sequence,
     })
 }

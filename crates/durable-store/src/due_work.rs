@@ -1,6 +1,6 @@
 use agent_loom_domain::{
-    AgentExecutionId, EventId, RunId, RunStatus, TaskId, TaskKind, TenantId, ToolExecutionId,
-    UnixMicros,
+    AgentExecutionId, EventId, RunId, RunStatus, StageExecutionId, TaskId, TaskKind, TenantId,
+    ToolExecutionId, UnixMicros,
 };
 
 use crate::{ExpectedRun, NewTask};
@@ -34,6 +34,7 @@ pub struct DueWorkQuery {
 pub struct DueWorkCandidate {
     pub tenant_id: TenantId,
     pub run_id: RunId,
+    pub stage_execution_id: Option<StageExecutionId>,
     pub target: DueWorkTarget,
     pub due_at: UnixMicros,
     pub expected_revision: u64,
@@ -85,6 +86,7 @@ impl ApplyDueWork {
         self.expected_run.run_id == self.candidate.run_id
             && self.expected_run.version == Some(self.candidate.run_version)
             && self.expected_run.execution_generation == Some(self.candidate.execution_generation)
+            && self.recovery_task.stage_execution_id == self.candidate.stage_execution_id
             && self.recovery_task.kind == TaskKind::Reconcile
             && self.recovery_task.generation == self.candidate.execution_generation
             && self.recovery_task.based_on_checkpoint_sequence == self.candidate.checkpoint_sequence
@@ -115,6 +117,7 @@ mod tests {
         let candidate = DueWorkCandidate {
             tenant_id: TenantId::from_bytes([1; 16]),
             run_id: RunId::from_bytes([2; 16]),
+            stage_execution_id: Some(StageExecutionId::from_bytes([9; 16])),
             target: DueWorkTarget::Agent(AgentExecutionId::from_bytes([3; 16])),
             due_at: UnixMicros::new(4),
             expected_revision: 5,
@@ -137,6 +140,7 @@ mod tests {
         let candidate = DueWorkCandidate {
             tenant_id: TenantId::from_bytes([1; 16]),
             run_id: RunId::from_bytes([2; 16]),
+            stage_execution_id: Some(StageExecutionId::from_bytes([10; 16])),
             target: DueWorkTarget::Tool(ToolExecutionId::from_bytes([3; 16])),
             due_at: UnixMicros::new(4),
             expected_revision: 1,
@@ -154,7 +158,7 @@ mod tests {
             },
             recovery_task: NewTask {
                 task_id: TaskId::from_bytes([9; 16]),
-                stage_execution_id: None,
+                stage_execution_id: candidate.stage_execution_id,
                 logical_key: LogicalKey::parse("due/tool-retry").expect("logical key"),
                 kind: TaskKind::Reconcile,
                 generation: 6,

@@ -457,7 +457,7 @@ pub enum DueWorkKind {
 
 `scan_due_work` 是只读候选扫描，不代表候选仍有效。`apply_due_work` 必须重新锁定相关 Run/Task/Wait/Execution，并以当前数据库时间再次校验。
 
-Tool/Agent retry 候选使用数据库 `retry_at <= db_now` 判断，并按 `(due_at, kind, execution_id)` 做稳定 keyset 分页。候选携带 Execution revision，但 revision 只用于后续 CAS；扫描本身不加跨请求锁，也不消费 retry。
+Tool/Agent retry 候选使用数据库 `retry_at <= db_now` 判断，并按 `(due_at, kind, execution_id)` 做稳定 keyset 分页。候选携带 Execution revision、Run fence、checkpoint sequence 和 `stage_execution_id`，使 Runtime 能构造归属明确的恢复 Task；revision 只用于后续 CAS，扫描本身不加跨请求锁，也不消费 retry。
 
 `apply_due_work` 对外部 retry 必须按 Run → Execution 锁序重新验证 Run version/generation/checkpoint、Execution revision/status、原始 `retry_at` 与数据库当前时间。获胜事务消费 `retry_at`、追加 due Event、创建 `reconcile` Task 并推进 Run；暂停 Run 创建 `scheduled` Task，恢复时再转为 queued。重复命令通过 Receipt 返回原结果，不生成第二个恢复 Task。
 
@@ -538,6 +538,7 @@ cursor 更新失败时整批回滚，客户端可以安全从旧 cursor 重读�
 - `scan_due_work` 返回带游标的有限候选页，不锁定对象跨请求等待。
 - 每个候选通过 `apply_due_work` 单独、短事务处理。
 - Scheduler 批次中一个候选失败不得回滚其他候选。
+- 同一候选的 Command、Event、恢复 Task 与 idempotency key 必须可确定性重建，Scheduler 在扫描后、应用前崩溃时可以安全重扫。
 - 暂时性数据库错误使用有限指数退避；状态冲突视为其他实例已处理。
 - Scheduler 必须覆盖以下兜底扫描：过期 Lease、到期 retry、Wait timeout、Run deadline、stale external execution、未发布 Outbox。
 

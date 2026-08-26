@@ -8,6 +8,7 @@ Agent Loom 是面向复杂 Agent 团队协作的持久化流程运行时。首�
 crates/domain          共享 ID、值对象、状态与只读投影
 crates/durable-store   DurableStore 接口、命令、结果、错误和 conformance 清单
 crates/adapter-core    Agent Server / Tool Adapter 通用接口
+crates/runtime         Scheduler/Worker 的数据库无关编排
 crates/provider-conformance  PostgreSQL/MySQL 共享迁移与行为契约测试
 crates/store-postgres  PostgreSQL Provider 与物理迁移
 crates/store-mysql     MySQL/InnoDB Provider 与物理迁移
@@ -19,7 +20,7 @@ crates/store-mysql     MySQL/InnoDB Provider 与物理迁移
 
 PostgreSQL 已接入真实驱动执行层：migration executor 使用 SHA-256 physical checksum、session advisory lock、step journal 和逐批 schema introspection；`PostgresStore` 通过连接池完整实现对象安全的 `DurableStore`，事务垂直切片已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 准备/结果记录、AgentExecution 提交/事件/结果记录，以及 Pause/Resume/Cancel。写路径包含 receipt 并发幂等闸门、显式层级锁序、`FOR UPDATE SKIP LOCKED`、Lease fencing、Run version/generation CAS，以及 Event、Checkpoint、Stage、Artifact 和后续动作的原子提交。
 
-续租使用数据库时间校验并延长 Task/TaskAttempt 的同一 Lease，不推进 Run 版本；失败事务会原子完成 attempt、清除 Lease、追加 Event，并区分 retry、不可重试终态与 Dead Letter。外部事件按 Event type 与 `match_key_hash` 单次消费 Wait，并实例化预存恢复计划。Tool 与 Agent 外部调用采用两阶段窗口：先提交 execution/Event 意图，再记录 adapter outcome；不确定结果持久化对账动作，backoff 必须持久化 `retry_at`。Agent 事件批次会原子完成 receipt/raw digest 去重、本地 Event 追加、远端 cursor CAS、Run 序列推进，以及规范化事件声明的 Task/Wait/Artifact/Execution outcome 投影；Pause/Cancel 后的迟到结果保留审计，但业务投影受 Run version/generation/deadline fencing。Scheduler 已具备 Tool/Agent retry 的数据库时间、稳定 keyset 候选扫描和原子应用事务；应用时重新锁定 Run/Execution、消费 `retry_at`、追加 Event 并创建 reconcile Task。恢复 Worker 领取该 Task 后，启动事务会校验 Lease、Run fence、Execution revision 和来源 `retry_due` Event，再原子创建 Tool 新 attempt 或将 Agent 重新置为 submitting，提交后才允许调用外部 Adapter。下一工程重点是 Runtime Scheduler/Worker 编排、更多 due-work 类型以及 MySQL 对等事务实现。
+续租使用数据库时间校验并延长 Task/TaskAttempt 的同一 Lease，不推进 Run 版本；失败事务会原子完成 attempt、清除 Lease、追加 Event，并区分 retry、不可重试终态与 Dead Letter。外部事件按 Event type 与 `match_key_hash` 单次消费 Wait，并实例化预存恢复计划。Tool 与 Agent 外部调用采用两阶段窗口：先提交 execution/Event 意图，再记录 adapter outcome；不确定结果持久化对账动作，backoff 必须持久化 `retry_at`。Agent 事件批次会原子完成 receipt/raw digest 去重、本地 Event 追加、远端 cursor CAS、Run 序列推进，以及规范化事件声明的 Task/Wait/Artifact/Execution outcome 投影；Pause/Cancel 后的迟到结果保留审计，但业务投影受 Run version/generation/deadline fencing。Scheduler 已具备 Tool/Agent retry 的数据库时间、稳定 keyset 候选扫描和原子应用事务；Runtime 的有界 Scheduler tick 会为候选生成确定性的 Command/Event/Task/Receipt 身份，并隔离单候选失败。应用事务重新锁定 Run/Execution、消费 `retry_at`、追加 Event 并创建 reconcile Task；恢复 Worker 领取该 Task 后，启动事务再校验 Lease、Run fence、Execution revision 和来源 `retry_due` Event，提交后才允许调用外部 Adapter。下一工程重点是 Worker 执行循环、更多 due-work 类型以及 MySQL 对等事务实现。
 
 ## 设计文档
 

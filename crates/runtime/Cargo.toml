@@ -1,0 +1,18 @@
+[package]
+name = "agent-loom-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agent-loom-domain = { path = "../domain" }
+agent-loom-durable-store = { path = "../durable-store" }
+sha2 = "0.11"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

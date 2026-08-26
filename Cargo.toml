@@ -4,6 +4,7 @@ members = [
     "crates/domain",
     "crates/durable-store",
     "crates/provider-conformance",
+    "crates/runtime",
     "crates/store-mysql",
     "crates/store-postgres",
 ]
