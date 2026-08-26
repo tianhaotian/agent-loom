@@ -514,6 +514,8 @@ Worker 在外部调用后、本地记录前崩溃时，Scheduler 根据 stale ex
 
 专用恢复 Worker 必须按 `reconcile` kind 领取 Task，并从已持久化 Task 输入读取 due-work kind、execution ID 和 expected revision。启动命令身份由 Task ID、Task attempt 和 revision 确定性生成；启动事务返回 duplicate 时，dispatcher 仍只能使用原 Execution 幂等身份恢复同一次外部调用，不得生成新的副作用身份。
 
+启动事务提交后，Worker 必须把提交后的 Run version、execution generation、correlation ID 和 actor 作为 `RecoveryDispatchFence` 传给 dispatcher。dispatcher 按 tool name 从 Registry 解析实现，只允许 `ReadOnly` 或 `IdempotentWrite` 进入同请求重放；注册缺失、身份不匹配或非幂等副作用必须持久化为 manual review，不能继续调用。Adapter 错误的 stable code、retry class、remote request ID 和结果摘要随确定性的 outcome Command 一并记录。
+
 ### 8.2 Agent Server
 
 ```text
@@ -530,6 +532,8 @@ Agent 提交意图必须同时保存规范化请求信封、request hash、Endpo
 Agent 提交拒绝使用与 Tool 相同的 `ExecutionRetryClass`。`SameRequestBackoff` 必须携带 `retry_at` 并投影为 `reconciling`；其他分类不得携带 retry time。`record_agent_submission` 即使发现 Run version/generation 已变化，也必须保存外部提交证据，但不得借此推进已被 fencing 的业务状态。
 
 Agent 到期重提同样只能由匹配 `agent.retry_due` Event 创建且已被当前 Worker 领取的 `reconcile` Task 发起。`begin_agent_resubmission` 必须在一个事务内验证 Lease、Run fence、Execution version、`reconciling` 状态、已消费的 retry time 和尚无 `remote_run_ref`，再将 Execution 置为 `submitting`、递增 version、追加 `agent.resubmission_started` 并保存 Receipt。重提沿用原 Endpoint、session reference 和 idempotency key；事务提交后才调用 Agent Server，随后仍由 `record_agent_submission` 保存远端证据。
+
+重提 dispatcher 必须同时验证当前 Adapter 能力与执行时保存的 capability snapshot 均声明 submission idempotency。凭据、trace 和绝对 deadline 由调用前的 `AdapterContextFactory` 临时解析；工厂不得改写 tenant、execution ID、correlation ID、idempotency key 或 request hash。能力缺失、请求信封非法和上下文非法均转为可审计的 manual-review submission outcome。
 
 ### 8.3 远程事件批次
 

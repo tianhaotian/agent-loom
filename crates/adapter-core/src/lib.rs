@@ -286,6 +286,8 @@ pub struct AdapterError {
     pub code: &'static str,
     pub retry: AdapterRetryClass,
     pub safe_message: String,
+    pub remote_request_id: Option<String>,
+    pub retry_after: Option<DurationMicros>,
 }
 
 impl fmt::Display for AdapterError {

@@ -194,6 +194,21 @@ pub struct AgentRunRequest {
 
 `WorkspaceRef` 表示远程服务可访问的仓库、工作区或对象存储引用，不是要求 Runtime 在本机创建目录。生产 Adapter 不接受“运行某个本地 CLI 路径”作为 workspace。
 
+当前 Runtime 垂直切片使用以下版本化最小信封恢复 `AgentRunRequest`，后续扩展字段必须保持向后兼容并由 schema version 驱动：
+
+```json
+{
+  "instructions": "...",
+  "input": {},
+  "budget": {
+    "max_duration_micros": 30000000,
+    "max_output_bytes": 4096
+  }
+}
+```
+
+信封在 `prepare_agent_execution` 前完成 schema 校验并与 request hash 一起持久化；恢复 dispatcher 再次校验信封和非零 budget。短期凭据、trace header 与调用 deadline 不属于信封，由 `AdapterContextFactory` 在外部 I/O 前解析。
+
 ### 6.2 远程引用
 
 ```rust

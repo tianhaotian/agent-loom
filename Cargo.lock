@@ -33,6 +33,7 @@ dependencies = [
 name = "agent-loom-runtime"
 version = "0.1.0"
 dependencies = [
+ "agent-loom-adapter-core",
  "agent-loom-domain",
  "agent-loom-durable-store",
  "serde",

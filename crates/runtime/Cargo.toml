@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+agent-loom-adapter-core = { path = "../adapter-core" }
 agent-loom-domain = { path = "../domain" }
 agent-loom-durable-store = { path = "../durable-store" }
 serde = { version = "1", features = ["derive"] }

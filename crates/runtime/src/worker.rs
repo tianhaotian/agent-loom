@@ -1,9 +1,9 @@
 use std::{error::Error, fmt, future::Future, pin::Pin};
 
 use agent_loom_domain::{
-    AgentExecutionId, AgentExecutionSnapshot, CommandId, Digest, DurationMicros, EventId,
-    IdempotencyKey, LeaseToken, ScopeKey, TaskKind, TenantId, ToolAttemptId, ToolExecutionId,
-    ToolExecutionSnapshot, WorkerId,
+    AgentExecutionId, AgentExecutionSnapshot, CommandId, CorrelationId, Digest, DurationMicros,
+    EventId, IdempotencyKey, LeaseToken, ScopeKey, TaskKind, TenantId, ToolAttemptId,
+    ToolExecutionId, ToolExecutionSnapshot, WorkerId,
 };
 use agent_loom_durable_store::{
     BeginAgentResubmission, BeginToolRetryAttempt, ClaimTask, ClaimedTask, CommandContext,
@@ -63,14 +63,24 @@ where
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryDispatchFence {
+    pub expected_run: ExpectedRun,
+    pub execution_generation: u64,
+    pub correlation_id: CorrelationId,
+    pub actor_ref: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StartedRecovery {
     Tool {
         execution: ToolExecutionSnapshot,
         disposition: CommandDisposition,
+        fence: RecoveryDispatchFence,
     },
     Agent {
         execution: AgentExecutionSnapshot,
         disposition: CommandDisposition,
+        fence: RecoveryDispatchFence,
     },
 }
 
@@ -243,6 +253,20 @@ where
             version: Some(claimed.run_version),
             execution_generation: Some(claimed.task.generation),
         };
+        let outcome_run_version = claimed
+            .run_version
+            .checked_add(1)
+            .ok_or_else(|| invalid_task("recovery Run version overflow"))?;
+        let dispatch_fence = RecoveryDispatchFence {
+            expected_run: ExpectedRun {
+                run_id: claimed.task.run_id,
+                version: Some(outcome_run_version),
+                execution_generation: Some(claimed.task.generation),
+            },
+            execution_generation: claimed.task.generation,
+            correlation_id: claim_context.correlation_id,
+            actor_ref: claim_context.actor_ref.clone(),
+        };
         let identity = format!(
             "recovery-start/{}/{}/{}",
             claimed.task.task_id, claimed.task.attempt, input.expected_revision
@@ -272,6 +296,7 @@ where
                 StartedRecovery::Tool {
                     execution: committed.value,
                     disposition: committed.disposition,
+                    fence: dispatch_fence,
                 }
             }
             RecoveryTaskKind::AgentRetry => {
@@ -291,6 +316,7 @@ where
                 StartedRecovery::Agent {
                     execution: committed.value,
                     disposition: committed.disposition,
+                    fence: dispatch_fence,
                 }
             }
         };
@@ -554,7 +580,24 @@ mod tests {
             )
             .await
             .expect("worker poll");
-        assert!(matches!(outcome, RecoveryPollOutcome::Dispatched { .. }));
+        assert!(matches!(
+            outcome,
+            RecoveryPollOutcome::Dispatched {
+                started: StartedRecovery::Tool {
+                    fence: RecoveryDispatchFence {
+                        expected_run: ExpectedRun {
+                            version: Some(10),
+                            execution_generation: Some(7),
+                            ..
+                        },
+                        execution_generation: 7,
+                        ..
+                    },
+                    ..
+                },
+                ..
+            }
+        ));
         assert_eq!(
             calls.lock().expect("calls lock").as_slice(),
             &["claim", "begin", "dispatch"]
