@@ -1,11 +1,15 @@
 use agent_loom_domain::{
-    AgentExecutionId, AgentVersionId, CheckpointId, Digest, EndpointId, EventRecord,
-    IdempotencyKey, JsonPayload, RunId, RunSnapshot, ScopeKey, TenantId, ToolExecutionId,
-    UnixMicros,
+    AgentExecutionId, AgentVersionId, ArtifactId, ArtifactRefSnapshot, ArtifactVersionRef,
+    CheckpointId, Digest, EndpointId, EventId, EventRecord, IdempotencyKey, JsonPayload,
+    LogicalKey, RunId, RunSnapshot, ScopeKey, StageExecutionId, StageExecutionSnapshot,
+    StageStatus, TenantId, ToolExecutionId, UnixMicros, WaitId, WaitSnapshot, WaitStatus,
+    WorkflowId, WorkflowSnapshot, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
     AgentInvocation, DueWorkCandidate, DueWorkKind, DueWorkPage, DueWorkQuery, DueWorkTarget,
-    EventCursor, EventPage, QueryContext, StoreError, StoreErrorCode, StoreResult, ToolInvocation,
+    EventCursor, EventPage, MaintenanceCandidate, MaintenanceKind, MaintenancePage,
+    MaintenanceQuery, MaintenanceTarget, QueryContext, StoreError, StoreErrorCode, StoreResult,
+    ToolInvocation,
 };
 use serde_json::Value;
 use tokio_postgres::{Client, Row};
@@ -18,6 +22,7 @@ use crate::{
 
 const MAX_EVENT_PAGE_SIZE: u32 = 1_000;
 const MAX_DUE_WORK_PAGE_SIZE: u32 = 1_000;
+const MAX_MAINTENANCE_PAGE_SIZE: u32 = 1_000;
 
 impl crate::PostgresTransactionExecutor {
     /// Reads the authoritative Run projection for one tenant.
@@ -49,6 +54,136 @@ impl crate::PostgresTransactionExecutor {
             .map_err(map_database_error)?;
         row.map(|row| decode_run(context.tenant_id, &row))
             .transpose()
+    }
+
+    /// Reads the latest published/draft version of a Workflow definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for unavailable PostgreSQL or invalid persisted data.
+    pub async fn get_workflow(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        workflow_id: WorkflowId,
+    ) -> StoreResult<Option<WorkflowSnapshot>> {
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let workflow_id = uuid(workflow_id.into_bytes());
+        let row = client
+            .query_opt(
+                "SELECT w.workflow_id, v.workflow_version_id, w.workflow_key, w.name, w.status, \
+                        v.version, v.lifecycle, v.spec_json, v.spec_digest, \
+                        (extract(epoch FROM v.created_at) * 1000000)::bigint, \
+                        (extract(epoch FROM w.updated_at) * 1000000)::bigint \
+                 FROM agent_loom.workflow_definitions w \
+                 JOIN agent_loom.workflow_definition_versions v \
+                   ON v.tenant_id = w.tenant_id AND v.workflow_id = w.workflow_id \
+                  AND v.version = w.latest_version \
+                 WHERE w.tenant_id = $1 AND w.workflow_id = $2",
+                &[&tenant_id, &workflow_id],
+            )
+            .await
+            .map_err(map_database_error)?;
+        row.map(|row| decode_workflow(context.tenant_id, &row))
+            .transpose()
+    }
+
+    /// Lists the business Stage projection for one Run in definition order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for unavailable PostgreSQL or invalid persisted data.
+    pub async fn list_stages(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        run_id: RunId,
+    ) -> StoreResult<Vec<StageExecutionSnapshot>> {
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_uuid = uuid(run_id.into_bytes());
+        client
+            .query(
+                "SELECT stage_execution_id, stage_key, definition_stage_key, status, version, \
+                        attempt, assignee_kind, assignee_ref, input_contract_json, \
+                        output_contract_json, \
+                        CASE WHEN started_at IS NULL THEN NULL ELSE \
+                            (extract(epoch FROM started_at) * 1000000)::bigint END, \
+                        CASE WHEN completed_at IS NULL THEN NULL ELSE \
+                            (extract(epoch FROM completed_at) * 1000000)::bigint END, \
+                        (extract(epoch FROM created_at) * 1000000)::bigint, \
+                        (extract(epoch FROM updated_at) * 1000000)::bigint \
+                 FROM agent_loom.stage_executions \
+                 WHERE tenant_id = $1 AND run_id = $2 \
+                 ORDER BY created_at, stage_key, attempt",
+                &[&tenant_id, &run_uuid],
+            )
+            .await
+            .map_err(map_database_error)?
+            .iter()
+            .map(|row| decode_stage(context.tenant_id, run_id, row))
+            .collect()
+    }
+
+    /// Lists immutable Artifact references produced by one Run.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for unavailable PostgreSQL or invalid persisted data.
+    pub async fn list_artifacts(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        run_id: RunId,
+    ) -> StoreResult<Vec<ArtifactRefSnapshot>> {
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_uuid = uuid(run_id.into_bytes());
+        client
+            .query(
+                "SELECT artifact_id, stage_execution_id, task_id, logical_key, kind, \
+                        contract_version, version, uri, digest, media_type, size_bytes, \
+                        source_artifact_refs_json, metadata_json, produced_by, created_event_id, \
+                        (extract(epoch FROM created_at) * 1000000)::bigint \
+                 FROM agent_loom.artifact_refs \
+                 WHERE tenant_id = $1 AND run_id = $2 \
+                 ORDER BY logical_key, version, artifact_id",
+                &[&tenant_id, &run_uuid],
+            )
+            .await
+            .map_err(map_database_error)?
+            .iter()
+            .map(|row| decode_artifact(context.tenant_id, run_id, row))
+            .collect()
+    }
+
+    /// Lists the durable Wait projection for one Run in creation order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for unavailable PostgreSQL or invalid data.
+    pub async fn list_waits(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        run_id: RunId,
+    ) -> StoreResult<Vec<WaitSnapshot>> {
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_uuid = uuid(run_id.into_bytes());
+        client
+            .query(
+                "SELECT wait_id, stage_execution_id, wait_type, expected_event_type, \
+                        match_key_hash, status, active_slot, \
+                        CASE WHEN expires_at IS NULL THEN NULL ELSE \
+                            (extract(epoch FROM expires_at) * 1000000)::bigint END, \
+                        consumed_by_event_id, created_event_id \
+                 FROM agent_loom.wait_subscriptions \
+                 WHERE tenant_id = $1 AND run_id = $2 ORDER BY created_at, wait_id",
+                &[&tenant_id, &run_uuid],
+            )
+            .await
+            .map_err(map_database_error)?
+            .iter()
+            .map(|row| decode_wait(context.tenant_id, run_id, row))
+            .collect()
     }
 
     /// Returns a stable, sequence-ordered Event page scoped to one Run and tenant.
@@ -192,6 +327,104 @@ impl crate::PostgresTransactionExecutor {
         })
     }
 
+    /// Scans Run deadlines, Wait expirations, and stale external executions
+    /// against PostgreSQL transaction time using one stable keyset.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for invalid bounds, database failures, or
+    /// invalid persisted candidate data.
+    pub async fn scan_maintenance(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        query: MaintenanceQuery,
+    ) -> StoreResult<MaintenancePage> {
+        if query.limit == 0 || query.stale_after_micros == 0 {
+            return Err(StoreError::new(
+                StoreErrorCode::ConstraintViolation,
+                agent_loom_durable_store::RetryClass::Never,
+                "maintenance limit and stale interval must be positive",
+            ));
+        }
+        let stale_after = i64::try_from(query.stale_after_micros).map_err(|_| {
+            StoreError::new(
+                StoreErrorCode::ConstraintViolation,
+                agent_loom_durable_store::RetryClass::Never,
+                "maintenance stale interval exceeds PostgreSQL range",
+            )
+        })?;
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let after_due = query.after.map(|cursor| cursor.due_at.get());
+        let after_kind = query.after.map(|cursor| maintenance_kind(cursor.kind));
+        let after_id = query.after.map(|cursor| Uuid::from_bytes(cursor.target_id));
+        let page_size = query.limit.min(MAX_MAINTENANCE_PAGE_SIZE);
+        let fetch_size = i64::from(page_size) + 1;
+        let rows = client
+            .query(
+                "SELECT kind, target_id, run_id, due_micros, expected_revision, run_version, \
+                        execution_generation FROM (\
+                    SELECT 'run_deadline'::text AS kind, r.run_id AS target_id, r.run_id, \
+                           (extract(epoch FROM r.deadline) * 1000000)::bigint AS due_micros, \
+                           r.version AS expected_revision, r.version AS run_version, \
+                           r.execution_generation \
+                    FROM agent_loom.runs r \
+                    WHERE r.tenant_id = $1 AND r.deadline <= transaction_timestamp() \
+                      AND r.status IN ('queued', 'running', 'waiting', 'approval_required', \
+                                       'retrying', 'paused') \
+                    UNION ALL \
+                    SELECT 'wait_timeout'::text, w.wait_id, w.run_id, \
+                           (extract(epoch FROM w.expires_at) * 1000000)::bigint, \
+                           0::bigint, r.version, r.execution_generation \
+                    FROM agent_loom.wait_subscriptions w \
+                    JOIN agent_loom.runs r ON r.tenant_id = w.tenant_id AND r.run_id = w.run_id \
+                    WHERE w.tenant_id = $1 AND w.status = 'open' \
+                      AND w.expires_at <= transaction_timestamp() \
+                      AND r.status IN ('waiting', 'approval_required', 'paused') \
+                    UNION ALL \
+                    SELECT 'tool_stale'::text, x.tool_execution_id, x.run_id, \
+                           (extract(epoch FROM x.updated_at) * 1000000)::bigint + $5::bigint, \
+                           x.attempt_count, r.version, r.execution_generation \
+                    FROM agent_loom.tool_executions x \
+                    JOIN agent_loom.runs r ON r.tenant_id = x.tenant_id AND r.run_id = x.run_id \
+                    WHERE x.tenant_id = $1 AND x.status IN ('executing', 'outcome_unknown') \
+                      AND x.updated_at <= transaction_timestamp() - ($5::bigint * interval '1 microsecond') \
+                      AND r.status IN ('queued', 'running', 'waiting', 'approval_required', \
+                                       'retrying', 'paused') \
+                    UNION ALL \
+                    SELECT 'agent_stale'::text, x.agent_execution_id, x.run_id, \
+                           (extract(epoch FROM x.updated_at) * 1000000)::bigint + $5::bigint, \
+                           x.version, r.version, r.execution_generation \
+                    FROM agent_loom.agent_executions x \
+                    JOIN agent_loom.runs r ON r.tenant_id = x.tenant_id AND r.run_id = x.run_id \
+                    WHERE x.tenant_id = $1 \
+                      AND x.status IN ('submitting', 'running', 'stopping', 'outcome_unknown') \
+                      AND x.updated_at <= transaction_timestamp() - ($5::bigint * interval '1 microsecond') \
+                      AND r.status IN ('queued', 'running', 'waiting', 'approval_required', \
+                                       'retrying', 'paused')\
+                 ) due \
+                 WHERE $2::bigint IS NULL OR (due_micros, kind, target_id) > \
+                       ($2::bigint, $3::text, $4::uuid) \
+                 ORDER BY due_micros, kind, target_id LIMIT $6",
+                &[&tenant_id, &after_due, &after_kind, &after_id, &stale_after, &fetch_size],
+            )
+            .await
+            .map_err(map_database_error)?;
+        let has_more = rows.len() > page_size as usize;
+        let candidates = rows
+            .iter()
+            .take(page_size as usize)
+            .map(|row| decode_maintenance(context.tenant_id, row))
+            .collect::<StoreResult<Vec<_>>>()?;
+        let next_cursor = has_more
+            .then(|| candidates.last().copied().map(MaintenanceCandidate::cursor))
+            .flatten();
+        Ok(MaintenancePage {
+            candidates,
+            next_cursor,
+        })
+    }
+
     /// Loads the immutable Tool Adapter invocation envelope for one execution.
     ///
     /// # Errors
@@ -284,6 +517,166 @@ fn decode_digest(value: Vec<u8>, field: &str) -> StoreResult<Digest> {
     Ok(Digest::from_bytes(bytes))
 }
 
+fn decode_workflow(tenant_id: TenantId, row: &Row) -> StoreResult<WorkflowSnapshot> {
+    let workflow_id: Uuid = row.get(0);
+    let workflow_version_id: Uuid = row.get(1);
+    Ok(WorkflowSnapshot {
+        tenant_id,
+        workflow_id: WorkflowId::from_bytes(workflow_id.into_bytes()),
+        workflow_version_id: WorkflowVersionId::from_bytes(workflow_version_id.into_bytes()),
+        workflow_key: row.get(2),
+        name: row.get(3),
+        status: row.get(4),
+        version: nonnegative_u64(row.get(5), "workflow version")?,
+        lifecycle: row.get(6),
+        spec: decode_json_payload(&row.get(7))?,
+        spec_digest: decode_digest(row.get(8), "workflow spec digest")?,
+        created_at: UnixMicros::new(row.get(9)),
+        updated_at: UnixMicros::new(row.get(10)),
+    })
+}
+
+fn decode_stage(
+    tenant_id: TenantId,
+    run_id: RunId,
+    row: &Row,
+) -> StoreResult<StageExecutionSnapshot> {
+    let stage_id: Uuid = row.get(0);
+    let attempt = u32::try_from(row.get::<_, i64>(5))
+        .map_err(|_| inconsistent("stage attempt is outside u32 range"))?;
+    Ok(StageExecutionSnapshot {
+        tenant_id,
+        stage_execution_id: StageExecutionId::from_bytes(stage_id.into_bytes()),
+        run_id,
+        stage_key: LogicalKey::parse(row.get::<_, String>(1))
+            .map_err(|_| inconsistent("stage key is invalid"))?,
+        definition_stage_key: row
+            .get::<_, Option<String>>(2)
+            .map(LogicalKey::parse)
+            .transpose()
+            .map_err(|_| inconsistent("definition stage key is invalid"))?,
+        status: parse_stage_status(row.get(3))?,
+        version: nonnegative_u64(row.get(4), "stage version")?,
+        attempt,
+        assignee_kind: row.get(6),
+        assignee_ref: row.get(7),
+        input_contract: decode_json_payload(&row.get(8))?,
+        output_contract: decode_json_payload(&row.get(9))?,
+        started_at: row.get::<_, Option<i64>>(10).map(UnixMicros::new),
+        completed_at: row.get::<_, Option<i64>>(11).map(UnixMicros::new),
+        created_at: UnixMicros::new(row.get(12)),
+        updated_at: UnixMicros::new(row.get(13)),
+    })
+}
+
+fn decode_artifact(
+    tenant_id: TenantId,
+    run_id: RunId,
+    row: &Row,
+) -> StoreResult<ArtifactRefSnapshot> {
+    let artifact_id: Uuid = row.get(0);
+    let sources = row
+        .get::<_, Value>(11)
+        .as_array()
+        .ok_or_else(|| inconsistent("artifact source list is not an array"))?
+        .iter()
+        .map(|source| {
+            let id = source
+                .get("artifact_id")
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .ok_or_else(|| inconsistent("artifact source ID is invalid"))?;
+            let version = source
+                .get("version")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| inconsistent("artifact source version is invalid"))?;
+            Ok(ArtifactVersionRef {
+                artifact_id: ArtifactId::from_bytes(id.into_bytes()),
+                version,
+            })
+        })
+        .collect::<StoreResult<Vec<_>>>()?;
+    Ok(ArtifactRefSnapshot {
+        tenant_id,
+        artifact_id: ArtifactId::from_bytes(artifact_id.into_bytes()),
+        run_id,
+        stage_execution_id: row
+            .get::<_, Option<Uuid>>(1)
+            .map(|id| StageExecutionId::from_bytes(id.into_bytes())),
+        task_id: row
+            .get::<_, Option<Uuid>>(2)
+            .map(|id| agent_loom_domain::TaskId::from_bytes(id.into_bytes())),
+        logical_key: LogicalKey::parse(row.get::<_, String>(3))
+            .map_err(|_| inconsistent("artifact logical key is invalid"))?,
+        kind: row.get(4),
+        contract_version: u32::try_from(row.get::<_, i64>(5))
+            .map_err(|_| inconsistent("artifact contract version is invalid"))?,
+        version: nonnegative_u64(row.get(6), "artifact version")?,
+        uri: row.get(7),
+        digest: decode_digest(row.get(8), "artifact digest")?,
+        media_type: row.get(9),
+        size_bytes: nonnegative_u64(row.get(10), "artifact size")?,
+        sources,
+        metadata: decode_json_payload(&row.get(12))?,
+        produced_by: row.get(13),
+        created_event_id: {
+            let id: Uuid = row.get(14);
+            EventId::from_bytes(id.into_bytes())
+        },
+        created_at: UnixMicros::new(row.get(15)),
+    })
+}
+
+fn decode_wait(tenant_id: TenantId, run_id: RunId, row: &Row) -> StoreResult<WaitSnapshot> {
+    let wait_id: Uuid = row.get(0);
+    let active_slot = row
+        .get::<_, Option<i16>>(6)
+        .map(u8::try_from)
+        .transpose()
+        .map_err(|_| inconsistent("Wait active slot is outside u8 range"))?;
+    let status = match row.get::<_, &str>(5) {
+        "open" => WaitStatus::Open,
+        "consumed" => WaitStatus::Consumed,
+        "expired" => WaitStatus::Expired,
+        "cancelled" => WaitStatus::Cancelled,
+        _ => return Err(inconsistent("database returned an unknown Wait status")),
+    };
+    let snapshot = WaitSnapshot {
+        tenant_id,
+        wait_id: WaitId::from_bytes(wait_id.into_bytes()),
+        run_id,
+        stage_execution_id: row
+            .get::<_, Option<Uuid>>(1)
+            .map(|id| StageExecutionId::from_bytes(id.into_bytes())),
+        wait_type: row.get(2),
+        expected_event_type: row.get(3),
+        match_key_hash: decode_digest(row.get(4), "Wait match key hash")?,
+        status,
+        active_slot,
+        expires_at: row.get::<_, Option<i64>>(7).map(UnixMicros::new),
+        consumed_by_event_id: row.get::<_, Option<Uuid>>(8).map(event_id_from_uuid),
+        created_event_id: event_id_from_uuid(row.get(9)),
+    };
+    if !snapshot.active_slot_invariant_holds() {
+        return Err(inconsistent("Wait active slot invariant is violated"));
+    }
+    Ok(snapshot)
+}
+
+fn parse_stage_status(value: &str) -> StoreResult<StageStatus> {
+    match value {
+        "planned" => Ok(StageStatus::Planned),
+        "active" => Ok(StageStatus::Active),
+        "waiting_approval" => Ok(StageStatus::WaitingApproval),
+        "rework_required" => Ok(StageStatus::ReworkRequired),
+        "succeeded" => Ok(StageStatus::Succeeded),
+        "failed" => Ok(StageStatus::Failed),
+        "skipped" => Ok(StageStatus::Skipped),
+        "cancelled" => Ok(StageStatus::Cancelled),
+        _ => Err(inconsistent("database returned an unknown stage status")),
+    }
+}
+
 fn decode_json_payload(value: &Value) -> StoreResult<JsonPayload> {
     serde_json::to_vec(value)
         .map(JsonPayload::from_validated_bytes)
@@ -325,6 +718,44 @@ fn decode_due_work(tenant_id: TenantId, row: &Row) -> StoreResult<DueWorkCandida
         run_version: nonnegative_u64(row.get(6), "due-work Run version")?,
         execution_generation: nonnegative_u64(row.get(7), "due-work generation")?,
         checkpoint_sequence,
+    })
+}
+
+const fn maintenance_kind(kind: MaintenanceKind) -> &'static str {
+    match kind {
+        MaintenanceKind::RunDeadline => "run_deadline",
+        MaintenanceKind::WaitTimeout => "wait_timeout",
+        MaintenanceKind::ToolStale => "tool_stale",
+        MaintenanceKind::AgentStale => "agent_stale",
+    }
+}
+
+fn decode_maintenance(tenant_id: TenantId, row: &Row) -> StoreResult<MaintenanceCandidate> {
+    let kind: &str = row.get(0);
+    let target_id: Uuid = row.get(1);
+    let target = match kind {
+        "run_deadline" => MaintenanceTarget::Run(RunId::from_bytes(target_id.into_bytes())),
+        "wait_timeout" => MaintenanceTarget::Wait(WaitId::from_bytes(target_id.into_bytes())),
+        "tool_stale" => {
+            MaintenanceTarget::Tool(ToolExecutionId::from_bytes(target_id.into_bytes()))
+        }
+        "agent_stale" => {
+            MaintenanceTarget::Agent(AgentExecutionId::from_bytes(target_id.into_bytes()))
+        }
+        _ => {
+            return Err(inconsistent(
+                "database returned an unknown maintenance kind",
+            ));
+        }
+    };
+    Ok(MaintenanceCandidate {
+        tenant_id,
+        run_id: run_id_from_uuid(row.get(2)),
+        target,
+        due_at: UnixMicros::new(row.get(3)),
+        expected_revision: nonnegative_u64(row.get(4), "maintenance revision")?,
+        run_version: nonnegative_u64(row.get(5), "maintenance Run version")?,
+        execution_generation: nonnegative_u64(row.get(6), "maintenance generation")?,
     })
 }
 
@@ -398,6 +829,18 @@ mod tests {
         assert!(source.contains("(due_micros, kind, execution_id) >"));
         assert!(source.contains("ORDER BY due_micros, kind, execution_id LIMIT $5"));
         assert_eq!(MAX_DUE_WORK_PAGE_SIZE, 1_000);
+    }
+
+    #[test]
+    fn maintenance_sql_uses_database_time_and_all_mvp_candidate_classes() {
+        let source = include_str!("query_executor.rs");
+        assert!(source.contains("r.deadline <= transaction_timestamp()"));
+        assert!(source.contains("w.expires_at <= transaction_timestamp()"));
+        assert!(source.contains("'tool_stale'::text"));
+        assert!(source.contains("'agent_stale'::text"));
+        assert!(source.contains("(due_micros, kind, target_id) >"));
+        assert!(source.contains("ORDER BY due_micros, kind, target_id LIMIT $6"));
+        assert_eq!(MAX_MAINTENANCE_PAGE_SIZE, 1_000);
     }
 
     #[test]

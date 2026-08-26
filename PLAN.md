@@ -327,6 +327,10 @@ CI 已配置独立的 workspace 质量门禁和 PostgreSQL 16 服务 Job；后�
 
 1. 继续将多 Worker 领取、续租/回收竞争与事务故障注入下沉为 Provider 黑盒 conformance 场景。
 2. 实现 MySQL 对等事务路径；优先覆盖 Lease 续租/回收竞争。
-3. 补齐 stale external execution、Wait timeout 与 Run deadline 的扫描及应用事务。
-4. 实现 Mock Agent Server Adapter 和业产研 Workflow fixture，跑通需求分析至部署的模拟 E2E。
+3. 将维护扫描、返工与审批竞争继续下沉为数据库无关的 Provider conformance 场景。
+4. 接入至少一个真实外部 Agent Server 和真实 DevOps Tool，并运行 Adapter conformance。
 5. 按部署需求选择 `0011_optional_outbox`；将 `0012_runtime_grants` 作为数据库权限加固迁移或等价 IaC，而不是基础领域正确性的前置条件。
+
+### MVP 交付状态
+
+`agent-loom-server` 已形成 PostgreSQL MVP：启动时自动 migration/fixture，使用 API Key 和 tenant-scoped Store 暴露 Workflow、Run、Event/SSE、Stage、Artifact、Pending Action 与控制 API。八个必需 Stage 会通过正式 AgentExecution 推进；fixture 固定触发一次集成测试失败，并在同一完成事务中创建 implementation/self_test/integration_test attempt 2。部署前进入可超时、单次消费的审批 Wait，审批后由正式 ToolExecution 调用 Mock DevOps Adapter。Due-work Scheduler、Recovery Worker、Lease Reclaimer 以及 Run deadline、Wait timeout、stale execution 维护服务均随进程启动。PostgreSQL 16 实测已覆盖 migration、完整事务套件、Provider conformance，以及 HTTP→返工→审批→Tool 部署→SSE/查询/终态和 deadline E2E。当前交付满足首个 PostgreSQL MVP；完整 Phase 2A/2B 仍需真实外部 Adapter、更多竞争/故障场景和 MySQL 对等事务实现。

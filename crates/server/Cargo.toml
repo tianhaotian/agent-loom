@@ -1,0 +1,30 @@
+[package]
+name = "agent-loom-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+agent-loom-adapter-core = { path = "../adapter-core" }
+agent-loom-domain = { path = "../domain" }
+agent-loom-durable-store = { path = "../durable-store" }
+agent-loom-runtime = { path = "../runtime" }
+agent-loom-store-postgres = { path = "../store-postgres" }
+axum = "0.8"
+deadpool-postgres = "0.14.1"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

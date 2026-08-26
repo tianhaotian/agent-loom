@@ -59,7 +59,22 @@ pub struct CreateRun {
     pub deadline: Option<UnixMicros>,
     pub initial_event_id: EventId,
     pub initial_checkpoint: NewCheckpoint,
+    pub initial_stages: Vec<InitialStage>,
     pub initial_tasks: Vec<InitialTask>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitialStage {
+    pub stage_execution_id: StageExecutionId,
+    pub stage_key: LogicalKey,
+    pub definition_stage_key: LogicalKey,
+    pub status: StageStatus,
+    pub attempt: u32,
+    pub assignee_kind: Option<String>,
+    pub assignee_ref: Option<String>,
+    pub input_contract: JsonPayload,
+    pub output_contract: JsonPayload,
+    pub policy: JsonPayload,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,6 +101,8 @@ pub struct CompleteTask {
     pub checkpoint: NewCheckpoint,
     pub task_result: TaskResult,
     pub stage_mutation: Option<StageMutation>,
+    pub additional_stage_mutations: Vec<StageMutation>,
+    pub new_stages: Vec<InitialStage>,
     pub artifacts: Vec<NewArtifactRef>,
     pub next: NextActions,
 }
@@ -122,6 +139,15 @@ impl CompleteTask {
                 || artifact.sources.iter().any(|source| source.version == 0)
         }) {
             return Err(CompletionShapeError::InvalidArtifactMetadata);
+        }
+
+        if self.new_stages.iter().any(|stage| {
+            stage.attempt == 0
+                || stage.assignee_kind.is_some() != stage.assignee_ref.is_some()
+                || stage.assignee_kind.as_deref().is_some_and(str::is_empty)
+                || stage.assignee_ref.as_deref().is_some_and(str::is_empty)
+        }) {
+            return Err(CompletionShapeError::InvalidStageMetadata);
         }
 
         if let Some(error) = self.next.metadata_error() {
@@ -312,6 +338,7 @@ pub enum CompletionShapeError {
     InvalidCheckpointMetadata,
     InvalidTaskMetadata,
     InvalidWaitMetadata,
+    InvalidStageMetadata,
     InvalidArtifactMetadata,
     GenerationMismatch,
     FinishRunRequiresTerminalStatus,
@@ -445,6 +472,8 @@ mod tests {
             },
             task_result: TaskResult { output: json() },
             stage_mutation: None,
+            additional_stage_mutations: Vec::new(),
+            new_stages: Vec::new(),
             artifacts: Vec::new(),
             next: NextActions::FinishRun(FinalRunResult {
                 status: RunStatus::Completed,

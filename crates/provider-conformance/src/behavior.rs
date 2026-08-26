@@ -106,6 +106,7 @@ pub async fn exercise_lease_expiry_retry(
                     state_digest: Digest::from_bytes([4; 32]),
                     created_event_id: initial_event_id,
                 },
+                initial_stages: Vec::new(),
                 initial_tasks: vec![InitialTask {
                     task_id,
                     stage_execution_id: None,

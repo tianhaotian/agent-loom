@@ -1,15 +1,17 @@
 use std::{future::Future, pin::Pin};
 
 use agent_loom_domain::{
-    AgentExecutionId, AgentExecutionSnapshot, RunId, RunSnapshot, ToolExecutionId,
-    ToolExecutionSnapshot,
+    AgentExecutionId, AgentExecutionSnapshot, ArtifactRefSnapshot, RunId, RunSnapshot,
+    StageExecutionSnapshot, ToolExecutionId, ToolExecutionSnapshot, WaitSnapshot, WorkflowId,
+    WorkflowSnapshot,
 };
 
 use crate::{
     AgentEventBatchOutcome, AgentInvocation, AppendAgentEvents, ApplyDueWork, ApplyEvent,
-    BeginAgentResubmission, BeginToolRetryAttempt, ClaimTask, ClaimedTask, Committed, CompleteTask,
-    ControlRun, CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery, EventCursor, EventPage,
-    FailTask, LeaseReclaimOutcome, PrepareAgentExecution, PrepareToolExecution, QueryContext,
+    ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt, ClaimTask, ClaimedTask,
+    Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery,
+    EventCursor, EventPage, FailTask, LeaseReclaimOutcome, MaintenanceOutcome, MaintenancePage,
+    MaintenanceQuery, PrepareAgentExecution, PrepareToolExecution, QueryContext,
     ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission, RecordToolOutcome,
     RenewTaskLease, StoreResult, ToolInvocation,
 };
@@ -51,6 +53,30 @@ pub trait DurableStore: Send + Sync {
         run_id: RunId,
     ) -> StoreFuture<'a, Option<RunSnapshot>>;
 
+    fn get_workflow<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        workflow_id: WorkflowId,
+    ) -> StoreFuture<'a, Option<WorkflowSnapshot>>;
+
+    fn list_stages<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        run_id: RunId,
+    ) -> StoreFuture<'a, Vec<StageExecutionSnapshot>>;
+
+    fn list_artifacts<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        run_id: RunId,
+    ) -> StoreFuture<'a, Vec<ArtifactRefSnapshot>>;
+
+    fn list_waits<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        run_id: RunId,
+    ) -> StoreFuture<'a, Vec<WaitSnapshot>>;
+
     fn list_events<'a>(
         &'a self,
         context: &'a QueryContext,
@@ -62,6 +88,12 @@ pub trait DurableStore: Send + Sync {
         context: &'a QueryContext,
         query: DueWorkQuery,
     ) -> StoreFuture<'a, DueWorkPage>;
+
+    fn scan_maintenance<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        query: MaintenanceQuery,
+    ) -> StoreFuture<'a, MaintenancePage>;
 
     fn get_tool_invocation<'a>(
         &'a self,
@@ -80,6 +112,12 @@ pub trait DurableStore: Send + Sync {
         context: &'a crate::CommandContext,
         command: ApplyDueWork,
     ) -> StoreFuture<'a, Committed<DueWorkOutcome>>;
+
+    fn apply_maintenance<'a>(
+        &'a self,
+        context: &'a crate::CommandContext,
+        command: ApplyMaintenance,
+    ) -> StoreFuture<'a, Option<MaintenanceOutcome>>;
 
     fn claim_task<'a>(
         &'a self,

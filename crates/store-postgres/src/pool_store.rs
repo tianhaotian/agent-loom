@@ -1,10 +1,14 @@
 use agent_loom_domain::{AgentExecutionId, ToolExecutionId};
-use agent_loom_domain::{AgentExecutionSnapshot, RunId, RunSnapshot, ToolExecutionSnapshot};
+use agent_loom_domain::{
+    AgentExecutionSnapshot, ArtifactRefSnapshot, RunId, RunSnapshot, StageExecutionSnapshot,
+    ToolExecutionSnapshot, WaitSnapshot, WorkflowId, WorkflowSnapshot,
+};
 use agent_loom_durable_store::{
     AgentEventBatchOutcome, AgentInvocation, AppendAgentEvents, ApplyDueWork, ApplyEvent,
-    BeginAgentResubmission, BeginToolRetryAttempt, ClaimTask, ClaimedTask, CommandContext,
-    Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery,
-    DurableStore, EventCursor, EventPage, FailTask, LeaseReclaimOutcome, PrepareAgentExecution,
+    ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt, ClaimTask, ClaimedTask,
+    CommandContext, Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome, DueWorkPage,
+    DueWorkQuery, DurableStore, EventCursor, EventPage, FailTask, LeaseReclaimOutcome,
+    MaintenanceOutcome, MaintenancePage, MaintenanceQuery, PrepareAgentExecution,
     PrepareToolExecution, QueryContext, ReclaimExpiredLease, RecordAgentOutcome,
     RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, RetryClass, StoreCapabilities,
     StoreError, StoreErrorCode, StoreFuture, StoreResult, ToolInvocation,
@@ -81,6 +85,52 @@ impl DurableStore for PostgresStore {
         })
     }
 
+    fn get_workflow<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        workflow_id: WorkflowId,
+    ) -> StoreFuture<'a, Option<WorkflowSnapshot>> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor
+                .get_workflow(&client, context, workflow_id)
+                .await
+        })
+    }
+
+    fn list_stages<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        run_id: RunId,
+    ) -> StoreFuture<'a, Vec<StageExecutionSnapshot>> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor.list_stages(&client, context, run_id).await
+        })
+    }
+
+    fn list_artifacts<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        run_id: RunId,
+    ) -> StoreFuture<'a, Vec<ArtifactRefSnapshot>> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor.list_artifacts(&client, context, run_id).await
+        })
+    }
+
+    fn list_waits<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        run_id: RunId,
+    ) -> StoreFuture<'a, Vec<WaitSnapshot>> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor.list_waits(&client, context, run_id).await
+        })
+    }
+
     fn list_events<'a>(
         &'a self,
         context: &'a QueryContext,
@@ -100,6 +150,19 @@ impl DurableStore for PostgresStore {
         Box::pin(async move {
             let client = self.connection().await?;
             self.executor.scan_due_work(&client, context, query).await
+        })
+    }
+
+    fn scan_maintenance<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        query: MaintenanceQuery,
+    ) -> StoreFuture<'a, MaintenancePage> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor
+                .scan_maintenance(&client, context, query)
+                .await
         })
     }
 
@@ -138,6 +201,19 @@ impl DurableStore for PostgresStore {
             let mut client = self.connection().await?;
             self.executor
                 .apply_due_work(&mut client, context, command)
+                .await
+        })
+    }
+
+    fn apply_maintenance<'a>(
+        &'a self,
+        context: &'a CommandContext,
+        command: ApplyMaintenance,
+    ) -> StoreFuture<'a, Option<MaintenanceOutcome>> {
+        Box::pin(async move {
+            let mut client = self.connection().await?;
+            self.executor
+                .apply_maintenance(&mut client, context, command)
                 .await
         })
     }

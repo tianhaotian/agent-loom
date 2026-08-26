@@ -1,9 +1,45 @@
 use crate::{
     AgentEventReceiptId, AgentExecutionId, AgentExecutionStatus, AgentVersionId, ArtifactId,
     CheckpointId, Digest, EndpointId, EventId, JsonPayload, LogicalKey, RunId, RunStatus,
-    StageExecutionId, TaskId, TaskStatus, TenantId, ToolExecutionId, ToolExecutionStatus,
-    UnixMicros, WaitId, WaitStatus, WorkflowVersionId,
+    StageExecutionId, StageStatus, TaskId, TaskStatus, TenantId, ToolExecutionId,
+    ToolExecutionStatus, UnixMicros, WaitId, WaitStatus, WorkflowId, WorkflowVersionId,
 };
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowSnapshot {
+    pub tenant_id: TenantId,
+    pub workflow_id: WorkflowId,
+    pub workflow_version_id: WorkflowVersionId,
+    pub workflow_key: String,
+    pub name: String,
+    pub status: String,
+    pub version: u64,
+    pub lifecycle: String,
+    pub spec: JsonPayload,
+    pub spec_digest: Digest,
+    pub created_at: UnixMicros,
+    pub updated_at: UnixMicros,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageExecutionSnapshot {
+    pub tenant_id: TenantId,
+    pub stage_execution_id: StageExecutionId,
+    pub run_id: RunId,
+    pub stage_key: LogicalKey,
+    pub definition_stage_key: Option<LogicalKey>,
+    pub status: StageStatus,
+    pub version: u64,
+    pub attempt: u32,
+    pub assignee_kind: Option<String>,
+    pub assignee_ref: Option<String>,
+    pub input_contract: JsonPayload,
+    pub output_contract: JsonPayload,
+    pub started_at: Option<UnixMicros>,
+    pub completed_at: Option<UnixMicros>,
+    pub created_at: UnixMicros,
+    pub updated_at: UnixMicros,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunSnapshot {

@@ -6,15 +6,16 @@ use agent_loom_domain::{
 };
 use agent_loom_durable_store::{
     AgentEventBatchOutcome, AgentEventExecutionOutcome, AgentSubmissionOutcome,
-    AgentWorkflowAction, AppendAgentEvents, ApplyDueWork, ApplyEvent, BeginAgentResubmission,
-    BeginToolRetryAttempt, ClaimTask, ClaimedTask, CommandContext, CommandDisposition, Committed,
-    CompleteTask, CompletionShapeError, ControlRun, CreateRun, DueWorkOutcome, DueWorkTarget,
-    DurableFollowUp, ExecutionRetryClass, ExpectedRun, FailTask, InitialTask, LeaseExpiryAction,
-    LeaseProof, LeaseReclaimOutcome, NewArtifactRef, NewTask, NewWaitSubscription, NextActions,
-    NormalizedAgentEventInput, PostCommitHint, PrepareAgentExecution, PrepareToolExecution,
-    ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission, RecordToolOutcome,
-    RenewTaskLease, SignatureVerification, StoreError, StoreErrorCode, StoreResult,
-    ToolRecordedOutcome,
+    AgentWorkflowAction, AppendAgentEvents, ApplyDueWork, ApplyEvent, ApplyMaintenance,
+    BeginAgentResubmission, BeginToolRetryAttempt, ClaimTask, ClaimedTask, CommandContext,
+    CommandDisposition, Committed, CompleteTask, CompletionShapeError, ControlRun, CreateRun,
+    DueWorkOutcome, DueWorkTarget, DurableFollowUp, ExecutionRetryClass, ExpectedRun, FailTask,
+    InitialStage, InitialTask, LeaseExpiryAction, LeaseProof, LeaseReclaimOutcome,
+    MaintenanceOutcome, MaintenanceTarget, NewArtifactRef, NewTask, NewWaitSubscription,
+    NextActions, NormalizedAgentEventInput, PostCommitHint, PrepareAgentExecution,
+    PrepareToolExecution, ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission,
+    RecordToolOutcome, RenewTaskLease, SignatureVerification, StoreError, StoreErrorCode,
+    StoreResult, ToolRecordedOutcome,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -198,6 +199,10 @@ impl PostgresTransactionExecutor {
             .await
             .map_err(map_database_error)?;
 
+        for stage in &command.initial_stages {
+            insert_initial_stage(&transaction, tenant_id, run_id, db_now, stage).await?;
+        }
+
         for task in &command.initial_tasks {
             insert_initial_task(
                 &transaction,
@@ -346,6 +351,21 @@ impl PostgresTransactionExecutor {
             )
             .await
             .map_err(map_database_error)?;
+
+        if let Some(stage_id) = stage_execution_id {
+            transaction
+                .execute(
+                    "UPDATE agent_loom.stage_executions SET status = 'active', \
+                        version = version + 1, \
+                        started_at = to_timestamp(($4::bigint)::double precision / 1000000.0), \
+                        updated_at = to_timestamp(($4::bigint)::double precision / 1000000.0) \
+                     WHERE tenant_id = $1 AND run_id = $2 AND stage_execution_id = $3 \
+                       AND status = 'planned'",
+                    &[&tenant_id, &run_id, &stage_id, &db_now],
+                )
+                .await
+                .map_err(map_database_error)?;
+        }
 
         let attempt_id = deterministic_attempt_id(task_id, attempt, lease_token);
         let lease_digest: [u8; 32] = Sha256::digest(lease_token).into();
@@ -950,7 +970,7 @@ impl PostgresTransactionExecutor {
             .execute(
                 "UPDATE agent_loom.runs SET status = $5, suspended_from_status = NULL, \
                     version = $6, next_event_sequence = $7, \
-                    terminal_event_id = CASE WHEN $8 THEN $9 ELSE NULL END, \
+                    terminal_event_id = CASE WHEN $8 THEN $9::uuid ELSE NULL::uuid END, \
                     terminal_at = CASE WHEN $8 THEN \
                         to_timestamp(($10::bigint)::double precision / 1000000.0) ELSE NULL END, \
                     updated_at = to_timestamp(($10::bigint)::double precision / 1000000.0) \
@@ -1163,9 +1183,9 @@ impl PostgresTransactionExecutor {
             .ok_or_else(|| inconsistent("run event sequence overflow"))?;
         let updated = transaction
             .execute(
-                "UPDATE agent_loom.runs SET status = $5, \
-                    suspended_from_status = CASE WHEN $5 = 'paused' \
-                        THEN suspended_from_status ELSE NULL END, \
+                "UPDATE agent_loom.runs SET status = $5::varchar, \
+                    suspended_from_status = CASE WHEN $5::varchar = 'paused' \
+                        THEN suspended_from_status ELSE NULL::varchar END, \
                     version = $6, next_event_sequence = $7, \
                     updated_at = to_timestamp(($8::bigint)::double precision / 1000000.0) \
                  WHERE tenant_id = $1 AND run_id = $2 AND version = $3 \
@@ -3017,6 +3037,254 @@ impl PostgresTransactionExecutor {
         ))
     }
 
+    /// Applies one deadline, Wait timeout, or stale-execution candidate after
+    /// locking and revalidating its Run and target revisions.
+    ///
+    /// Returns `None` when a scan hint became stale before it was locked. This
+    /// is a successful no-op; a later scan observes the authoritative state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for tenant mismatch, invalid timestamps,
+    /// inconsistent persisted state, or a PostgreSQL failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn apply_maintenance(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: ApplyMaintenance,
+    ) -> StoreResult<Option<MaintenanceOutcome>> {
+        if command.candidate.tenant_id != context.tenant_id {
+            return Err(invalid_command(
+                "maintenance candidate belongs to another tenant",
+            ));
+        }
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        if command.candidate.due_at.get() > db_now {
+            return Err(store_error(
+                StoreErrorCode::InvalidTransition,
+                "maintenance candidate is not due",
+            ));
+        }
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_id = uuid(command.candidate.run_id.into_bytes());
+        let run = lock_event_run(&transaction, tenant_id, run_id).await?;
+        if i64::try_from(command.candidate.run_version).ok() != Some(run.version)
+            || i64::try_from(command.candidate.execution_generation).ok()
+                != Some(run.execution_generation)
+            || matches!(
+                run.status.as_str(),
+                "completed" | "failed" | "cancelled" | "timed_out"
+            )
+        {
+            transaction.commit().await.map_err(map_database_error)?;
+            return Ok(None);
+        }
+
+        let (event_type, projected_status, terminal) = match command.candidate.target {
+            MaintenanceTarget::Run(target_run_id) => {
+                if target_run_id != command.candidate.run_id
+                    || run.deadline != Some(command.candidate.due_at.get())
+                    || run.deadline.is_none_or(|deadline| deadline > db_now)
+                {
+                    transaction.commit().await.map_err(map_database_error)?;
+                    return Ok(None);
+                }
+                ("run.timed_out", "timed_out", true)
+            }
+            MaintenanceTarget::Wait(wait_id) => {
+                let wait_id = uuid(wait_id.into_bytes());
+                let row = transaction
+                    .query_opt(
+                        "SELECT run_id, status, CASE WHEN expires_at IS NULL THEN NULL \
+                             ELSE (extract(epoch FROM expires_at) * 1000000)::bigint END \
+                         FROM agent_loom.wait_subscriptions \
+                         WHERE tenant_id = $1 AND wait_id = $2 FOR UPDATE",
+                        &[&tenant_id, &wait_id],
+                    )
+                    .await
+                    .map_err(map_database_error)?;
+                let Some(row) = row else {
+                    transaction.commit().await.map_err(map_database_error)?;
+                    return Ok(None);
+                };
+                if row.get::<_, Uuid>(0) != run_id
+                    || row.get::<_, &str>(1) != "open"
+                    || row.get::<_, Option<i64>>(2) != Some(command.candidate.due_at.get())
+                {
+                    transaction.commit().await.map_err(map_database_error)?;
+                    return Ok(None);
+                }
+                transaction
+                    .execute(
+                        "UPDATE agent_loom.wait_subscriptions SET status = 'expired', \
+                            active_slot = NULL, updated_at = \
+                                to_timestamp(($3::bigint)::double precision / 1000000.0) \
+                         WHERE tenant_id = $1 AND wait_id = $2 AND status = 'open'",
+                        &[&tenant_id, &wait_id, &db_now],
+                    )
+                    .await
+                    .map_err(map_database_error)?;
+                ("wait.expired", "timed_out", true)
+            }
+            MaintenanceTarget::Tool(execution_id) => {
+                let execution_id = uuid(execution_id.into_bytes());
+                let expected = to_i64(
+                    command.candidate.expected_revision,
+                    "maintenance Tool revision",
+                )?;
+                let updated = transaction
+                    .execute(
+                        "UPDATE agent_loom.tool_executions SET status = 'retry_scheduled', \
+                            recovery_action = 'query_outcome', retry_at = \
+                                to_timestamp(($6::bigint)::double precision / 1000000.0), \
+                            updated_at = to_timestamp(($6::bigint)::double precision / 1000000.0) \
+                         WHERE tenant_id = $1 AND tool_execution_id = $2 AND run_id = $3 \
+                           AND attempt_count = $4 AND status IN ('executing', 'outcome_unknown') \
+                           AND updated_at <= to_timestamp(($5::bigint)::double precision / 1000000.0)",
+                        &[
+                            &tenant_id,
+                            &execution_id,
+                            &run_id,
+                            &expected,
+                            &command.candidate.due_at.get(),
+                            &db_now,
+                        ],
+                    )
+                    .await
+                    .map_err(map_database_error)?;
+                if updated != 1 {
+                    transaction.commit().await.map_err(map_database_error)?;
+                    return Ok(None);
+                }
+                (
+                    "tool.execution_stale",
+                    if run.status == "paused" {
+                        "paused"
+                    } else {
+                        "retrying"
+                    },
+                    false,
+                )
+            }
+            MaintenanceTarget::Agent(execution_id) => {
+                let execution_id = uuid(execution_id.into_bytes());
+                let expected = to_i64(
+                    command.candidate.expected_revision,
+                    "maintenance Agent revision",
+                )?;
+                let updated = transaction
+                    .execute(
+                        "UPDATE agent_loom.agent_executions SET status = 'reconciling', \
+                            retry_at = to_timestamp(($6::bigint)::double precision / 1000000.0), \
+                            version = version + 1, \
+                            updated_at = to_timestamp(($6::bigint)::double precision / 1000000.0) \
+                         WHERE tenant_id = $1 AND agent_execution_id = $2 AND run_id = $3 \
+                           AND version = $4 \
+                           AND status IN ('submitting', 'running', 'stopping', 'outcome_unknown') \
+                           AND updated_at <= to_timestamp(($5::bigint)::double precision / 1000000.0)",
+                        &[
+                            &tenant_id,
+                            &execution_id,
+                            &run_id,
+                            &expected,
+                            &command.candidate.due_at.get(),
+                            &db_now,
+                        ],
+                    )
+                    .await
+                    .map_err(map_database_error)?;
+                if updated != 1 {
+                    transaction.commit().await.map_err(map_database_error)?;
+                    return Ok(None);
+                }
+                (
+                    "agent.execution_stale",
+                    if run.status == "paused" {
+                        "paused"
+                    } else {
+                        "retrying"
+                    },
+                    false,
+                )
+            }
+        };
+
+        let event_id = uuid(command.event_id.into_bytes());
+        let payload = json!({
+            "maintenance_kind": event_type,
+            "target_id": uuid(command.candidate.target_id_bytes()),
+            "due_at_micros": command.candidate.due_at.get(),
+            "expected_revision": command.candidate.expected_revision,
+        });
+        insert_event(
+            &transaction,
+            EventInsert {
+                event_id,
+                tenant_id,
+                run_id,
+                sequence: run.next_event_sequence,
+                event_type,
+                payload: &payload,
+                payload_schema_version: 1,
+                producer: "maintenance",
+                context,
+                correlation_id: uuid(context.correlation_id.into_bytes()),
+                occurred_at: None,
+                recorded_at: db_now,
+            },
+        )
+        .await?;
+        if terminal {
+            finalize_timed_out_run(&transaction, tenant_id, run_id, db_now).await?;
+        }
+        let next_sequence = run
+            .next_event_sequence
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("run event sequence overflow"))?;
+        let updated = transaction
+            .execute(
+                "UPDATE agent_loom.runs SET status = $5, suspended_from_status = NULL, \
+                    version = version + 1, next_event_sequence = $6, \
+                    terminal_event_id = CASE WHEN $7 THEN $8::uuid ELSE terminal_event_id END, \
+                    terminal_at = CASE WHEN $7 THEN \
+                        to_timestamp(($9::bigint)::double precision / 1000000.0) \
+                        ELSE terminal_at END, \
+                    updated_at = to_timestamp(($9::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND run_id = $2 AND version = $3 \
+                   AND execution_generation = $4",
+                &[
+                    &tenant_id,
+                    &run_id,
+                    &run.version,
+                    &run.execution_generation,
+                    &projected_status,
+                    &next_sequence,
+                    &terminal,
+                    &event_id,
+                    &db_now,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if updated != 1 {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "Run changed while applying maintenance",
+            ));
+        }
+        let outcome = MaintenanceOutcome {
+            tenant_id: context.tenant_id,
+            run_id: command.candidate.run_id,
+            target: command.candidate.target,
+            run_status: parse_run_status(projected_status)?,
+            applied_at: UnixMicros::new(db_now),
+        };
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(Some(outcome))
+    }
+
     /// Atomically validates the lease and Run fence, appends the completion
     /// Event and Checkpoint, finalizes the Task, applies stage/artifact writes,
     /// schedules the next action, and advances the Run projection.
@@ -3130,6 +3398,12 @@ impl PostgresTransactionExecutor {
             command.stage_mutation,
         )
         .await?;
+        for mutation in command.additional_stage_mutations.iter().copied() {
+            apply_stage_mutation(&transaction, tenant_id, run_id, db_now, Some(mutation)).await?;
+        }
+        for stage in &command.new_stages {
+            insert_initial_stage(&transaction, tenant_id, run_id, db_now, stage).await?;
+        }
         insert_artifact_refs(
             &transaction,
             tenant_id,
@@ -3159,7 +3433,7 @@ impl PostgresTransactionExecutor {
                 "UPDATE agent_loom.runs SET status = $5, suspended_from_status = NULL, \
                     version = version + 1, next_event_sequence = $6, \
                     current_checkpoint_id = $7, state_summary_json = $8, \
-                    terminal_event_id = CASE WHEN $9 THEN $10 ELSE NULL END, \
+                    terminal_event_id = CASE WHEN $9 THEN $10::uuid ELSE NULL::uuid END, \
                     terminal_at = CASE WHEN $9 THEN \
                         to_timestamp(($11::bigint)::double precision / 1000000.0) ELSE NULL END, \
                     updated_at = to_timestamp(($11::bigint)::double precision / 1000000.0) \
@@ -5592,7 +5866,7 @@ async fn execute_control(
             "UPDATE agent_loom.runs SET status = $5, suspended_from_status = $6, \
                 version = $7, execution_generation = $8, next_event_sequence = $9, \
                 resume_blocked_reason = $10, \
-                terminal_event_id = CASE WHEN $11 THEN $12 ELSE terminal_event_id END, \
+                terminal_event_id = CASE WHEN $11 THEN $12::uuid ELSE terminal_event_id END, \
                 terminal_at = CASE WHEN $11 THEN \
                     to_timestamp(($13::bigint)::double precision / 1000000.0) \
                     ELSE terminal_at END, \
@@ -6133,6 +6407,58 @@ async fn database_now(transaction: &Transaction<'_>) -> StoreResult<i64> {
         .map_err(map_database_error)
 }
 
+async fn finalize_timed_out_run(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    db_now: i64,
+) -> StoreResult<()> {
+    transaction
+        .execute(
+            "UPDATE agent_loom.task_attempts SET finished_at = \
+                 to_timestamp(($3::bigint)::double precision / 1000000.0), \
+                 outcome = 'cancelled', error_code = 'run_timed_out' \
+             WHERE tenant_id = $1 AND run_id = $2 AND finished_at IS NULL",
+            &[&tenant_id, &run_id, &db_now],
+        )
+        .await
+        .map_err(map_database_error)?;
+    transaction
+        .execute(
+            "UPDATE agent_loom.tasks SET status = 'cancelled', lease_owner = NULL, \
+                 lease_token = NULL, lease_expires_at = NULL, error_code = 'run_timed_out', \
+                 completed_at = to_timestamp(($3::bigint)::double precision / 1000000.0), \
+                 updated_at = to_timestamp(($3::bigint)::double precision / 1000000.0) \
+             WHERE tenant_id = $1 AND run_id = $2 \
+               AND status IN ('scheduled', 'queued', 'leased', 'retry_scheduled')",
+            &[&tenant_id, &run_id, &db_now],
+        )
+        .await
+        .map_err(map_database_error)?;
+    transaction
+        .execute(
+            "UPDATE agent_loom.stage_executions SET status = 'cancelled', \
+                 completed_at = to_timestamp(($3::bigint)::double precision / 1000000.0), \
+                 updated_at = to_timestamp(($3::bigint)::double precision / 1000000.0), \
+                 version = version + 1 \
+             WHERE tenant_id = $1 AND run_id = $2 \
+               AND status IN ('planned', 'active', 'waiting_approval', 'rework_required')",
+            &[&tenant_id, &run_id, &db_now],
+        )
+        .await
+        .map_err(map_database_error)?;
+    transaction
+        .execute(
+            "UPDATE agent_loom.wait_subscriptions SET status = 'cancelled', active_slot = NULL, \
+                 updated_at = to_timestamp(($3::bigint)::double precision / 1000000.0) \
+             WHERE tenant_id = $1 AND run_id = $2 AND status = 'open'",
+            &[&tenant_id, &run_id, &db_now],
+        )
+        .await
+        .map_err(map_database_error)?;
+    Ok(())
+}
+
 struct EventInsert<'a> {
     event_id: Uuid,
     tenant_id: Uuid,
@@ -6225,6 +6551,54 @@ async fn insert_initial_task(
                 &max_attempts,
                 &input,
                 &event_id,
+                &db_now,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    Ok(())
+}
+
+async fn insert_initial_stage(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    db_now: i64,
+    stage: &InitialStage,
+) -> StoreResult<()> {
+    let stage_id = uuid(stage.stage_execution_id.into_bytes());
+    let status = stage_status(stage.status);
+    let attempt = i64::from(stage.attempt);
+    let input_contract = json_value(&stage.input_contract)?;
+    let output_contract = json_value(&stage.output_contract)?;
+    let policy = json_value(&stage.policy)?;
+    let started_at = (stage.status == StageStatus::Active).then_some(db_now);
+    transaction
+        .execute(
+            "INSERT INTO agent_loom.stage_executions (\
+                stage_execution_id, tenant_id, run_id, stage_key, definition_stage_key, \
+                parent_stage_execution_id, generated_by_event_id, status, version, attempt, \
+                assignee_kind, assignee_ref, agent_version_id, input_contract_json, \
+                output_contract_json, policy_json, started_at, completed_at, created_at, updated_at\
+             ) VALUES ($1, $2, $3, $4, $5, NULL, NULL, $6, 0, $7, $8, $9, NULL, \
+                $10, $11, $12, \
+                to_timestamp(($13::bigint)::double precision / 1000000.0), NULL, \
+                to_timestamp(($14::bigint)::double precision / 1000000.0), \
+                to_timestamp(($14::bigint)::double precision / 1000000.0))",
+            &[
+                &stage_id,
+                &tenant_id,
+                &run_id,
+                &stage.stage_key.as_str(),
+                &stage.definition_stage_key.as_str(),
+                &status,
+                &attempt,
+                &stage.assignee_kind,
+                &stage.assignee_ref,
+                &input_contract,
+                &output_contract,
+                &policy,
+                &started_at,
                 &db_now,
             ],
         )
@@ -6530,7 +6904,7 @@ async fn apply_stage_mutation(
              WHERE tenant_id = $1 AND run_id = $2 AND stage_execution_id = $3 \
                AND version = $7 \
                AND (\
-                    (status = 'planned' AND $5 IN ('active', 'cancelled')) \
+                    (status = 'planned' AND $5 IN ('active', 'waiting_approval', 'cancelled')) \
                  OR (status = 'active' AND $5 IN (\
                         'waiting_approval', 'rework_required', 'succeeded', 'failed', \
                         'skipped', 'cancelled')) \
@@ -6837,9 +7211,32 @@ fn validate_create_run(command: &CreateRun) -> StoreResult<()> {
             .initial_tasks
             .iter()
             .any(|task| task.max_attempts == 0)
+        || command.initial_stages.iter().any(|stage| {
+            stage.attempt == 0
+                || !matches!(stage.status, StageStatus::Planned | StageStatus::Active)
+                || (stage.assignee_kind.is_some() != stage.assignee_ref.is_some())
+        })
+        || command
+            .initial_stages
+            .iter()
+            .enumerate()
+            .any(|(index, stage)| {
+                command.initial_stages[index + 1..].iter().any(|other| {
+                    other.stage_execution_id == stage.stage_execution_id
+                        || (other.stage_key == stage.stage_key && other.attempt == stage.attempt)
+                })
+            })
+        || command.initial_tasks.iter().any(|task| {
+            task.stage_execution_id.is_some_and(|stage_id| {
+                !command
+                    .initial_stages
+                    .iter()
+                    .any(|stage| stage.stage_execution_id == stage_id)
+            })
+        })
     {
         return Err(invalid_command(
-            "create_run initial event/checkpoint/task shape is invalid",
+            "create_run initial event/checkpoint/stage/task shape is invalid",
         ));
     }
     Ok(())
@@ -8239,6 +8636,7 @@ mod tests {
                 state_digest: Digest::from_bytes([5; 32]),
                 created_event_id: initial_event_id,
             },
+            initial_stages: Vec::new(),
             initial_tasks: vec![InitialTask {
                 task_id,
                 stage_execution_id: None,
@@ -8318,6 +8716,8 @@ mod tests {
                         output: payload(&json!({"ok": true})),
                     },
                     stage_mutation: None,
+                    additional_stage_mutations: Vec::new(),
+                    new_stages: Vec::new(),
                     artifacts: Vec::new(),
                     next: NextActions::FinishRun(FinalRunResult {
                         status: RunStatus::Completed,
@@ -8363,7 +8763,13 @@ mod tests {
         executor
             .create_run(
                 &mut client,
-                &command_context(tenant_id, ids(54), "create_run", &tenant_key, 54),
+                &command_context(
+                    tenant_id,
+                    ids(54),
+                    "create_run",
+                    &format!("{tenant_key}-recovery"),
+                    54,
+                ),
                 smoke_run(
                     recovery_run_id,
                     recovery_task_id,
@@ -8438,7 +8844,7 @@ mod tests {
             },
             failure_event_id: EventId::from_bytes(ids(59)),
             error_code: "transient_worker_error".to_owned(),
-            retry_at: Some(UnixMicros::new(now_micros)),
+            retry_at: Some(UnixMicros::new(now_micros + 60_000_000)),
         };
         let retrying = executor
             .fail_task(&mut client, &fail_context, retry_failure.clone())
@@ -8615,6 +9021,8 @@ mod tests {
                         output: payload(&json!({"proposal": "ready"})),
                     },
                     stage_mutation: None,
+                    additional_stage_mutations: Vec::new(),
+                    new_stages: Vec::new(),
                     artifacts: Vec::new(),
                     next: NextActions::Wait(NewWaitSubscription {
                         wait_id: agent_loom_domain::WaitId::from_bytes(ids(80)),
@@ -8809,6 +9217,7 @@ mod tests {
                         state_digest: Digest::from_bytes([15; 32]),
                         created_event_id: control_initial_event,
                     },
+                    initial_stages: Vec::new(),
                     initial_tasks: vec![InitialTask {
                         task_id: control_task_id,
                         stage_execution_id: None,
@@ -8989,6 +9398,8 @@ mod tests {
                     output: payload(&json!({"ok": true})),
                 },
                 stage_mutation: None,
+                additional_stage_mutations: Vec::new(),
+                new_stages: Vec::new(),
                 artifacts: Vec::new(),
                 next: NextActions::FinishRun(FinalRunResult {
                     status: RunStatus::Completed,
@@ -9093,6 +9504,7 @@ mod tests {
                 state_digest: Digest::from_bytes([28; 32]),
                 created_event_id: event_id,
             },
+            initial_stages: Vec::new(),
             initial_tasks: vec![InitialTask {
                 task_id,
                 stage_execution_id: None,
@@ -9119,8 +9531,11 @@ mod tests {
             correlation_id: CorrelationId::from_bytes(command_bytes),
             actor_ref: "postgres-smoke-test".to_owned(),
             scope: ScopeKey::parse(scope).expect("scope"),
-            idempotency_key: IdempotencyKey::parse(format!("{scope}-{key_suffix}"))
-                .expect("idempotency key"),
+            idempotency_key: IdempotencyKey::parse(format!(
+                "{scope}-{key_suffix}-{}",
+                Uuid::from_bytes(command_bytes).simple()
+            ))
+            .expect("idempotency key"),
             request_hash: Digest::from_bytes([digest; 32]),
         }
     }

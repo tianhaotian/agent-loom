@@ -3,6 +3,7 @@ members = [
     "crates/adapter-core",
     "crates/domain",
     "crates/durable-store",
+    "crates/server",
     "crates/provider-conformance",
     "crates/runtime",
     "crates/store-mysql",

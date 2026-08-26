@@ -73,6 +73,7 @@ jobs:
       - name: Run PostgreSQL migration and transaction tests
         run: >-
           cargo test
+          -p agent-loom-server
           -p agent-loom-store-postgres
           -p agent-loom-provider-conformance
           --all-targets -- --test-threads=1
