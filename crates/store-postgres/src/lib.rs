@@ -1,10 +1,12 @@
 //! PostgreSQL provider bootstrap, migrations, and transactional execution paths.
 
 mod migration_executor;
+mod pool_store;
 mod query_executor;
 mod transaction_executor;
 
 pub use migration_executor::*;
+pub use pool_store::*;
 pub use transaction_executor::*;
 
 use agent_loom_durable_store::{EmbeddedMigration, StoreCapabilities};

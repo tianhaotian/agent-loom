@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 agent-loom-domain = { path = "../domain" }
 agent-loom-durable-store = { path = "../durable-store" }
+deadpool-postgres = "0.14.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

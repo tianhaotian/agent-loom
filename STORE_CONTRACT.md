@@ -28,6 +28,7 @@ crates/
 - Provider 返回领域错误，不向 Runtime 泄漏 SQLSTATE、错误号或方言 SQL。
 - Runtime 不获得裸连接、事务句柄或任意 SQL 执行能力。
 - Adapter 不直接调用 Provider CRUD；所有状态推进经 DurableStore 领域方法完成。
+- 生产 Provider 必须由连接池实现 `DurableStore` 对象；一次方法调用只在内部借用一个连接，提交或查询完成后立即归还。连接获取失败统一映射为可重试的领域错误。
 
 ## 3. 公共基础类型
 
