@@ -274,6 +274,11 @@ pub trait DurableStore: Send + Sync {
         cmd: PrepareToolExecution,
     ) -> StoreFuture<'a, Committed<ToolExecutionSnapshot>>;
 
+    fn begin_tool_retry_attempt<'a>(
+        &'a self,
+        cmd: BeginToolRetryAttempt,
+    ) -> StoreFuture<'a, Committed<ToolExecutionSnapshot>>;
+
     fn record_tool_outcome<'a>(
         &'a self,
         cmd: RecordToolOutcome,
@@ -282,6 +287,11 @@ pub trait DurableStore: Send + Sync {
     fn prepare_agent_execution<'a>(
         &'a self,
         cmd: PrepareAgentExecution,
+    ) -> StoreFuture<'a, Committed<AgentExecutionSnapshot>>;
+
+    fn begin_agent_resubmission<'a>(
+        &'a self,
+        cmd: BeginAgentResubmission,
     ) -> StoreFuture<'a, Committed<AgentExecutionSnapshot>>;
 
     fn record_agent_submission<'a>(
@@ -463,6 +473,8 @@ Tool/Agent retry 候选使用数据库 `retry_at <= db_now` 判断，并按 `(du
 | `resume_run` | Receipt、未知结果检查、Checkpoint 兼容性、恢复 Task、Run/Event | 恢复/对账 Task | WakeWorkers、SSE |
 | `cancel_run` | Receipt、唯一终态、Wait 关闭、Task 控制门、Event | Agent/Tool stop 或补偿 Task | WakeScheduler、SSE |
 | `prepare_*_execution` | Receipt、Execution 意图、状态、Task 关联 Event | 执行 Task 自身 | 无或 SSE |
+| `begin_tool_retry_attempt` | Receipt、恢复 Task Lease/Run fence/来源 Event 校验、Execution revision、attempt 递增、未完成 attempt、Event | Tool 外部调用 | 无或 SSE |
+| `begin_agent_resubmission` | Receipt、恢复 Task Lease/Run fence/来源 Event 校验、Execution version、submitting 状态、Event | Agent 外部提交 | 无或 SSE |
 | `record_*_outcome` | Receipt、Execution 结果、Event、Checkpoint/Task/Run 推进 | 对账/补偿/后续 Task | WakeWorkers、SSE |
 | `apply_due_work` | 当前时间与状态复核、Event、状态推进、后续 Task | 重试/对账/停止 | WakeWorkers/Scheduler、SSE |
 
@@ -485,6 +497,8 @@ Worker 在外部调用后、本地记录前崩溃时，Scheduler 根据 stale ex
 
 `SameRequestBackoff` 结果必须携带 `retry_at`，并与 ToolExecution 的 `retry_scheduled` 状态同事务持久化；其他结果不得残留 retry time。
 
+到期重试由 `apply_due_work` 创建的 `reconcile` Task 承载。Worker 领取后必须先调用 `begin_tool_retry_attempt`；Provider 必须验证有效 Lease、Run version/generation、Execution revision，并确认 Task 的 `created_event_id` 指向同一 ToolExecution 的 `tool.retry_due` Event。获胜事务将 Execution 从 `reconciling` 置为 `executing`、递增 attempt、插入新的未完成 ToolExecutionAttempt、追加 `tool.retry_attempt_started` 并保存 Receipt。只有该事务提交后才能调用 Tool Adapter。
+
 ### 8.2 Agent Server
 
 ```text
@@ -497,6 +511,8 @@ prepare_agent_execution（提交 submitting 意图）
 `submitting` 长时间未保存 remote reference 时必须进入 reconcile，而不是重新 submit。Pause/Cancel 事务把 Execution 标记为 stop requested 并创建稳定 logical key 的 stop Task；PostCommitHint 只唤醒 Worker。
 
 Agent 提交拒绝使用与 Tool 相同的 `ExecutionRetryClass`。`SameRequestBackoff` 必须携带 `retry_at` 并投影为 `reconciling`；其他分类不得携带 retry time。`record_agent_submission` 即使发现 Run version/generation 已变化，也必须保存外部提交证据，但不得借此推进已被 fencing 的业务状态。
+
+Agent 到期重提同样只能由匹配 `agent.retry_due` Event 创建且已被当前 Worker 领取的 `reconcile` Task 发起。`begin_agent_resubmission` 必须在一个事务内验证 Lease、Run fence、Execution version、`reconciling` 状态、已消费的 retry time 和尚无 `remote_run_ref`，再将 Execution 置为 `submitting`、递增 version、追加 `agent.resubmission_started` 并保存 Receipt。重提沿用原 Endpoint、session reference 和 idempotency key；事务提交后才调用 Agent Server，随后仍由 `record_agent_submission` 保存远端证据。
 
 ### 8.3 远程事件批次
 

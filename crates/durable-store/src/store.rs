@@ -3,10 +3,11 @@ use std::{future::Future, pin::Pin};
 use agent_loom_domain::{AgentExecutionSnapshot, RunId, RunSnapshot, ToolExecutionSnapshot};
 
 use crate::{
-    AgentEventBatchOutcome, AppendAgentEvents, ApplyDueWork, ApplyEvent, ClaimTask, ClaimedTask,
-    Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery,
-    EventCursor, EventPage, FailTask, PrepareAgentExecution, PrepareToolExecution, QueryContext,
-    RecordAgentOutcome, RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, StoreResult,
+    AgentEventBatchOutcome, AppendAgentEvents, ApplyDueWork, ApplyEvent, BeginAgentResubmission,
+    BeginToolRetryAttempt, ClaimTask, ClaimedTask, Committed, CompleteTask, ControlRun, CreateRun,
+    DueWorkOutcome, DueWorkPage, DueWorkQuery, EventCursor, EventPage, FailTask,
+    PrepareAgentExecution, PrepareToolExecution, QueryContext, RecordAgentOutcome,
+    RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, StoreResult,
 };
 
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = StoreResult<T>> + Send + 'a>>;
@@ -106,6 +107,12 @@ pub trait DurableStore: Send + Sync {
         command: RecordToolOutcome,
     ) -> StoreFuture<'a, Committed<ToolExecutionSnapshot>>;
 
+    fn begin_tool_retry_attempt<'a>(
+        &'a self,
+        context: &'a crate::CommandContext,
+        command: BeginToolRetryAttempt,
+    ) -> StoreFuture<'a, Committed<ToolExecutionSnapshot>>;
+
     fn prepare_agent_execution<'a>(
         &'a self,
         context: &'a crate::CommandContext,
@@ -116,6 +123,12 @@ pub trait DurableStore: Send + Sync {
         &'a self,
         context: &'a crate::CommandContext,
         command: RecordAgentSubmission,
+    ) -> StoreFuture<'a, Committed<AgentExecutionSnapshot>>;
+
+    fn begin_agent_resubmission<'a>(
+        &'a self,
+        context: &'a crate::CommandContext,
+        command: BeginAgentResubmission,
     ) -> StoreFuture<'a, Committed<AgentExecutionSnapshot>>;
 
     fn append_agent_events<'a>(

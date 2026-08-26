@@ -22,6 +22,24 @@ pub struct PrepareToolExecution {
     pub prepared_event_id: EventId,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BeginToolRetryAttempt {
+    pub expected_run: ExpectedRun,
+    pub lease: LeaseProof,
+    pub tool_execution_id: ToolExecutionId,
+    pub expected_attempt: u32,
+    pub tool_attempt_id: ToolAttemptId,
+    pub started_event_id: EventId,
+}
+
+impl BeginToolRetryAttempt {
+    pub fn shape_is_valid(&self) -> bool {
+        self.expected_attempt > 0
+            && self.expected_run.version.is_some()
+            && self.expected_run.execution_generation == Some(self.lease.execution_generation)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionRetryClass {
     Never,
@@ -97,6 +115,23 @@ pub struct PrepareAgentExecution {
     pub request_hash: Digest,
     pub capabilities_snapshot: JsonPayload,
     pub prepared_event_id: EventId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BeginAgentResubmission {
+    pub expected_run: ExpectedRun,
+    pub lease: LeaseProof,
+    pub agent_execution_id: AgentExecutionId,
+    pub expected_version: u64,
+    pub started_event_id: EventId,
+}
+
+impl BeginAgentResubmission {
+    pub fn shape_is_valid(&self) -> bool {
+        self.expected_version > 0
+            && self.expected_run.version.is_some()
+            && self.expected_run.execution_generation == Some(self.lease.execution_generation)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -454,6 +489,40 @@ mod tests {
             batch(vec![first, second]).validate_shape(),
             Err(AgentEventBatchShapeError::ConflictingProjection)
         );
+    }
+
+    #[test]
+    fn retry_start_commands_require_explicit_run_and_lease_fences() {
+        let expected_run = ExpectedRun {
+            run_id: agent_loom_domain::RunId::from_bytes([1; 16]),
+            version: Some(2),
+            execution_generation: Some(3),
+        };
+        let lease = LeaseProof {
+            task_id: TaskId::from_bytes([4; 16]),
+            worker_id: agent_loom_domain::WorkerId::from_bytes([5; 16]),
+            token: agent_loom_domain::LeaseToken::from_bytes([6; 32]),
+            execution_generation: 3,
+        };
+        let tool = BeginToolRetryAttempt {
+            expected_run,
+            lease: lease.clone(),
+            tool_execution_id: ToolExecutionId::from_bytes([7; 16]),
+            expected_attempt: 1,
+            tool_attempt_id: ToolAttemptId::from_bytes([8; 16]),
+            started_event_id: EventId::from_bytes([9; 16]),
+        };
+        assert!(tool.shape_is_valid());
+        let mut agent = BeginAgentResubmission {
+            expected_run,
+            lease,
+            agent_execution_id: AgentExecutionId::from_bytes([10; 16]),
+            expected_version: 2,
+            started_event_id: EventId::from_bytes([11; 16]),
+        };
+        assert!(agent.shape_is_valid());
+        agent.expected_run.execution_generation = Some(4);
+        assert!(!agent.shape_is_valid());
     }
 
     fn batch(events: Vec<NormalizedAgentEventInput>) -> AppendAgentEvents {

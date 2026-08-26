@@ -6,13 +6,14 @@ use agent_loom_domain::{
 };
 use agent_loom_durable_store::{
     AgentEventBatchOutcome, AgentEventExecutionOutcome, AgentSubmissionOutcome,
-    AgentWorkflowAction, AppendAgentEvents, ApplyDueWork, ApplyEvent, ClaimTask, ClaimedTask,
-    CommandContext, CommandDisposition, Committed, CompleteTask, CompletionShapeError, ControlRun,
-    CreateRun, DueWorkOutcome, DueWorkTarget, DurableFollowUp, ExecutionRetryClass, ExpectedRun,
-    FailTask, InitialTask, LeaseProof, NewArtifactRef, NewTask, NewWaitSubscription, NextActions,
-    NormalizedAgentEventInput, PostCommitHint, PrepareAgentExecution, PrepareToolExecution,
-    RecordAgentOutcome, RecordAgentSubmission, RecordToolOutcome, RenewTaskLease,
-    SignatureVerification, StoreError, StoreErrorCode, StoreResult, ToolRecordedOutcome,
+    AgentWorkflowAction, AppendAgentEvents, ApplyDueWork, ApplyEvent, BeginAgentResubmission,
+    BeginToolRetryAttempt, ClaimTask, ClaimedTask, CommandContext, CommandDisposition, Committed,
+    CompleteTask, CompletionShapeError, ControlRun, CreateRun, DueWorkOutcome, DueWorkTarget,
+    DurableFollowUp, ExecutionRetryClass, ExpectedRun, FailTask, InitialTask, LeaseProof,
+    NewArtifactRef, NewTask, NewWaitSubscription, NextActions, NormalizedAgentEventInput,
+    PostCommitHint, PrepareAgentExecution, PrepareToolExecution, RecordAgentOutcome,
+    RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, SignatureVerification, StoreError,
+    StoreErrorCode, StoreResult, ToolRecordedOutcome,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1212,6 +1213,201 @@ impl PostgresTransactionExecutor {
         ))
     }
 
+    /// Starts a new Tool adapter attempt from a leased retry reconciliation
+    /// Task after proving that Task was created by this Execution's due Event.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable store error for a lost Lease, stale Run/attempt,
+    /// invalid retry origin, wrong recovery state, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn begin_tool_retry_attempt(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: BeginToolRetryAttempt,
+    ) -> StoreResult<Committed<ToolExecutionSnapshot>> {
+        if !command.shape_is_valid() {
+            return Err(invalid_command("invalid Tool retry attempt command shape"));
+        }
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        match acquire_receipt(
+            &transaction,
+            context,
+            db_now,
+            self.config.receipt_ttl_micros,
+        )
+        .await?
+        {
+            ReceiptGuard::Existing(receipt) => {
+                let snapshot = decode_tool_receipt(context.tenant_id, &receipt.outcome)?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(tool_committed(
+                    CommandDisposition::Duplicate,
+                    snapshot,
+                    receipt.event_id.map(event_id),
+                    Vec::new(),
+                ));
+            }
+            ReceiptGuard::Acquired => {}
+        }
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_id = uuid(command.expected_run.run_id.into_bytes());
+        let task_id = uuid(command.lease.task_id.into_bytes());
+        let locked = lock_worker_task(&transaction, tenant_id, run_id, task_id).await?;
+        validate_worker_fences(
+            &command.expected_run,
+            &command.lease,
+            &locked,
+            db_now,
+            "Tool retry attempt start",
+        )?;
+        let execution_id = uuid(command.tool_execution_id.into_bytes());
+        validate_retry_task_origin(
+            &transaction,
+            tenant_id,
+            run_id,
+            task_id,
+            "tool.retry_due",
+            execution_id,
+        )
+        .await?;
+        let execution = lock_tool_by_id(&transaction, tenant_id, execution_id).await?;
+        let expected_attempt = i64::from(command.expected_attempt);
+        if execution.run_id != run_id || execution.stage_execution_id != locked.stage_execution_id {
+            return Err(store_error(
+                StoreErrorCode::NotFound,
+                "Tool retry Task belongs to another Execution scope",
+            ));
+        }
+        if execution.status != "reconciling"
+            || execution.recovery_action.as_deref() != Some("retry_same_request")
+            || execution.retry_at.is_some()
+            || execution.attempt_count != expected_attempt
+        {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "Tool retry state or attempt changed",
+            ));
+        }
+        let next_attempt = execution
+            .attempt_count
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("Tool attempt count overflow"))?;
+        let updated = transaction
+            .execute(
+                "UPDATE agent_loom.tool_executions SET status = 'executing', \
+                    attempt_count = $3, error_code = NULL, recovery_action = NULL, \
+                    result_json = NULL, completed_at = NULL, \
+                    updated_at = to_timestamp(($5::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND tool_execution_id = $2 \
+                   AND status = 'reconciling' AND attempt_count = $4 \
+                   AND recovery_action = 'retry_same_request' AND retry_at IS NULL",
+                &[
+                    &tenant_id,
+                    &execution_id,
+                    &next_attempt,
+                    &execution.attempt_count,
+                    &db_now,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if updated != 1 {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "Tool retry attempt was started concurrently",
+            ));
+        }
+        let attempt_id = uuid(command.tool_attempt_id.into_bytes());
+        transaction
+            .execute(
+                "INSERT INTO agent_loom.tool_execution_attempts (\
+                    tool_attempt_id, tenant_id, tool_execution_id, run_id, attempt, \
+                    request_started_at, request_finished_at, adapter_error_code, retry_class, \
+                    remote_request_id, external_ref, response_digest, outcome, metrics_json\
+                 ) VALUES ($1, $2, $3, $4, $5, \
+                    to_timestamp(($6::bigint)::double precision / 1000000.0), \
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, '{}'::jsonb)",
+                &[
+                    &attempt_id,
+                    &tenant_id,
+                    &execution_id,
+                    &run_id,
+                    &next_attempt,
+                    &db_now,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        let event_id = uuid(command.started_event_id.into_bytes());
+        let event_payload = json!({
+            "tool_execution_id": execution_id,
+            "recovery_task_id": task_id,
+            "attempt": next_attempt,
+        });
+        insert_event(
+            &transaction,
+            EventInsert {
+                event_id,
+                tenant_id,
+                run_id,
+                sequence: locked.next_event_sequence,
+                event_type: "tool.retry_attempt_started",
+                payload: &event_payload,
+                payload_schema_version: 1,
+                producer: "worker",
+                context,
+                correlation_id: uuid(context.correlation_id.into_bytes()),
+                occurred_at: None,
+                recorded_at: db_now,
+            },
+        )
+        .await?;
+        advance_run_event_cursor(
+            &transaction,
+            tenant_id,
+            run_id,
+            locked.run_version,
+            locked.execution_generation,
+            db_now,
+        )
+        .await?;
+        let snapshot = ToolExecutionSnapshot {
+            tenant_id: context.tenant_id,
+            tool_execution_id: command.tool_execution_id,
+            run_id: command.expected_run.run_id,
+            stage_execution_id: execution.stage_execution_id.map(stage_id_from_uuid),
+            task_id: task_id_from_uuid(execution.task_id),
+            tool_call_id: execution.tool_call_id,
+            tool_name: execution.tool_name,
+            status: ToolExecutionStatus::Executing,
+            attempt_count: positive_u32(next_attempt, "Tool attempt count")?,
+            external_ref: execution.external_ref,
+            recovery_action: None,
+            retry_at: None,
+            updated_at: UnixMicros::new(db_now),
+        };
+        let outcome = encode_tool_receipt(&snapshot)?;
+        finish_receipt(
+            &transaction,
+            context,
+            "applied",
+            &outcome,
+            Some(event_id),
+            Some(("tool_execution", execution_id, next_attempt)),
+        )
+        .await?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(tool_committed(
+            CommandDisposition::Applied,
+            snapshot,
+            Some(command.started_event_id),
+            Vec::new(),
+        ))
+    }
+
     /// Finalizes one Tool adapter attempt while preserving late or uncertain
     /// external evidence even when the Run generation has already been fenced.
     ///
@@ -1644,6 +1840,181 @@ impl PostgresTransactionExecutor {
             CommandDisposition::Applied,
             snapshot,
             Some(command.prepared_event_id),
+            Vec::new(),
+        ))
+    }
+
+    /// Re-enters Agent submission from a leased retry reconciliation Task
+    /// while preserving the original Endpoint idempotency identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable store error for a lost Lease, stale Run/version,
+    /// invalid retry origin, an existing remote Run, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn begin_agent_resubmission(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: BeginAgentResubmission,
+    ) -> StoreResult<Committed<AgentExecutionSnapshot>> {
+        if !command.shape_is_valid() {
+            return Err(invalid_command("invalid Agent resubmission command shape"));
+        }
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        match acquire_receipt(
+            &transaction,
+            context,
+            db_now,
+            self.config.receipt_ttl_micros,
+        )
+        .await?
+        {
+            ReceiptGuard::Existing(receipt) => {
+                let snapshot = decode_agent_receipt(context.tenant_id, &receipt.outcome)?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(agent_committed(
+                    CommandDisposition::Duplicate,
+                    snapshot,
+                    receipt.event_id.map(event_id),
+                    Vec::new(),
+                ));
+            }
+            ReceiptGuard::Acquired => {}
+        }
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_id = uuid(command.expected_run.run_id.into_bytes());
+        let task_id = uuid(command.lease.task_id.into_bytes());
+        let locked = lock_worker_task(&transaction, tenant_id, run_id, task_id).await?;
+        validate_worker_fences(
+            &command.expected_run,
+            &command.lease,
+            &locked,
+            db_now,
+            "Agent resubmission start",
+        )?;
+        let execution_id = uuid(command.agent_execution_id.into_bytes());
+        validate_retry_task_origin(
+            &transaction,
+            tenant_id,
+            run_id,
+            task_id,
+            "agent.retry_due",
+            execution_id,
+        )
+        .await?;
+        let execution = lock_agent_by_id(&transaction, tenant_id, execution_id).await?;
+        let expected_version = to_i64(command.expected_version, "Agent execution version")?;
+        if execution.run_id != run_id || execution.stage_execution_id != locked.stage_execution_id {
+            return Err(store_error(
+                StoreErrorCode::NotFound,
+                "Agent retry Task belongs to another Execution scope",
+            ));
+        }
+        if execution.status != "reconciling"
+            || execution.version != expected_version
+            || execution.retry_at.is_some()
+            || execution.remote_run_ref.is_some()
+        {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "Agent resubmission state or version changed",
+            ));
+        }
+        let next_version = execution
+            .version
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("Agent execution version overflow"))?;
+        let updated = transaction
+            .execute(
+                "UPDATE agent_loom.agent_executions SET status = 'submitting', version = $3, \
+                    error_code = NULL, result_json = NULL, completed_at = NULL, \
+                    updated_at = to_timestamp(($5::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND agent_execution_id = $2 \
+                   AND status = 'reconciling' AND version = $4 AND retry_at IS NULL \
+                   AND remote_run_ref IS NULL",
+                &[
+                    &tenant_id,
+                    &execution_id,
+                    &next_version,
+                    &execution.version,
+                    &db_now,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if updated != 1 {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "Agent resubmission was started concurrently",
+            ));
+        }
+        let event_id = uuid(command.started_event_id.into_bytes());
+        let event_payload = json!({
+            "agent_execution_id": execution_id,
+            "recovery_task_id": task_id,
+            "version": next_version,
+        });
+        insert_event(
+            &transaction,
+            EventInsert {
+                event_id,
+                tenant_id,
+                run_id,
+                sequence: locked.next_event_sequence,
+                event_type: "agent.resubmission_started",
+                payload: &event_payload,
+                payload_schema_version: 1,
+                producer: "worker",
+                context,
+                correlation_id: uuid(context.correlation_id.into_bytes()),
+                occurred_at: None,
+                recorded_at: db_now,
+            },
+        )
+        .await?;
+        advance_run_event_cursor(
+            &transaction,
+            tenant_id,
+            run_id,
+            locked.run_version,
+            locked.execution_generation,
+            db_now,
+        )
+        .await?;
+        let snapshot = AgentExecutionSnapshot {
+            tenant_id: context.tenant_id,
+            agent_execution_id: command.agent_execution_id,
+            run_id: command.expected_run.run_id,
+            stage_execution_id: execution.stage_execution_id.map(stage_id_from_uuid),
+            task_id: task_id_from_uuid(execution.task_id),
+            endpoint_id: EndpointId::from_bytes(execution.endpoint_id.into_bytes()),
+            agent_version_id: AgentVersionId::from_bytes(execution.agent_version_id.into_bytes()),
+            status: AgentExecutionStatus::Submitting,
+            version: nonnegative_u64(next_version, "Agent execution version")?,
+            remote_run_ref: None,
+            remote_session_ref: execution.remote_session_ref,
+            event_cursor: execution.event_cursor,
+            cursor_version: nonnegative_u64(execution.cursor_version, "Agent cursor version")?,
+            retry_at: None,
+            updated_at: UnixMicros::new(db_now),
+        };
+        let outcome = encode_agent_receipt(&snapshot)?;
+        finish_receipt(
+            &transaction,
+            context,
+            "applied",
+            &outcome,
+            Some(event_id),
+            Some(("agent_execution", execution_id, next_version)),
+        )
+        .await?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(agent_committed(
+            CommandDisposition::Applied,
+            snapshot,
+            Some(command.started_event_id),
             Vec::new(),
         ))
     }
@@ -2902,6 +3273,45 @@ fn validate_worker_fences(
         return Err(store_error(
             StoreErrorCode::LeaseExpired,
             "task lease expired",
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_retry_task_origin(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    task_id: Uuid,
+    expected_event_type: &str,
+    expected_execution_id: Uuid,
+) -> StoreResult<()> {
+    let row = transaction
+        .query_opt(
+            "SELECT t.kind, e.event_type, e.payload_json \
+             FROM agent_loom.tasks t \
+             JOIN agent_loom.events e ON e.tenant_id = t.tenant_id \
+               AND e.run_id = t.run_id AND e.event_id = t.created_event_id \
+             WHERE t.tenant_id = $1 AND t.run_id = $2 AND t.task_id = $3",
+            &[&tenant_id, &run_id, &task_id],
+        )
+        .await
+        .map_err(map_database_error)?
+        .ok_or_else(|| store_error(StoreErrorCode::NotFound, "retry Task origin was not found"))?;
+    let kind: &str = row.get(0);
+    let event_type: &str = row.get(1);
+    let payload: Value = row.get(2);
+    let payload_execution_id = payload
+        .get("execution_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    if kind != "reconcile"
+        || event_type != expected_event_type
+        || payload_execution_id != Some(expected_execution_id)
+    {
+        return Err(store_error(
+            StoreErrorCode::InvalidTransition,
+            "recovery Task was not authorized by the matching retry due Event",
         ));
     }
     Ok(())
@@ -7246,6 +7656,9 @@ mod tests {
         assert!(source.contains("Tool retry changed after the due-work scan"));
         assert!(source.contains("Agent retry changed after the due-work scan"));
         assert!(source.contains("retry_at <= to_timestamp"));
+        assert!(source.contains("tool.retry_attempt_started"));
+        assert!(source.contains("agent.resubmission_started"));
+        assert!(source.contains("recovery Task was not authorized"));
     }
 
     #[tokio::test]

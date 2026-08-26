@@ -399,7 +399,7 @@ started_at, completed_at, updated_at
 - `outcome_unknown` 必须设置 recovery_action 或进入人工队列。
 - `retry_scheduled` 必须设置数据库时间语义的 `retry_at`；其他状态不得残留该字段。
 
-`tool_execution_attempts` 在外部调用前追加请求开始记录，并在同一 attempt 下以 `request_finished_at IS NULL` 条件 finalize 一次，保存结束时间、Adapter 错误分类、外部 request ID 与响应摘要。finalize 后不可再次修改。重试使用同一 ToolExecution 和幂等键，不创建新的逻辑调用。
+`tool_execution_attempts` 在外部调用前追加请求开始记录，并在同一 attempt 下以 `request_finished_at IS NULL` 条件 finalize 一次，保存结束时间、Adapter 错误分类、外部 request ID 与响应摘要。finalize 后不可再次修改。重试使用同一 ToolExecution 和幂等键，不创建新的逻辑调用；每个新 attempt 必须由匹配 `tool.retry_due` Event 的已领取恢复 Task 在启动事务中追加。
 
 ### 10.2 `agent_executions`
 
@@ -419,6 +419,7 @@ retry_at, last_synced_at, created_at, updated_at, completed_at
 - 非空 remote reference 时应在 Endpoint 作用域唯一；
 - event cursor 更新必须匹配 `cursor_version`，避免两个同步 Worker 互相覆盖；
 - `SameRequestBackoff` 映射到 `reconciling` 并必须设置数据库时间语义的 `retry_at`；其他 Agent 状态不得残留该字段；
+- `reconciling → submitting` 的自动重提必须由匹配 `agent.retry_due` Event 的已领取恢复 Task 授权，且沿用原 Endpoint 与 idempotency key；
 - capabilities snapshot 创建后不可覆盖，能力重新发现只影响新 AgentExecution。
 
 远程 Agent 进入 running 后，提交 Task 创建 WaitSubscription 或短时 poll Task，并释放 Worker。AgentExecution 的 running 不要求 Run 保持 running；Run 可以投影为 waiting。

@@ -304,6 +304,7 @@ planned → executing → succeeded
 - 进程在外部响应与本地提交之间崩溃时，执行进入或被恢复器判定为 `outcome_unknown`。
 - `outcome_unknown` 只能通过外部查询、幂等重放、补偿或人工决定退出，不能由普通 Task 自动重试。
 - `retry_scheduled` 必须持久化 `retry_at`；数据库时间驱动的 due-work 先原子消费时间并进入 `reconciling`、创建恢复 Task，再由持有 Lease 的恢复 Task 开启下一 attempt，不得依赖进程内定时器。
+- 恢复 Task 必须由同一 ToolExecution 的 `tool.retry_due` Event 创建；启动事务同时验证 Task Lease、Run fence 和 Execution attempt，原子执行 `reconciling → executing`、attempt 递增、未完成 attempt 插入和 `tool.retry_attempt_started` 追加。事务提交前不得调用 Tool Adapter。
 - 已 `succeeded` 的调用在 Task 重试时直接复用结果。
 
 ## 9. AgentExecution 状态机
@@ -321,6 +322,7 @@ planned → submitting → running → succeeded
 - Adapter 支持按幂等键查询时，恢复器优先查询既有远程 Run。
 - Adapter 不支持幂等提交或查询确认时，提交窗口故障进入 `outcome_unknown`，禁止自动创建第二个远程 Run。
 - 提交被拒绝且分类为 `SameRequestBackoff` 时进入 `reconciling`，必须在同一事务持久化 `retry_at`；due-work 只能使用数据库时间触发。
+- 到期重提只能由同一 AgentExecution 的 `agent.retry_due` Event 创建且持有有效 Lease 的恢复 Task 启动；启动事务验证 Run fence、Execution version 与空 `remote_run_ref`，原子执行 `reconciling → submitting`、version 递增和 `agent.resubmission_started` 追加，并沿用原 Endpoint、session reference 与 idempotency key。事务提交前不得再次 submit。
 - 事件游标必须持久化；每批远程事件的规范化、游标更新和本地 Event 追加应原子提交。
 - 规范化事件的 Task/Wait/Artifact 业务投影必须通过 Run version、generation、非暂停/非终态和 deadline fence；fence 失效时仅保存事件、receipt、cursor 与 Agent 外部结果事实。
 - `stop` 是请求，不等于远程已经停止。只有 Adapter 明确确认后才能进入 `cancelled`；远程已经完成时应记录真实结果，再由 Run generation 决定该结果能否推进业务状态。
