@@ -68,6 +68,7 @@ pub struct ClaimTask {
     pub lease_token: LeaseToken,
     pub lease_duration: DurationMicros,
     pub candidate_window: u32,
+    pub kind: Option<TaskKind>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

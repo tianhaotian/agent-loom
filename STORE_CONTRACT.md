@@ -370,6 +370,8 @@ pub struct CreateRun {
 
 `initial_plan` 是已经过 Runtime 验证的类型化计划，包含初始 Stage、Task 和 Artifact Contract。Provider 必须再次验证引用、tenant 和唯一 logical key。
 
+`claim_task` 可以按 Task kind 过滤，使专用 Worker 不会领取无法处理的任务。领取结果必须包含不可变 Task 输入和领取事务提交后的 Run version，供后续 Worker 命令构造 Lease proof 与 Run CAS；重复领取命令必须从 Receipt 返回完全相同的结果。
+
 ### 6.2 CompleteTask
 
 ```rust
@@ -499,6 +501,8 @@ Worker 在外部调用后、本地记录前崩溃时，Scheduler 根据 stale ex
 `SameRequestBackoff` 结果必须携带 `retry_at`，并与 ToolExecution 的 `retry_scheduled` 状态同事务持久化；其他结果不得残留 retry time。
 
 到期重试由 `apply_due_work` 创建的 `reconcile` Task 承载。Worker 领取后必须先调用 `begin_tool_retry_attempt`；Provider 必须验证有效 Lease、Run version/generation、Execution revision，并确认 Task 的 `created_event_id` 指向同一 ToolExecution 的 `tool.retry_due` Event。获胜事务将 Execution 从 `reconciling` 置为 `executing`、递增 attempt、插入新的未完成 ToolExecutionAttempt、追加 `tool.retry_attempt_started` 并保存 Receipt。只有该事务提交后才能调用 Tool Adapter。
+
+专用恢复 Worker 必须按 `reconcile` kind 领取 Task，并从已持久化 Task 输入读取 due-work kind、execution ID 和 expected revision。启动命令身份由 Task ID、Task attempt 和 revision 确定性生成；启动事务返回 duplicate 时，dispatcher 仍只能使用原 Execution 幂等身份恢复同一次外部调用，不得生成新的副作用身份。
 
 ### 8.2 Agent Server
 

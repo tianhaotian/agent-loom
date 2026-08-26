@@ -221,6 +221,7 @@ scheduled → queued → leased → succeeded
 
 - Task 必须保存 `generation`、`based_on_checkpoint_sequence` 和 `attempt`。
 - 领取条件必须包含 Run 非 paused/terminal、Task generation 等于 Run generation、`available_at <= database_now`。
+- 专用 Worker 必须按其可处理的 Task kind 领取；领取结果包含不可变 Task 输入及领取事务推进后的 Run version，禁止使用领取前快照构造后续 CAS。
 - 完成和续租必须匹配 `task_id + lease_owner + lease_token + lease_expires_at > database_now`。
 - 一次成功完成只能产生一个 Task completion Event 和一组后续动作。
 - Pause 后旧 generation Task 的迟到结果只作为执行证据记录，不得更新 Run、StageExecution 或 Checkpoint。

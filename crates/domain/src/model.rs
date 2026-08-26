@@ -51,6 +51,7 @@ pub struct TaskSnapshot {
     pub attempt: u32,
     pub max_attempts: u32,
     pub available_at: UnixMicros,
+    pub input: JsonPayload,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -294,8 +294,14 @@ impl PostgresTransactionExecutor {
         }
 
         let tenant_id = uuid(context.tenant_id.into_bytes());
-        let candidate =
-            lock_claim_candidate(&transaction, tenant_id, db_now, command.candidate_window).await?;
+        let candidate = lock_claim_candidate(
+            &transaction,
+            tenant_id,
+            db_now,
+            command.candidate_window,
+            command.kind,
+        )
+        .await?;
 
         let Some(row) = candidate else {
             let outcome = json!({"type": "claim_none"});
@@ -418,7 +424,17 @@ impl PostgresTransactionExecutor {
                 attempt: positive_u32(attempt, "task attempt")?,
                 max_attempts,
                 available_at: UnixMicros::new(row.available_at),
+                input: JsonPayload::from_validated_bytes(
+                    serde_json::to_vec(&row.input)
+                        .map_err(|_| inconsistent("failed to encode claimed Task input"))?,
+                ),
             },
+            run_version: nonnegative_u64(
+                row.run_version
+                    .checked_add(1)
+                    .ok_or_else(|| inconsistent("Run version overflow"))?,
+                "Run version",
+            )?,
             lease_expires_at: UnixMicros::new(lease_expires_at),
         };
         let outcome = encode_claim_receipt(Some(&value))?;
@@ -3016,6 +3032,8 @@ struct LockedClaimCandidate {
     attempt: i64,
     max_attempts: i64,
     available_at: i64,
+    input: Value,
+    run_version: i64,
     next_event_sequence: i64,
 }
 
@@ -3024,8 +3042,10 @@ async fn lock_claim_candidate(
     tenant_id: Uuid,
     db_now: i64,
     candidate_window: u32,
+    required_kind: Option<TaskKind>,
 ) -> StoreResult<Option<LockedClaimCandidate>> {
     let window = i64::from(candidate_window);
+    let required_kind = required_kind.map(task_kind);
     let candidates = transaction
         .query(
             "SELECT t.task_id, t.run_id \
@@ -3039,10 +3059,11 @@ async fn lock_claim_candidate(
                AND (t.deadline IS NULL OR t.deadline >= \
                    to_timestamp(($2::bigint)::double precision / 1000000.0)) \
                AND t.attempt < t.max_attempts \
+               AND ($4::text IS NULL OR t.kind = $4) \
                AND r.status IN ('queued', 'running') \
                AND t.generation = r.execution_generation \
              ORDER BY t.priority DESC, t.available_at, t.task_id LIMIT $3",
-            &[&tenant_id, &db_now, &window],
+            &[&tenant_id, &db_now, &window, &required_kind],
         )
         .await
         .map_err(map_database_error)?;
@@ -3052,7 +3073,7 @@ async fn lock_claim_candidate(
         let run_id: Uuid = candidate.get(1);
         let Some(run) = transaction
             .query_opt(
-                "SELECT execution_generation, next_event_sequence \
+                "SELECT version, execution_generation, next_event_sequence \
                  FROM agent_loom.runs \
                  WHERE tenant_id = $1 AND run_id = $2 AND status IN ('queued', 'running') \
                  FOR UPDATE SKIP LOCKED",
@@ -3063,12 +3084,14 @@ async fn lock_claim_candidate(
         else {
             continue;
         };
-        let generation: i64 = run.get(0);
-        let next_event_sequence: i64 = run.get(1);
+        let run_version: i64 = run.get(0);
+        let generation: i64 = run.get(1);
+        let next_event_sequence: i64 = run.get(2);
         let Some(task) = transaction
             .query_opt(
                 "SELECT stage_execution_id, logical_key, kind, generation, attempt, \
-                        max_attempts, (extract(epoch FROM available_at) * 1000000)::bigint \
+                        max_attempts, (extract(epoch FROM available_at) * 1000000)::bigint, \
+                        input_json \
                  FROM agent_loom.tasks \
                  WHERE tenant_id = $1 AND run_id = $2 AND task_id = $3 \
                    AND status IN ('queued', 'retry_scheduled') AND generation = $4 \
@@ -3076,8 +3099,16 @@ async fn lock_claim_candidate(
                        to_timestamp(($5::bigint)::double precision / 1000000.0) \
                    AND (deadline IS NULL OR deadline >= \
                        to_timestamp(($5::bigint)::double precision / 1000000.0)) \
-                   AND attempt < max_attempts FOR UPDATE SKIP LOCKED",
-                &[&tenant_id, &run_id, &task_id, &generation, &db_now],
+                   AND attempt < max_attempts \
+                   AND ($6::text IS NULL OR kind = $6) FOR UPDATE SKIP LOCKED",
+                &[
+                    &tenant_id,
+                    &run_id,
+                    &task_id,
+                    &generation,
+                    &db_now,
+                    &required_kind,
+                ],
             )
             .await
             .map_err(map_database_error)?
@@ -3094,6 +3125,8 @@ async fn lock_claim_candidate(
             attempt: task.get(4),
             max_attempts: task.get(5),
             available_at: task.get(6),
+            input: task.get(7),
+            run_version,
             next_event_sequence,
         }));
     }
@@ -3112,6 +3145,7 @@ struct LockedWorkerTask {
     attempt: i64,
     max_attempts: i64,
     available_at: i64,
+    input: Value,
     lease_owner: Option<Uuid>,
     lease_token: Option<Vec<u8>>,
     lease_expires_at: Option<i64>,
@@ -3140,7 +3174,12 @@ impl LockedWorkerTask {
                 attempt: positive_u32(self.attempt, "task attempt")?,
                 max_attempts: positive_u32(self.max_attempts, "task max attempts")?,
                 available_at: UnixMicros::new(self.available_at),
+                input: JsonPayload::from_validated_bytes(
+                    serde_json::to_vec(&self.input)
+                        .map_err(|_| inconsistent("failed to encode leased Task input"))?,
+                ),
             },
+            run_version: nonnegative_u64(self.run_version, "Run version")?,
             lease_expires_at: UnixMicros::new(lease_expires_at),
         })
     }
@@ -3170,7 +3209,7 @@ async fn lock_worker_task(
             "SELECT run_id, task_id, stage_execution_id, logical_key, kind, status, \
                     generation, attempt, max_attempts, \
                     (extract(epoch FROM available_at) * 1000000)::bigint, \
-                    lease_owner, lease_token, \
+                    input_json, lease_owner, lease_token, \
                     CASE WHEN lease_expires_at IS NULL THEN NULL \
                          ELSE (extract(epoch FROM lease_expires_at) * 1000000)::bigint END \
              FROM agent_loom.tasks \
@@ -3191,9 +3230,10 @@ async fn lock_worker_task(
         attempt: task.get(7),
         max_attempts: task.get(8),
         available_at: task.get(9),
-        lease_owner: task.get(10),
-        lease_token: task.get(11),
-        lease_expires_at: task.get(12),
+        input: task.get(10),
+        lease_owner: task.get(11),
+        lease_token: task.get(12),
+        lease_expires_at: task.get(13),
         run_status: run.get(0),
         run_version: run.get(1),
         execution_generation: run.get(2),
@@ -7261,6 +7301,8 @@ struct ClaimReceipt {
     attempt: u32,
     max_attempts: u32,
     available_at: i64,
+    input: Value,
+    run_version: u64,
     lease_expires_at: i64,
 }
 
@@ -7282,6 +7324,8 @@ fn encode_claim_receipt(value: Option<&ClaimedTask>) -> StoreResult<Value> {
         attempt: value.task.attempt,
         max_attempts: value.task.max_attempts,
         available_at: value.task.available_at.get(),
+        input: json_value(&value.task.input)?,
+        run_version: value.run_version,
         lease_expires_at: value.lease_expires_at.get(),
     })
     .map_err(|_| inconsistent("failed to encode claim receipt"))
@@ -7312,7 +7356,12 @@ fn decode_claim_receipt(tenant_id: TenantId, value: &Value) -> StoreResult<Optio
             attempt: receipt.attempt,
             max_attempts: receipt.max_attempts,
             available_at: UnixMicros::new(receipt.available_at),
+            input: JsonPayload::from_validated_bytes(
+                serde_json::to_vec(&receipt.input)
+                    .map_err(|_| inconsistent("failed to encode claim receipt Task input"))?,
+            ),
         },
+        run_version: receipt.run_version,
         lease_expires_at: UnixMicros::new(receipt.lease_expires_at),
     }))
 }
@@ -7609,6 +7658,33 @@ mod tests {
     }
 
     #[test]
+    fn claim_receipt_round_trip_preserves_input_and_run_version() {
+        let claimed = ClaimedTask {
+            task: TaskSnapshot {
+                tenant_id: TenantId::from_bytes([1; 16]),
+                task_id: TaskId::from_bytes([2; 16]),
+                run_id: RunId::from_bytes([3; 16]),
+                stage_execution_id: Some(StageExecutionId::from_bytes([4; 16])),
+                logical_key: LogicalKey::parse("reconcile/tool").expect("logical key"),
+                kind: TaskKind::Reconcile,
+                status: TaskStatus::Leased,
+                generation: 5,
+                attempt: 2,
+                max_attempts: 3,
+                available_at: UnixMicros::new(6),
+                input: payload(&json!({"execution_id": "tool-1"})),
+            },
+            run_version: 7,
+            lease_expires_at: UnixMicros::new(8),
+        };
+        let encoded = encode_claim_receipt(Some(&claimed)).expect("encode claim receipt");
+        assert_eq!(
+            decode_claim_receipt(claimed.task.tenant_id, &encoded).expect("decode claim receipt"),
+            Some(claimed)
+        );
+    }
+
+    #[test]
     fn receipt_round_trip_preserves_original_run_snapshot() {
         let snapshot = RunSnapshot {
             tenant_id: TenantId::from_bytes([1; 16]),
@@ -7659,6 +7735,7 @@ mod tests {
         assert!(source.contains("tool.retry_attempt_started"));
         assert!(source.contains("agent.resubmission_started"));
         assert!(source.contains("recovery Task was not authorized"));
+        assert!(source.contains("($4::text IS NULL OR t.kind = $4)"));
     }
 
     #[tokio::test]
@@ -7758,6 +7835,7 @@ mod tests {
                     lease_token: lease_token.clone(),
                     lease_duration: DurationMicros::new(60_000_000),
                     candidate_window: 8,
+                    kind: None,
                 },
             )
             .await
@@ -7868,6 +7946,7 @@ mod tests {
                     lease_token: recovery_token.clone(),
                     lease_duration: DurationMicros::new(60_000_000),
                     candidate_window: 8,
+                    kind: None,
                 },
             )
             .await
@@ -7995,6 +8074,7 @@ mod tests {
                     lease_token: fatal_token.clone(),
                     lease_duration: DurationMicros::new(60_000_000),
                     candidate_window: 8,
+                    kind: None,
                 },
             )
             .await
@@ -8054,6 +8134,7 @@ mod tests {
                     lease_token: wait_token.clone(),
                     lease_duration: DurationMicros::new(60_000_000),
                     candidate_window: 8,
+                    kind: None,
                 },
             )
             .await
@@ -8236,6 +8317,7 @@ mod tests {
                     lease_token: LeaseToken::from_bytes([88; 32]),
                     lease_duration: DurationMicros::new(60_000_000),
                     candidate_window: 8,
+                    kind: None,
                 },
             )
             .await
@@ -8419,6 +8501,7 @@ mod tests {
                     lease_token: race_token.clone(),
                     lease_duration: DurationMicros::new(60_000_000),
                     candidate_window: 8,
+                    kind: None,
                 },
             )
             .await

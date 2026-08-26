@@ -39,6 +39,7 @@ pub struct Committed<T> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimedTask {
     pub task: TaskSnapshot,
+    pub run_version: u64,
     pub lease_expires_at: UnixMicros,
 }
 

@@ -35,6 +35,8 @@ version = "0.1.0"
 dependencies = [
  "agent-loom-domain",
  "agent-loom-durable-store",
+ "serde",
+ "serde_json",
  "sha2",
  "tokio",
 ]
