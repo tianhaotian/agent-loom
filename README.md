@@ -17,9 +17,9 @@ crates/store-mysql     MySQL/InnoDB Provider 与物理迁移
 
 已实现 `0000_migration_meta` 至 `0006_external_executions` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt、Checkpoint、Wait、Artifact、ToolExecution 与 AgentExecution。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、Wait 单次消费槽、Artifact 版本血缘、外部执行幂等与 Agent Event 去重。
 
-PostgreSQL 已接入真实驱动执行层：migration executor 使用 SHA-256 physical checksum、session advisory lock、step journal 和逐批 schema introspection；事务垂直切片已覆盖 `create_run`、`get_run`、`list_events`、`claim_task`、`complete_task`、`pause_run`、`resume_run` 与 `cancel_run`。写路径包含 receipt 并发幂等闸门、显式 `Run → Task` 锁序、`FOR UPDATE SKIP LOCKED`、Lease fencing、Run version/generation CAS，以及 Event、Checkpoint、Stage、Artifact 和后续动作的原子提交。
+PostgreSQL 已接入真实驱动执行层：migration executor 使用 SHA-256 physical checksum、session advisory lock、step journal 和逐批 schema introspection；事务垂直切片已覆盖 `create_run`、`get_run`、`list_events`、`claim_task`、`renew_task_lease`、`complete_task`、`fail_task`、`pause_run`、`resume_run` 与 `cancel_run`。写路径包含 receipt 并发幂等闸门、显式 `Run → Task` 锁序、`FOR UPDATE SKIP LOCKED`、Lease fencing、Run version/generation CAS，以及 Event、Checkpoint、Stage、Artifact 和后续动作的原子提交。
 
-Pause 会递增 execution generation、终止旧 Lease attempt、保留并冻结动态 Task 计划；Resume 会拒绝存在未知外部结果的 Run，并根据当前 Task/Wait 重新投影状态；Cancel 会原子关闭 Task、Wait、Stage，设置唯一 terminal Event，并将远程 Agent stop 与不确定 Tool 对账意图持久化。该切片目前接受连接池借出的 `&mut tokio_postgres::Client`；完整 `DurableStore` Provider 仍需补齐连接池封装、续租、失败、事件应用和外部执行操作。
+续租使用数据库时间校验并延长 Task/TaskAttempt 的同一 Lease，不推进 Run 版本；失败事务会原子完成 attempt、清除 Lease、追加 Event，并区分 retry、不可重试终态与 Dead Letter。Dead Letter 按领域契约保持 Run 非终态并进入 `waiting`，交由后续恢复策略或人工介入。Pause 会递增 execution generation、终止旧 Lease attempt、保留并冻结动态 Task 计划；Resume 会拒绝存在未知外部结果的 Run，并根据当前 Task/Wait 重新投影状态；Cancel 会原子关闭 Task、Wait、Stage，设置唯一 terminal Event，并将远程 Agent stop 与不确定 Tool 对账意图持久化。该切片目前接受连接池借出的 `&mut tokio_postgres::Client`；完整 `DurableStore` Provider 仍需补齐连接池封装、事件应用和外部执行操作。
 
 ## 设计文档
 
@@ -41,7 +41,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-设置测试专用数据库后可同时执行真实 migration 与事务 smoke test；后者还覆盖查询分页、暂停/恢复/取消幂等，以及 `cancel`/`complete_task` 并发终态唯一性：
+设置测试专用数据库后可同时执行真实 migration 与事务 smoke test；后者还覆盖查询分页、续租与失败幂等、Lease fencing、暂停/恢复/取消幂等，以及 `cancel`/`complete_task` 并发终态唯一性：
 
 ```bash
 AGENT_LOOM_TEST_POSTGRES_URL='postgresql://...' cargo test -p agent-loom-store-postgres

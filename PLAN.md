@@ -321,10 +321,10 @@ Kafka、NATS 或 Redis Streams 可以在高吞吐事件分发时引入，但必�
 
 ## 11. 下一步
 
-已完成共享领域/Store/Adapter 契约骨架、`0000` 至 `0006` PostgreSQL/MySQL 对等迁移、migration runner/执行状态机，以及 PostgreSQL migration executor。PostgreSQL 事务垂直切片现已覆盖 Run 创建/查询、Event 分页、Task 领取/完成和 Pause/Resume/Cancel；Worker 与控制命令统一使用显式 `Run → Task` 锁序。后续按以下顺序推进：
+已完成共享领域/Store/Adapter 契约骨架、`0000` 至 `0006` PostgreSQL/MySQL 对等迁移、migration runner/执行状态机，以及 PostgreSQL migration executor。PostgreSQL 事务垂直切片现已覆盖 Run 创建/查询、Event 分页、Task 领取/续租/完成/失败和 Pause/Resume/Cancel；Worker 与控制命令统一使用显式 `Run → Task` 锁序。失败路径已区分 retry、fatal 与 Dead Letter，后者保持 Run 非终态并等待恢复策略。后续按以下顺序推进：
 
-1. 在 CI 的 PostgreSQL 16+ 测试库启用 `AGENT_LOOM_TEST_POSTGRES_URL`，持续执行真实 migration、重复命令、领取/完成、暂停/恢复/取消和 cancel/complete 竞争 smoke test；继续补充多 Worker 领取与故障注入测试。
-2. 为 PostgreSQL 补齐连接池边界与完整 `DurableStore` 实现：`renew_task_lease/fail_task/apply_event` 以及 Tool/AgentExecution 操作，保持所有状态推进使用 receipt、行锁或 CAS。
+1. 在 CI 的 PostgreSQL 16+ 测试库启用 `AGENT_LOOM_TEST_POSTGRES_URL`，持续执行真实 migration、重复命令、领取/续租/完成/失败、暂停/恢复/取消和 cancel/complete 竞争 smoke test；继续补充多 Worker 领取、续租/回收竞争与故障注入测试。
+2. 为 PostgreSQL 补齐连接池边界与完整 `DurableStore` 实现：`apply_event` 以及 Tool/AgentExecution 操作，保持所有状态推进使用 receipt、行锁或 CAS。
 3. 将共享 conformance harness 从 schema 形状测试扩展为 Provider 黑盒行为测试，并实现 MySQL 对等事务路径。
 4. 实现 Scheduler/Worker 最小循环、Lease 回收与数据库时间驱动的 due-work 扫描。
 5. 实现 Mock Agent Server Adapter 和业产研 Workflow fixture，跑通需求分析至部署的模拟 E2E。

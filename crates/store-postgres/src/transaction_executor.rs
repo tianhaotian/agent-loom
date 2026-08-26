@@ -5,8 +5,9 @@ use agent_loom_domain::{
 };
 use agent_loom_durable_store::{
     ClaimTask, ClaimedTask, CommandContext, CommandDisposition, Committed, CompleteTask,
-    CompletionShapeError, ControlRun, CreateRun, DurableFollowUp, InitialTask, NewTask,
-    NextActions, PostCommitHint, StoreError, StoreErrorCode, StoreResult,
+    CompletionShapeError, ControlRun, CreateRun, DurableFollowUp, ExpectedRun, FailTask,
+    InitialTask, LeaseProof, NewTask, NextActions, PostCommitHint, RenewTaskLease, StoreError,
+    StoreErrorCode, StoreResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -437,6 +438,337 @@ impl PostgresTransactionExecutor {
         }))
     }
 
+    /// Extends an active Task lease and its matching attempt using the
+    /// authoritative database clock. The Run version is intentionally not
+    /// advanced because renewal does not change the workflow projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable store error for an invalid extension, stale Run fence,
+    /// lost or expired lease, idempotency misuse, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn renew_task_lease(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: RenewTaskLease,
+    ) -> StoreResult<Committed<ClaimedTask>> {
+        if command.extension.get() == 0 {
+            return Err(invalid_command("lease extension must be positive"));
+        }
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        match acquire_receipt(
+            &transaction,
+            context,
+            db_now,
+            self.config.receipt_ttl_micros,
+        )
+        .await?
+        {
+            ReceiptGuard::Existing(receipt) => {
+                let value = decode_claim_receipt(context.tenant_id, &receipt.outcome)?
+                    .ok_or_else(|| inconsistent("renewal receipt has no claimed task"))?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(Committed {
+                    disposition: CommandDisposition::Duplicate,
+                    value,
+                    event_ids: receipt.event_id.map(event_id).into_iter().collect(),
+                    durable_follow_ups: Vec::new(),
+                    post_commit_hints: Vec::new(),
+                });
+            }
+            ReceiptGuard::Acquired => {}
+        }
+
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let locked = lock_worker_task(
+            &transaction,
+            tenant_id,
+            uuid(command.expected_run.run_id.into_bytes()),
+            uuid(command.lease.task_id.into_bytes()),
+        )
+        .await?;
+        validate_worker_fences(
+            &command.expected_run,
+            &command.lease,
+            &locked,
+            db_now,
+            "renewal",
+        )?;
+        let extension = to_i64(command.extension.get(), "lease extension")?;
+        let lease_expires_at = locked
+            .lease_expires_at
+            .and_then(|expires| expires.checked_add(extension))
+            .ok_or_else(|| invalid_command("lease expiry overflow"))?;
+        let lease_token = command.lease.token.as_bytes().as_slice();
+        let task_updated = transaction
+            .execute(
+                "UPDATE agent_loom.tasks SET lease_expires_at = \
+                    to_timestamp(($6::bigint)::double precision / 1000000.0), \
+                    updated_at = to_timestamp(($7::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND run_id = $2 AND task_id = $3 \
+                   AND status = 'leased' AND lease_owner = $4 AND lease_token = $5",
+                &[
+                    &tenant_id,
+                    &locked.run_id,
+                    &locked.task_id,
+                    &locked.lease_owner,
+                    &lease_token,
+                    &lease_expires_at,
+                    &db_now,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if task_updated != 1 {
+            return Err(store_error(
+                StoreErrorCode::LeaseLost,
+                "task lease changed during renewal",
+            ));
+        }
+        let attempt_updated = transaction
+            .execute(
+                "UPDATE agent_loom.task_attempts SET lease_expires_at = \
+                    to_timestamp(($4::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND task_id = $2 AND attempt = $3 \
+                   AND finished_at IS NULL",
+                &[
+                    &tenant_id,
+                    &locked.task_id,
+                    &locked.attempt,
+                    &lease_expires_at,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if attempt_updated != 1 {
+            return Err(inconsistent("leased task has no open matching attempt"));
+        }
+
+        let value = locked.claimed_task(context.tenant_id, lease_expires_at)?;
+        let outcome = encode_claim_receipt(Some(&value))?;
+        finish_receipt(
+            &transaction,
+            context,
+            "applied",
+            &outcome,
+            None,
+            Some(("task", locked.task_id, locked.attempt)),
+        )
+        .await?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(Committed {
+            disposition: CommandDisposition::Applied,
+            value,
+            event_ids: Vec::new(),
+            durable_follow_ups: Vec::new(),
+            post_commit_hints: Vec::new(),
+        })
+    }
+
+    /// Finalizes the active Task attempt and atomically projects the Run to a
+    /// retry, fatal failure, or dead-letter/manual-recovery state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable store error for invalid failure metadata, stale Run
+    /// expectations, lost or expired lease, idempotency misuse, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn fail_task(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: FailTask,
+    ) -> StoreResult<Committed<RunSnapshot>> {
+        if command.error_code.is_empty() {
+            return Err(invalid_command("task failure error code must not be empty"));
+        }
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        match acquire_receipt(
+            &transaction,
+            context,
+            db_now,
+            self.config.receipt_ttl_micros,
+        )
+        .await?
+        {
+            ReceiptGuard::Existing(receipt) => {
+                let snapshot = decode_run_receipt(context.tenant_id, &receipt.outcome)?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(failure_committed(
+                    CommandDisposition::Duplicate,
+                    snapshot,
+                    receipt.event_id.map(event_id),
+                    Vec::new(),
+                    false,
+                ));
+            }
+            ReceiptGuard::Acquired => {}
+        }
+
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let locked = lock_worker_task(
+            &transaction,
+            tenant_id,
+            uuid(command.expected_run.run_id.into_bytes()),
+            uuid(command.lease.task_id.into_bytes()),
+        )
+        .await?;
+        validate_worker_fences(
+            &command.expected_run,
+            &command.lease,
+            &locked,
+            db_now,
+            "failure",
+        )?;
+        let transition = FailureTransition::classify(
+            locked.attempt,
+            locked.max_attempts,
+            command.retry_at.map(UnixMicros::get),
+        );
+        let event_id = uuid(command.failure_event_id.into_bytes());
+        let correlation_id = uuid(context.correlation_id.into_bytes());
+        let event_payload = json!({
+            "task_id": locked.task_id,
+            "attempt": locked.attempt,
+            "max_attempts": locked.max_attempts,
+            "error_code": &command.error_code,
+            "task_status": transition.task_status,
+            "run_status": transition.run_status,
+            "retry_at_micros": transition.retry_at,
+        });
+        insert_event(
+            &transaction,
+            EventInsert {
+                event_id,
+                tenant_id,
+                run_id: locked.run_id,
+                sequence: locked.next_event_sequence,
+                event_type: transition.event_type,
+                payload: &event_payload,
+                producer: "worker",
+                context,
+                correlation_id,
+                recorded_at: db_now,
+            },
+        )
+        .await?;
+        finalize_failed_task(
+            &transaction,
+            tenant_id,
+            &locked,
+            db_now,
+            &command.error_code,
+            &event_payload,
+            &transition,
+        )
+        .await?;
+        let mut follow_ups = Vec::new();
+        if transition.terminal {
+            close_work_after_fatal_failure(
+                &transaction,
+                tenant_id,
+                locked.run_id,
+                locked.task_id,
+                db_now,
+            )
+            .await?;
+            let (_, mut stop_follow_ups) =
+                request_external_stops(&transaction, tenant_id, locked.run_id, db_now).await?;
+            follow_ups.append(&mut stop_follow_ups);
+            let mut reconcile_follow_ups =
+                mark_executing_tools_uncertain(&transaction, tenant_id, locked.run_id, db_now)
+                    .await?;
+            follow_ups.append(&mut reconcile_follow_ups);
+        }
+
+        let next_version = locked
+            .run_version
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("run version overflow"))?;
+        let next_event_sequence = locked
+            .next_event_sequence
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("run event sequence overflow"))?;
+        let run_updated = transaction
+            .execute(
+                "UPDATE agent_loom.runs SET status = $5, suspended_from_status = NULL, \
+                    version = $6, next_event_sequence = $7, \
+                    terminal_event_id = CASE WHEN $8 THEN $9 ELSE NULL END, \
+                    terminal_at = CASE WHEN $8 THEN \
+                        to_timestamp(($10::bigint)::double precision / 1000000.0) ELSE NULL END, \
+                    updated_at = to_timestamp(($10::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND run_id = $2 AND version = $3 \
+                   AND execution_generation = $4 \
+                   AND status IN ('queued', 'running', 'retrying')",
+                &[
+                    &tenant_id,
+                    &locked.run_id,
+                    &locked.run_version,
+                    &locked.execution_generation,
+                    &transition.run_status,
+                    &next_version,
+                    &next_event_sequence,
+                    &transition.terminal,
+                    &event_id,
+                    &db_now,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if run_updated != 1 {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "run changed while failing the task",
+            ));
+        }
+
+        let snapshot = RunSnapshot {
+            tenant_id: context.tenant_id,
+            run_id: run_id_from_uuid(locked.run_id),
+            workflow_version_id: locked.workflow_version_id.map(workflow_id_from_uuid),
+            status: parse_run_status(transition.run_status)?,
+            suspended_from_status: None,
+            version: nonnegative_u64(next_version, "run version")?,
+            execution_generation: nonnegative_u64(
+                locked.execution_generation,
+                "execution generation",
+            )?,
+            next_event_sequence: nonnegative_u64(next_event_sequence, "event sequence")?,
+            current_checkpoint_id: locked
+                .current_checkpoint_id
+                .map(|id| CheckpointId::from_bytes(id.into_bytes())),
+            terminal_event_id: transition.terminal.then_some(command.failure_event_id),
+            deadline: locked.deadline.map(UnixMicros::new),
+            updated_at: UnixMicros::new(db_now),
+        };
+        if let Some(not_before) = transition.retry_at {
+            follow_ups.push(DurableFollowUp::ScanDueWork {
+                not_before: UnixMicros::new(not_before),
+            });
+        }
+        let outcome = encode_run_receipt(&snapshot)?;
+        finish_receipt(
+            &transaction,
+            context,
+            "applied",
+            &outcome,
+            Some(event_id),
+            Some(("run", locked.run_id, next_version)),
+        )
+        .await?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(failure_committed(
+            CommandDisposition::Applied,
+            snapshot,
+            Some(command.failure_event_id),
+            follow_ups,
+            transition.retry_at.is_some(),
+        ))
+    }
+
     /// Atomically validates the lease and Run fence, appends the completion
     /// Event and Checkpoint, finalizes the Task, applies stage/artifact writes,
     /// schedules the next action, and advances the Run projection.
@@ -777,6 +1109,353 @@ async fn lock_claim_candidate(
         }));
     }
     Ok(None)
+}
+
+#[derive(Debug)]
+struct LockedWorkerTask {
+    run_id: Uuid,
+    task_id: Uuid,
+    stage_execution_id: Option<Uuid>,
+    logical_key: String,
+    kind: String,
+    task_status: String,
+    task_generation: i64,
+    attempt: i64,
+    max_attempts: i64,
+    available_at: i64,
+    lease_owner: Option<Uuid>,
+    lease_token: Option<Vec<u8>>,
+    lease_expires_at: Option<i64>,
+    run_status: String,
+    run_version: i64,
+    execution_generation: i64,
+    next_event_sequence: i64,
+    workflow_version_id: Option<Uuid>,
+    current_checkpoint_id: Option<Uuid>,
+    deadline: Option<i64>,
+}
+
+impl LockedWorkerTask {
+    fn claimed_task(&self, tenant_id: TenantId, lease_expires_at: i64) -> StoreResult<ClaimedTask> {
+        Ok(ClaimedTask {
+            task: TaskSnapshot {
+                tenant_id,
+                task_id: task_id_from_uuid(self.task_id),
+                run_id: run_id_from_uuid(self.run_id),
+                stage_execution_id: self.stage_execution_id.map(stage_id_from_uuid),
+                logical_key: LogicalKey::parse(self.logical_key.clone())
+                    .map_err(|_| inconsistent("database contains an invalid task logical key"))?,
+                kind: parse_task_kind(&self.kind)?,
+                status: TaskStatus::Leased,
+                generation: nonnegative_u64(self.task_generation, "task generation")?,
+                attempt: positive_u32(self.attempt, "task attempt")?,
+                max_attempts: positive_u32(self.max_attempts, "task max attempts")?,
+                available_at: UnixMicros::new(self.available_at),
+            },
+            lease_expires_at: UnixMicros::new(lease_expires_at),
+        })
+    }
+}
+
+async fn lock_worker_task(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    task_id: Uuid,
+) -> StoreResult<LockedWorkerTask> {
+    let run = transaction
+        .query_opt(
+            "SELECT status, version, execution_generation, next_event_sequence, \
+                    workflow_version_id, current_checkpoint_id, \
+                    CASE WHEN deadline IS NULL THEN NULL \
+                         ELSE (extract(epoch FROM deadline) * 1000000)::bigint END \
+             FROM agent_loom.runs \
+             WHERE tenant_id = $1 AND run_id = $2 FOR UPDATE",
+            &[&tenant_id, &run_id],
+        )
+        .await
+        .map_err(map_database_error)?
+        .ok_or_else(|| store_error(StoreErrorCode::NotFound, "run was not found"))?;
+    let task = transaction
+        .query_opt(
+            "SELECT run_id, task_id, stage_execution_id, logical_key, kind, status, \
+                    generation, attempt, max_attempts, \
+                    (extract(epoch FROM available_at) * 1000000)::bigint, \
+                    lease_owner, lease_token, \
+                    CASE WHEN lease_expires_at IS NULL THEN NULL \
+                         ELSE (extract(epoch FROM lease_expires_at) * 1000000)::bigint END \
+             FROM agent_loom.tasks \
+             WHERE tenant_id = $1 AND task_id = $2 FOR UPDATE",
+            &[&tenant_id, &task_id],
+        )
+        .await
+        .map_err(map_database_error)?
+        .ok_or_else(|| store_error(StoreErrorCode::NotFound, "task was not found"))?;
+    Ok(LockedWorkerTask {
+        run_id: task.get(0),
+        task_id: task.get(1),
+        stage_execution_id: task.get(2),
+        logical_key: task.get(3),
+        kind: task.get(4),
+        task_status: task.get(5),
+        task_generation: task.get(6),
+        attempt: task.get(7),
+        max_attempts: task.get(8),
+        available_at: task.get(9),
+        lease_owner: task.get(10),
+        lease_token: task.get(11),
+        lease_expires_at: task.get(12),
+        run_status: run.get(0),
+        run_version: run.get(1),
+        execution_generation: run.get(2),
+        next_event_sequence: run.get(3),
+        workflow_version_id: run.get(4),
+        current_checkpoint_id: run.get(5),
+        deadline: run.get(6),
+    })
+}
+
+fn validate_worker_fences(
+    expected_run: &ExpectedRun,
+    lease: &LeaseProof,
+    locked: &LockedWorkerTask,
+    db_now: i64,
+    operation: &str,
+) -> StoreResult<()> {
+    if locked.run_id != uuid(expected_run.run_id.into_bytes()) {
+        return Err(store_error(
+            StoreErrorCode::NotFound,
+            "task belongs to another run",
+        ));
+    }
+    if locked.task_status != "leased" {
+        return Err(store_error(StoreErrorCode::LeaseLost, "task is not leased"));
+    }
+    if locked.run_status == "paused" {
+        return Err(store_error(
+            StoreErrorCode::InvalidTransition,
+            &format!("paused run rejects task {operation}"),
+        ));
+    }
+    if matches!(
+        locked.run_status.as_str(),
+        "completed" | "failed" | "cancelled" | "timed_out"
+    ) {
+        return Err(store_error(StoreErrorCode::TerminalRun, "run is terminal"));
+    }
+    if expected_run
+        .version
+        .is_some_and(|expected| i64::try_from(expected).ok() != Some(locked.run_version))
+    {
+        return Err(store_error(
+            StoreErrorCode::VersionConflict,
+            "run version changed",
+        ));
+    }
+    if expected_run
+        .execution_generation
+        .is_some_and(|expected| i64::try_from(expected).ok() != Some(locked.execution_generation))
+    {
+        return Err(store_error(
+            StoreErrorCode::VersionConflict,
+            "run execution generation changed",
+        ));
+    }
+    let lease_generation = to_i64(lease.execution_generation, "lease generation")?;
+    if lease_generation != locked.execution_generation || lease_generation != locked.task_generation
+    {
+        return Err(store_error(
+            StoreErrorCode::VersionConflict,
+            "execution generation changed",
+        ));
+    }
+    if locked.lease_owner != Some(uuid(lease.worker_id.into_bytes()))
+        || locked.lease_token.as_deref() != Some(lease.token.as_bytes().as_slice())
+    {
+        return Err(store_error(
+            StoreErrorCode::LeaseLost,
+            "task lease proof does not match",
+        ));
+    }
+    if locked
+        .lease_expires_at
+        .is_none_or(|expires| expires <= db_now)
+    {
+        return Err(store_error(
+            StoreErrorCode::LeaseExpired,
+            "task lease expired",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FailureTransition {
+    task_status: &'static str,
+    run_status: &'static str,
+    event_type: &'static str,
+    retry_at: Option<i64>,
+    terminal: bool,
+}
+
+impl FailureTransition {
+    const fn classify(attempt: i64, max_attempts: i64, retry_at: Option<i64>) -> Self {
+        if retry_at.is_some() && attempt < max_attempts {
+            Self {
+                task_status: "retry_scheduled",
+                run_status: "retrying",
+                event_type: "task.retry_scheduled",
+                retry_at,
+                terminal: false,
+            }
+        } else if attempt >= max_attempts {
+            Self {
+                task_status: "dead_lettered",
+                run_status: "waiting",
+                event_type: "task.dead_lettered",
+                retry_at: None,
+                terminal: false,
+            }
+        } else {
+            Self {
+                task_status: "failed",
+                run_status: "failed",
+                event_type: "task.failed",
+                retry_at: None,
+                terminal: true,
+            }
+        }
+    }
+}
+
+async fn finalize_failed_task(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    locked: &LockedWorkerTask,
+    db_now: i64,
+    error_code: &str,
+    error_json: &Value,
+    transition: &FailureTransition,
+) -> StoreResult<()> {
+    let task_terminal = transition.task_status != "retry_scheduled";
+    let updated = transaction
+        .execute(
+            "UPDATE agent_loom.tasks SET status = $4, \
+                available_at = CASE WHEN $5::bigint IS NULL THEN available_at ELSE \
+                    to_timestamp(($5::bigint)::double precision / 1000000.0) END, \
+                lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, \
+                error_code = $6, error_json = $7, \
+                completed_at = CASE WHEN $8 THEN \
+                    to_timestamp(($9::bigint)::double precision / 1000000.0) ELSE NULL END, \
+                updated_at = to_timestamp(($9::bigint)::double precision / 1000000.0) \
+             WHERE tenant_id = $1 AND task_id = $2 AND attempt = $3 AND status = 'leased'",
+            &[
+                &tenant_id,
+                &locked.task_id,
+                &locked.attempt,
+                &transition.task_status,
+                &transition.retry_at,
+                &error_code,
+                &error_json,
+                &task_terminal,
+                &db_now,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if updated != 1 {
+        return Err(store_error(
+            StoreErrorCode::LeaseLost,
+            "task lease changed while recording failure",
+        ));
+    }
+    let attempt_updated = transaction
+        .execute(
+            "UPDATE agent_loom.task_attempts SET \
+                finished_at = to_timestamp(($5::bigint)::double precision / 1000000.0), \
+                outcome = 'failed', error_code = $4 \
+             WHERE tenant_id = $1 AND task_id = $2 AND attempt = $3 \
+               AND finished_at IS NULL",
+            &[
+                &tenant_id,
+                &locked.task_id,
+                &locked.attempt,
+                &error_code,
+                &db_now,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if attempt_updated != 1 {
+        return Err(inconsistent("leased task has no open matching attempt"));
+    }
+    Ok(())
+}
+
+async fn close_work_after_fatal_failure(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    failed_task_id: Uuid,
+    db_now: i64,
+) -> StoreResult<()> {
+    transaction
+        .execute(
+            "UPDATE agent_loom.tasks SET status = 'cancelled', \
+                lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, \
+                error_code = 'run_failed', \
+                completed_at = to_timestamp(($4::bigint)::double precision / 1000000.0), \
+                updated_at = to_timestamp(($4::bigint)::double precision / 1000000.0) \
+             WHERE tenant_id = $1 AND run_id = $2 AND task_id <> $3 \
+               AND status IN ('scheduled', 'queued', 'leased', 'retry_scheduled')",
+            &[&tenant_id, &run_id, &failed_task_id, &db_now],
+        )
+        .await
+        .map_err(map_database_error)?;
+    transaction
+        .execute(
+            "UPDATE agent_loom.task_attempts SET \
+                finished_at = to_timestamp(($4::bigint)::double precision / 1000000.0), \
+                outcome = 'cancelled', error_code = 'run_failed' \
+             WHERE tenant_id = $1 AND run_id = $2 AND task_id <> $3 \
+               AND finished_at IS NULL",
+            &[&tenant_id, &run_id, &failed_task_id, &db_now],
+        )
+        .await
+        .map_err(map_database_error)?;
+    transaction
+        .execute(
+            "UPDATE agent_loom.wait_subscriptions SET status = 'cancelled', active_slot = NULL, \
+                updated_at = to_timestamp(($3::bigint)::double precision / 1000000.0) \
+             WHERE tenant_id = $1 AND run_id = $2 AND status = 'open'",
+            &[&tenant_id, &run_id, &db_now],
+        )
+        .await
+        .map_err(map_database_error)?;
+    transaction
+        .execute(
+            "UPDATE agent_loom.agent_executions SET status = 'cancelled', version = version + 1, \
+                error_code = 'run_failed', \
+                completed_at = to_timestamp(($3::bigint)::double precision / 1000000.0), \
+                updated_at = to_timestamp(($3::bigint)::double precision / 1000000.0) \
+             WHERE tenant_id = $1 AND run_id = $2 AND status = 'planned'",
+            &[&tenant_id, &run_id, &db_now],
+        )
+        .await
+        .map_err(map_database_error)?;
+    transaction
+        .execute(
+            "UPDATE agent_loom.tool_executions SET status = 'failed', \
+                error_code = 'run_failed', \
+                completed_at = to_timestamp(($3::bigint)::double precision / 1000000.0), \
+                updated_at = to_timestamp(($3::bigint)::double precision / 1000000.0) \
+             WHERE tenant_id = $1 AND run_id = $2 \
+               AND status IN ('planned', 'retry_scheduled')",
+            &[&tenant_id, &run_id, &db_now],
+        )
+        .await
+        .map_err(map_database_error)?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2381,6 +3060,30 @@ fn committed_run(
     }
 }
 
+fn failure_committed(
+    disposition: CommandDisposition,
+    snapshot: RunSnapshot,
+    event_id: Option<EventId>,
+    durable_follow_ups: Vec<DurableFollowUp>,
+    wake_scheduler: bool,
+) -> Committed<RunSnapshot> {
+    let run_id = snapshot.run_id;
+    let mut post_commit_hints = vec![
+        PostCommitHint::RunEventsAvailable { run_id },
+        PostCommitHint::InvalidateRunCache { run_id },
+    ];
+    if wake_scheduler {
+        post_commit_hints.push(PostCommitHint::WakeScheduler);
+    }
+    Committed {
+        disposition,
+        value: snapshot,
+        event_ids: event_id.into_iter().collect(),
+        durable_follow_ups,
+        post_commit_hints,
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct RunReceipt {
     #[serde(rename = "type")]
@@ -2569,6 +3272,26 @@ mod tests {
         assert!(ControlKind::Cancel.is_no_op(RunStatus::Completed));
         assert!(!ControlKind::Cancel.is_no_op(RunStatus::Running));
         assert!(!ControlKind::Resume.is_no_op(RunStatus::Paused));
+    }
+
+    #[test]
+    fn task_failure_projection_distinguishes_retry_fatal_and_dead_letter() {
+        let retry = FailureTransition::classify(1, 3, Some(99));
+        assert_eq!(retry.task_status, "retry_scheduled");
+        assert_eq!(retry.run_status, "retrying");
+        assert_eq!(retry.retry_at, Some(99));
+        assert!(!retry.terminal);
+
+        let fatal = FailureTransition::classify(1, 3, None);
+        assert_eq!(fatal.task_status, "failed");
+        assert_eq!(fatal.run_status, "failed");
+        assert!(fatal.terminal);
+
+        let dead_letter = FailureTransition::classify(3, 3, Some(99));
+        assert_eq!(dead_letter.task_status, "dead_lettered");
+        assert_eq!(dead_letter.run_status, "waiting");
+        assert_eq!(dead_letter.retry_at, None);
+        assert!(!dead_letter.terminal);
     }
 
     #[test]
@@ -2795,6 +3518,193 @@ mod tests {
         assert_eq!(events.events.len(), 3);
         assert_eq!(events.events[0].sequence, 1);
         assert_eq!(events.events[2].sequence, 3);
+
+        let recovery_run_id = RunId::from_bytes(ids(50));
+        let recovery_task_id = TaskId::from_bytes(ids(51));
+        let recovery_initial_event = EventId::from_bytes(ids(52));
+        executor
+            .create_run(
+                &mut client,
+                &command_context(tenant_id, ids(54), "create_run", &tenant_key, 54),
+                smoke_run(
+                    recovery_run_id,
+                    recovery_task_id,
+                    recovery_initial_event,
+                    CheckpointId::from_bytes(ids(53)),
+                    now_micros,
+                    "worker-recovery",
+                ),
+            )
+            .await
+            .expect("create worker recovery run");
+        let recovery_worker = WorkerId::from_bytes(ids(55));
+        let recovery_token = LeaseToken::from_bytes([56; 32]);
+        let recovery_claim = executor
+            .claim_task(
+                &mut client,
+                &command_context(tenant_id, ids(56), "claim_task", &tenant_key, 56),
+                ClaimTask {
+                    worker_id: recovery_worker,
+                    lease_token: recovery_token.clone(),
+                    lease_duration: DurationMicros::new(60_000_000),
+                    candidate_window: 8,
+                },
+            )
+            .await
+            .expect("claim worker recovery task")
+            .expect("worker recovery task is claimable");
+        let renew_context =
+            command_context(tenant_id, ids(57), "renew_task_lease", &tenant_key, 57);
+        let renewal = RenewTaskLease {
+            expected_run: ExpectedRun {
+                run_id: recovery_run_id,
+                version: Some(1),
+                execution_generation: Some(0),
+            },
+            lease: LeaseProof {
+                task_id: recovery_task_id,
+                worker_id: recovery_worker,
+                token: recovery_token.clone(),
+                execution_generation: 0,
+            },
+            extension: DurationMicros::new(30_000_000),
+        };
+        let renewed = executor
+            .renew_task_lease(&mut client, &renew_context, renewal.clone())
+            .await
+            .expect("renew task lease");
+        assert_eq!(
+            renewed.value.lease_expires_at.get(),
+            recovery_claim.value.lease_expires_at.get() + 30_000_000
+        );
+        let renewed_duplicate = executor
+            .renew_task_lease(&mut client, &renew_context, renewal)
+            .await
+            .expect("replay task lease renewal");
+        assert_eq!(renewed_duplicate.disposition, CommandDisposition::Duplicate);
+        assert_eq!(renewed_duplicate.value, renewed.value);
+
+        let fail_context = command_context(tenant_id, ids(58), "fail_task", &tenant_key, 58);
+        let retry_failure = FailTask {
+            expected_run: ExpectedRun {
+                run_id: recovery_run_id,
+                version: Some(1),
+                execution_generation: Some(0),
+            },
+            lease: LeaseProof {
+                task_id: recovery_task_id,
+                worker_id: recovery_worker,
+                token: recovery_token.clone(),
+                execution_generation: 0,
+            },
+            failure_event_id: EventId::from_bytes(ids(59)),
+            error_code: "transient_worker_error".to_owned(),
+            retry_at: Some(UnixMicros::new(now_micros)),
+        };
+        let retrying = executor
+            .fail_task(&mut client, &fail_context, retry_failure.clone())
+            .await
+            .expect("schedule task retry");
+        assert_eq!(retrying.value.status, RunStatus::Retrying);
+        assert_eq!(retrying.value.version, 2);
+        assert_eq!(retrying.durable_follow_ups.len(), 1);
+        let retry_duplicate = executor
+            .fail_task(&mut client, &fail_context, retry_failure)
+            .await
+            .expect("replay task failure");
+        assert_eq!(retry_duplicate.disposition, CommandDisposition::Duplicate);
+        assert_eq!(retry_duplicate.value, retrying.value);
+        let recovery_task_status: String = client
+            .query_one(
+                "SELECT status FROM agent_loom.tasks \
+                 WHERE tenant_id = $1 AND task_id = $2",
+                &[&tenant_uuid, &uuid(recovery_task_id.into_bytes())],
+            )
+            .await
+            .expect("query retry task")
+            .get(0);
+        assert_eq!(recovery_task_status, "retry_scheduled");
+        let stale_renewal = executor
+            .renew_task_lease(
+                &mut client,
+                &command_context(tenant_id, ids(69), "renew_task_lease", &tenant_key, 69),
+                RenewTaskLease {
+                    expected_run: ExpectedRun {
+                        run_id: recovery_run_id,
+                        version: Some(2),
+                        execution_generation: Some(0),
+                    },
+                    lease: LeaseProof {
+                        task_id: recovery_task_id,
+                        worker_id: recovery_worker,
+                        token: recovery_token,
+                        execution_generation: 0,
+                    },
+                    extension: DurationMicros::new(1_000_000),
+                },
+            )
+            .await
+            .expect_err("finalized lease cannot be renewed");
+        assert_eq!(stale_renewal.code, StoreErrorCode::LeaseLost);
+
+        let fatal_run_id = RunId::from_bytes(ids(60));
+        let fatal_task_id = TaskId::from_bytes(ids(61));
+        executor
+            .create_run(
+                &mut client,
+                &command_context(tenant_id, ids(64), "create_run", &tenant_key, 64),
+                smoke_run(
+                    fatal_run_id,
+                    fatal_task_id,
+                    EventId::from_bytes(ids(62)),
+                    CheckpointId::from_bytes(ids(63)),
+                    now_micros,
+                    "fatal-worker-failure",
+                ),
+            )
+            .await
+            .expect("create fatal failure run");
+        let fatal_worker = WorkerId::from_bytes(ids(65));
+        let fatal_token = LeaseToken::from_bytes([66; 32]);
+        executor
+            .claim_task(
+                &mut client,
+                &command_context(tenant_id, ids(66), "claim_task", &tenant_key, 66),
+                ClaimTask {
+                    worker_id: fatal_worker,
+                    lease_token: fatal_token.clone(),
+                    lease_duration: DurationMicros::new(60_000_000),
+                    candidate_window: 8,
+                },
+            )
+            .await
+            .expect("claim fatal failure task")
+            .expect("fatal failure task is claimable");
+        let failed = executor
+            .fail_task(
+                &mut client,
+                &command_context(tenant_id, ids(67), "fail_task", &tenant_key, 67),
+                FailTask {
+                    expected_run: ExpectedRun {
+                        run_id: fatal_run_id,
+                        version: Some(1),
+                        execution_generation: Some(0),
+                    },
+                    lease: LeaseProof {
+                        task_id: fatal_task_id,
+                        worker_id: fatal_worker,
+                        token: fatal_token,
+                        execution_generation: 0,
+                    },
+                    failure_event_id: EventId::from_bytes(ids(68)),
+                    error_code: "fatal_worker_error".to_owned(),
+                    retry_at: None,
+                },
+            )
+            .await
+            .expect("fail run from non-retryable task failure");
+        assert_eq!(failed.value.status, RunStatus::Failed);
+        assert!(failed.value.terminal_invariant_holds());
 
         let control_run_id = RunId::from_bytes(ids(12));
         let control_task_id = TaskId::from_bytes(ids(13));
