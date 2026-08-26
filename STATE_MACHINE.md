@@ -279,6 +279,8 @@ open → consumed
 8. 更新 Checkpoint 和 Run 投影；
 9. 提交事务。
 
+恢复 Task 的 ID、logical key、kind、重试上限和基础输入必须在创建 WaitSubscription 时一并持久化。事件事务只能实例化该计划，并把规范化事件 payload 作为恢复输入的一部分；不得由事件调用方临时指定任意 Task 或目标 Run 状态。
+
 两个事件竞争同一个 WaitSubscription 时只能有一个进入 `consumed`。失败者返回 `WAIT_ALREADY_CONSUMED`，相同幂等请求返回首次结果。
 
 Timer 过期与外部事件竞争时同样采用首个合法提交获胜：Timer 先提交则外部事件返回 `WAIT_EXPIRED`；外部事件先消费则 Timer no-op。

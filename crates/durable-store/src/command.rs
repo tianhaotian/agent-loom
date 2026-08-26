@@ -200,7 +200,19 @@ pub struct NewWaitSubscription {
     pub match_key_hash: Digest,
     pub match_contract: JsonPayload,
     pub expires_at: Option<UnixMicros>,
+    pub resume_task: WaitResumeTask,
     pub created_event_id: EventId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitResumeTask {
+    pub task_id: TaskId,
+    pub logical_key: LogicalKey,
+    pub kind: TaskKind,
+    pub priority: i32,
+    pub max_attempts: u32,
+    pub input: JsonPayload,
+    pub deadline: Option<UnixMicros>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,7 +287,9 @@ impl NextActions {
                 Some(CompletionShapeError::InvalidTaskMetadata)
             }
             Self::Wait(wait)
-                if wait.wait_type.is_empty() || wait.expected_event_type.is_empty() =>
+                if wait.wait_type.is_empty()
+                    || wait.expected_event_type.is_empty()
+                    || wait.resume_task.max_attempts == 0 =>
             {
                 Some(CompletionShapeError::InvalidWaitMetadata)
             }
@@ -316,9 +330,18 @@ pub struct ApplyEvent {
     pub expected_run: ExpectedRun,
     pub event_id: EventId,
     pub event_type: String,
+    pub match_key_hash: Digest,
     pub payload_schema_version: u32,
     pub payload: JsonPayload,
+    pub signature_verification: SignatureVerification,
     pub occurred_at: Option<UnixMicros>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignatureVerification {
+    Verified,
+    NotRequired,
+    Failed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -375,6 +398,15 @@ mod tests {
             match_key_hash: Digest::from_bytes([8; 32]),
             match_contract: json(),
             expires_at: None,
+            resume_task: WaitResumeTask {
+                task_id: TaskId::from_bytes([10; 16]),
+                logical_key: LogicalKey::parse("approval/resume").expect("logical key"),
+                kind: TaskKind::Model,
+                priority: 0,
+                max_attempts: 1,
+                input: json(),
+                deadline: None,
+            },
             created_event_id: command.completion_event_id,
         });
 

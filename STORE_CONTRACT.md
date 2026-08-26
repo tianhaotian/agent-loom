@@ -380,6 +380,28 @@ pub enum NextActions {
     FinishRun(FinalRunResult),
     NoFurtherWork,
 }
+
+pub struct NewWaitSubscription {
+    pub wait_id: WaitId,
+    pub stage_execution_id: Option<StageExecutionId>,
+    pub wait_type: String,
+    pub expected_event_type: String,
+    pub match_key_hash: Digest,
+    pub match_contract: RedactedJson,
+    pub expires_at: Option<Instant>,
+    pub resume_task: WaitResumeTask,
+    pub created_event_id: EventId,
+}
+
+pub struct WaitResumeTask {
+    pub task_id: TaskId,
+    pub logical_key: LogicalKey,
+    pub kind: TaskKind,
+    pub priority: i32,
+    pub max_attempts: u32,
+    pub input: RedactedJson,
+    pub deadline: Option<Instant>,
+}
 ```
 
 Provider 不执行 Agent 规划，但必须验证 `next` 与当前状态机兼容，例如：
@@ -393,18 +415,20 @@ Provider 不执行 Agent 规划，但必须验证 `next` 与当前状态机兼�
 
 ```rust
 pub struct ApplyEvent {
-    pub context: CommandContext,
-    pub run_id: RunId,
-    pub event_type: EventType,
+    pub expected_run: ExpectedRun,
+    pub event_id: EventId,
+    pub event_type: String,
     pub match_key_hash: Digest,
-    pub payload: RedactedJson,
     pub payload_schema_version: SchemaVersion,
-    pub signature_verification: VerificationResult,
+    pub payload: RedactedJson,
+    pub signature_verification: SignatureVerification,
     pub occurred_at: Option<Instant>,
 }
 ```
 
-Provider 必须匹配并消费 WaitSubscription。调用方不得直接指定任意下一状态或绕过等待契约。
+Provider 必须匹配并消费 WaitSubscription。恢复 Task 计划在 Wait 创建时持久化，调用方不得在事件到达时临时指定任意下一状态或绕过等待契约。签名校验失败的事件不得进入状态事务；`NotRequired` 只用于已经处于受信边界内的事件源。
+
+基础 `match_contract` 是可移植 JSON 对象：`required` 为 payload 必须包含的字段名数组，`equals` 为字段精确值约束。Provider 必须至少实现这两项；更复杂的 Schema 校验应在 Runtime 规范化层完成，并将稳定的校验结论随命令传入。
 
 ### 6.4 DueWork
 

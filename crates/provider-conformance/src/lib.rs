@@ -144,6 +144,19 @@ mod tests {
     }
 
     #[test]
+    fn wait_resume_plan_is_persisted_by_both_providers() {
+        for migrations in [postgres::MIGRATIONS, mysql::MIGRATIONS] {
+            let sql = migrations[7].sql;
+            assert!(sql.contains("resume_task_id"));
+            assert!(sql.contains("resume_logical_key"));
+            assert!(sql.contains("resume_task_kind"));
+            assert!(sql.contains("resume_max_attempts"));
+            assert!(sql.contains("resume_input_json"));
+            assert!(sql.contains("uq_waits__resume_task"));
+        }
+    }
+
+    #[test]
     fn artifact_versions_and_lineage_are_provider_equivalent() {
         for migrations in [postgres::MIGRATIONS, mysql::MIGRATIONS] {
             let sql = migrations[5].sql;

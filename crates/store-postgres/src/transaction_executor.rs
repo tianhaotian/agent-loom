@@ -4,10 +4,10 @@ use agent_loom_domain::{
     ToolExecutionId, UnixMicros, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
-    ClaimTask, ClaimedTask, CommandContext, CommandDisposition, Committed, CompleteTask,
-    CompletionShapeError, ControlRun, CreateRun, DurableFollowUp, ExpectedRun, FailTask,
-    InitialTask, LeaseProof, NewTask, NextActions, PostCommitHint, RenewTaskLease, StoreError,
-    StoreErrorCode, StoreResult,
+    ApplyEvent, ClaimTask, ClaimedTask, CommandContext, CommandDisposition, Committed,
+    CompleteTask, CompletionShapeError, ControlRun, CreateRun, DurableFollowUp, ExpectedRun,
+    FailTask, InitialTask, LeaseProof, NewTask, NextActions, PostCommitHint, RenewTaskLease,
+    SignatureVerification, StoreError, StoreErrorCode, StoreResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -133,9 +133,11 @@ impl PostgresTransactionExecutor {
                 sequence: 1,
                 event_type: "run.created",
                 payload: &input,
+                payload_schema_version: 1,
                 producer: "runtime",
                 context,
                 correlation_id,
+                occurred_at: None,
                 recorded_at: db_now,
             },
         )
@@ -386,9 +388,11 @@ impl PostgresTransactionExecutor {
                 sequence: row.next_event_sequence,
                 event_type: "task.claimed",
                 payload: &event_payload,
+                payload_schema_version: 1,
                 producer: "worker",
                 context,
                 correlation_id,
+                occurred_at: None,
                 recorded_at: db_now,
             },
         )
@@ -648,9 +652,11 @@ impl PostgresTransactionExecutor {
                 sequence: locked.next_event_sequence,
                 event_type: transition.event_type,
                 payload: &event_payload,
+                payload_schema_version: 1,
                 producer: "worker",
                 context,
                 correlation_id,
+                occurred_at: None,
                 recorded_at: db_now,
             },
         )
@@ -769,6 +775,220 @@ impl PostgresTransactionExecutor {
         ))
     }
 
+    /// Matches and consumes one Wait, appends the external Event, creates the
+    /// persisted resume Task, and advances the Run projection in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable store error for failed signature verification, stale
+    /// expectations, missing/ambiguous/consumed/expired waits, terminal Runs,
+    /// idempotency misuse, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn apply_event(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: ApplyEvent,
+    ) -> StoreResult<Committed<RunSnapshot>> {
+        validate_apply_event(&command)?;
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        match acquire_receipt(
+            &transaction,
+            context,
+            db_now,
+            self.config.receipt_ttl_micros,
+        )
+        .await?
+        {
+            ReceiptGuard::Existing(receipt) => {
+                let snapshot = decode_run_receipt(context.tenant_id, &receipt.outcome)?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(event_committed(
+                    CommandDisposition::Duplicate,
+                    snapshot,
+                    receipt.event_id.map(event_id),
+                    None,
+                ));
+            }
+            ReceiptGuard::Acquired => {}
+        }
+
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_id = uuid(command.expected_run.run_id.into_bytes());
+        let match_hash = command.match_key_hash.as_bytes().as_slice();
+        let candidate = find_wait_candidate(
+            &transaction,
+            tenant_id,
+            run_id,
+            &command.event_type,
+            match_hash,
+        )
+        .await?;
+        let locked_run = lock_event_run(&transaction, tenant_id, run_id).await?;
+        validate_event_run(&command.expected_run, &locked_run, db_now)?;
+        let Some(candidate) = candidate else {
+            return Err(classify_wait_miss(
+                &transaction,
+                tenant_id,
+                run_id,
+                &command.event_type,
+                match_hash,
+                db_now,
+            )
+            .await?);
+        };
+        if let Some(stage_id) = candidate.stage_execution_id {
+            lock_event_stage(&transaction, tenant_id, run_id, stage_id).await?;
+        }
+        let wait = lock_wait(&transaction, tenant_id, run_id, candidate.wait_id).await?;
+        validate_locked_wait(&command, &wait, db_now)?;
+
+        let event_id = uuid(command.event_id.into_bytes());
+        let correlation_id = uuid(context.correlation_id.into_bytes());
+        let payload = json_value(&command.payload)?;
+        let payload_schema_version = i64::from(command.payload_schema_version);
+        let producer = match command.signature_verification {
+            SignatureVerification::Verified => "external-verified",
+            SignatureVerification::NotRequired => "external-trusted",
+            SignatureVerification::Failed => unreachable!("validated above"),
+        };
+        insert_event(
+            &transaction,
+            EventInsert {
+                event_id,
+                tenant_id,
+                run_id,
+                sequence: locked_run.next_event_sequence,
+                event_type: &command.event_type,
+                payload: &payload,
+                payload_schema_version,
+                producer,
+                context,
+                correlation_id,
+                occurred_at: command.occurred_at.map(UnixMicros::get),
+                recorded_at: db_now,
+            },
+        )
+        .await?;
+        consume_wait(&transaction, tenant_id, wait.wait_id, event_id, db_now).await?;
+        reactivate_waiting_stage(
+            &transaction,
+            tenant_id,
+            run_id,
+            wait.stage_execution_id,
+            &wait.wait_type,
+            db_now,
+        )
+        .await?;
+        let checkpoint_sequence = locked_run
+            .checkpoint_sequence
+            .ok_or_else(|| inconsistent("waiting run has no current checkpoint"))?;
+        let paused = locked_run.status == "paused";
+        insert_wait_resume_task(
+            &transaction,
+            tenant_id,
+            run_id,
+            event_id,
+            db_now,
+            locked_run.execution_generation,
+            checkpoint_sequence,
+            &wait,
+            &command,
+            paused,
+        )
+        .await?;
+        let target_status = if paused {
+            "paused"
+        } else if run_has_leased_task(&transaction, tenant_id, run_id).await? {
+            "running"
+        } else {
+            "queued"
+        };
+        let next_version = locked_run
+            .version
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("run version overflow"))?;
+        let next_event_sequence = locked_run
+            .next_event_sequence
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("run event sequence overflow"))?;
+        let updated = transaction
+            .execute(
+                "UPDATE agent_loom.runs SET status = $5, \
+                    suspended_from_status = CASE WHEN $5 = 'paused' \
+                        THEN suspended_from_status ELSE NULL END, \
+                    version = $6, next_event_sequence = $7, \
+                    updated_at = to_timestamp(($8::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND run_id = $2 AND version = $3 \
+                   AND execution_generation = $4 \
+                   AND status NOT IN ('completed', 'failed', 'cancelled', 'timed_out')",
+                &[
+                    &tenant_id,
+                    &run_id,
+                    &locked_run.version,
+                    &locked_run.execution_generation,
+                    &target_status,
+                    &next_version,
+                    &next_event_sequence,
+                    &db_now,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if updated != 1 {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "run changed while applying the event",
+            ));
+        }
+
+        let snapshot = RunSnapshot {
+            tenant_id: context.tenant_id,
+            run_id: command.expected_run.run_id,
+            workflow_version_id: locked_run.workflow_version_id.map(workflow_id_from_uuid),
+            status: parse_run_status(target_status)?,
+            suspended_from_status: if paused {
+                locked_run
+                    .suspended_from_status
+                    .as_deref()
+                    .map(parse_run_status)
+                    .transpose()?
+            } else {
+                None
+            },
+            version: nonnegative_u64(next_version, "run version")?,
+            execution_generation: nonnegative_u64(
+                locked_run.execution_generation,
+                "execution generation",
+            )?,
+            next_event_sequence: nonnegative_u64(next_event_sequence, "event sequence")?,
+            current_checkpoint_id: locked_run
+                .current_checkpoint_id
+                .map(|id| CheckpointId::from_bytes(id.into_bytes())),
+            terminal_event_id: None,
+            deadline: locked_run.deadline.map(UnixMicros::new),
+            updated_at: UnixMicros::new(db_now),
+        };
+        let outcome = encode_run_receipt(&snapshot)?;
+        finish_receipt(
+            &transaction,
+            context,
+            "applied",
+            &outcome,
+            Some(event_id),
+            Some(("run", run_id, next_version)),
+        )
+        .await?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(event_committed(
+            CommandDisposition::Applied,
+            snapshot,
+            Some(command.event_id),
+            (!paused).then_some(wait.resume_task_id),
+        ))
+    }
+
     /// Atomically validates the lease and Run fence, appends the completion
     /// Event and Checkpoint, finalizes the Task, applies stage/artifact writes,
     /// schedules the next action, and advances the Run projection.
@@ -853,9 +1073,11 @@ impl PostgresTransactionExecutor {
                 sequence: locked.next_event_sequence,
                 event_type: "task.completed",
                 payload: &event_payload,
+                payload_schema_version: 1,
                 producer: "worker",
                 context,
                 correlation_id,
+                occurred_at: None,
                 recorded_at: db_now,
             },
         )
@@ -1458,6 +1680,485 @@ async fn close_work_after_fatal_failure(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+struct WaitCandidate {
+    wait_id: Uuid,
+    stage_execution_id: Option<Uuid>,
+}
+
+#[derive(Debug)]
+struct LockedEventRun {
+    status: String,
+    suspended_from_status: Option<String>,
+    version: i64,
+    execution_generation: i64,
+    next_event_sequence: i64,
+    workflow_version_id: Option<Uuid>,
+    current_checkpoint_id: Option<Uuid>,
+    checkpoint_sequence: Option<i64>,
+    deadline: Option<i64>,
+}
+
+#[derive(Debug)]
+struct LockedWait {
+    wait_id: Uuid,
+    stage_execution_id: Option<Uuid>,
+    wait_type: String,
+    expected_event_type: String,
+    match_key_hash: Vec<u8>,
+    match_contract: Value,
+    status: String,
+    expires_at: Option<i64>,
+    resume_task_id: TaskId,
+    resume_logical_key: String,
+    resume_task_kind: String,
+    resume_priority: i32,
+    resume_max_attempts: i64,
+    resume_input: Value,
+    resume_deadline: Option<i64>,
+}
+
+fn validate_apply_event(command: &ApplyEvent) -> StoreResult<()> {
+    if command.event_type.is_empty() || command.payload_schema_version == 0 {
+        return Err(invalid_command(
+            "external event type and payload schema version must be present",
+        ));
+    }
+    if command.signature_verification == SignatureVerification::Failed {
+        return Err(invalid_command(
+            "external event signature verification failed",
+        ));
+    }
+    Ok(())
+}
+
+async fn find_wait_candidate(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    event_type: &str,
+    match_key_hash: &[u8],
+) -> StoreResult<Option<WaitCandidate>> {
+    let rows = transaction
+        .query(
+            "SELECT wait_id, stage_execution_id \
+             FROM agent_loom.wait_subscriptions \
+             WHERE tenant_id = $1 AND run_id = $2 AND status = 'open' \
+               AND expected_event_type = $3 AND match_key_hash = $4 \
+             ORDER BY wait_id LIMIT 2",
+            &[&tenant_id, &run_id, &event_type, &match_key_hash],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if rows.len() > 1 {
+        return Err(store_error(
+            StoreErrorCode::WaitMismatch,
+            "external event matches more than one open wait",
+        ));
+    }
+    Ok(rows.first().map(|row| WaitCandidate {
+        wait_id: row.get(0),
+        stage_execution_id: row.get(1),
+    }))
+}
+
+async fn lock_event_run(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+) -> StoreResult<LockedEventRun> {
+    let row = transaction
+        .query_opt(
+            "SELECT r.status, r.suspended_from_status, r.version, r.execution_generation, \
+                    r.next_event_sequence, r.workflow_version_id, r.current_checkpoint_id, \
+                    c.sequence, CASE WHEN r.deadline IS NULL THEN NULL \
+                        ELSE (extract(epoch FROM r.deadline) * 1000000)::bigint END \
+             FROM agent_loom.runs r \
+             LEFT JOIN agent_loom.checkpoints c ON c.tenant_id = r.tenant_id \
+                AND c.run_id = r.run_id AND c.checkpoint_id = r.current_checkpoint_id \
+             WHERE r.tenant_id = $1 AND r.run_id = $2 FOR UPDATE OF r",
+            &[&tenant_id, &run_id],
+        )
+        .await
+        .map_err(map_database_error)?
+        .ok_or_else(|| store_error(StoreErrorCode::NotFound, "run was not found"))?;
+    Ok(LockedEventRun {
+        status: row.get(0),
+        suspended_from_status: row.get(1),
+        version: row.get(2),
+        execution_generation: row.get(3),
+        next_event_sequence: row.get(4),
+        workflow_version_id: row.get(5),
+        current_checkpoint_id: row.get(6),
+        checkpoint_sequence: row.get(7),
+        deadline: row.get(8),
+    })
+}
+
+fn validate_event_run(
+    expected: &ExpectedRun,
+    locked: &LockedEventRun,
+    db_now: i64,
+) -> StoreResult<()> {
+    if matches!(
+        locked.status.as_str(),
+        "completed" | "failed" | "cancelled" | "timed_out"
+    ) {
+        return Err(store_error(StoreErrorCode::TerminalRun, "run is terminal"));
+    }
+    if expected
+        .version
+        .is_some_and(|value| i64::try_from(value).ok() != Some(locked.version))
+        || expected
+            .execution_generation
+            .is_some_and(|value| i64::try_from(value).ok() != Some(locked.execution_generation))
+    {
+        return Err(store_error(
+            StoreErrorCode::VersionConflict,
+            "run expectation changed",
+        ));
+    }
+    if locked.deadline.is_some_and(|deadline| deadline <= db_now) {
+        return Err(store_error(
+            StoreErrorCode::DeadlineExceeded,
+            "run deadline has elapsed",
+        ));
+    }
+    Ok(())
+}
+
+async fn classify_wait_miss(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    event_type: &str,
+    match_key_hash: &[u8],
+    db_now: i64,
+) -> StoreResult<StoreError> {
+    let row = transaction
+        .query_opt(
+            "SELECT status, CASE WHEN expires_at IS NULL THEN NULL \
+                    ELSE (extract(epoch FROM expires_at) * 1000000)::bigint END \
+             FROM agent_loom.wait_subscriptions \
+             WHERE tenant_id = $1 AND run_id = $2 AND expected_event_type = $3 \
+               AND match_key_hash = $4 \
+             ORDER BY updated_at DESC, wait_id LIMIT 1",
+            &[&tenant_id, &run_id, &event_type, &match_key_hash],
+        )
+        .await
+        .map_err(map_database_error)?;
+    let Some(row) = row else {
+        return Ok(store_error(
+            StoreErrorCode::WaitMismatch,
+            "external event does not match an open wait",
+        ));
+    };
+    let status: &str = row.get(0);
+    let expires_at: Option<i64> = row.get(1);
+    Ok(match status {
+        "consumed" => store_error(
+            StoreErrorCode::WaitAlreadyConsumed,
+            "matching wait was already consumed",
+        ),
+        "expired" => store_error(StoreErrorCode::WaitExpired, "matching wait expired"),
+        "open" if expires_at.is_some_and(|expires| expires <= db_now) => {
+            store_error(StoreErrorCode::WaitExpired, "matching wait expired")
+        }
+        "cancelled" => store_error(StoreErrorCode::WaitMismatch, "matching wait was cancelled"),
+        _ => inconsistent("open wait candidate scan disagrees with wait history"),
+    })
+}
+
+async fn lock_event_stage(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    stage_execution_id: Uuid,
+) -> StoreResult<()> {
+    transaction
+        .query_opt(
+            "SELECT stage_execution_id FROM agent_loom.stage_executions \
+             WHERE tenant_id = $1 AND run_id = $2 AND stage_execution_id = $3 FOR UPDATE",
+            &[&tenant_id, &run_id, &stage_execution_id],
+        )
+        .await
+        .map_err(map_database_error)?
+        .ok_or_else(|| inconsistent("wait references a missing stage"))?;
+    Ok(())
+}
+
+async fn lock_wait(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    wait_id: Uuid,
+) -> StoreResult<LockedWait> {
+    let row = transaction
+        .query_opt(
+            "SELECT wait_id, stage_execution_id, wait_type, expected_event_type, \
+                    match_key_hash, match_contract_json, status, \
+                    CASE WHEN expires_at IS NULL THEN NULL \
+                        ELSE (extract(epoch FROM expires_at) * 1000000)::bigint END, \
+                    resume_task_id, resume_logical_key, resume_task_kind, resume_priority, \
+                    resume_max_attempts, resume_input_json, \
+                    CASE WHEN resume_deadline IS NULL THEN NULL \
+                        ELSE (extract(epoch FROM resume_deadline) * 1000000)::bigint END \
+             FROM agent_loom.wait_subscriptions \
+             WHERE tenant_id = $1 AND run_id = $2 AND wait_id = $3 FOR UPDATE",
+            &[&tenant_id, &run_id, &wait_id],
+        )
+        .await
+        .map_err(map_database_error)?
+        .ok_or_else(|| inconsistent("wait candidate disappeared"))?;
+    Ok(LockedWait {
+        wait_id: row.get(0),
+        stage_execution_id: row.get(1),
+        wait_type: row.get(2),
+        expected_event_type: row.get(3),
+        match_key_hash: row.get(4),
+        match_contract: row.get(5),
+        status: row.get(6),
+        expires_at: row.get(7),
+        resume_task_id: task_id_from_uuid(row.get(8)),
+        resume_logical_key: row.get(9),
+        resume_task_kind: row.get(10),
+        resume_priority: row.get(11),
+        resume_max_attempts: row.get(12),
+        resume_input: row.get(13),
+        resume_deadline: row.get(14),
+    })
+}
+
+fn validate_locked_wait(command: &ApplyEvent, wait: &LockedWait, db_now: i64) -> StoreResult<()> {
+    if wait.status != "open" {
+        return Err(match wait.status.as_str() {
+            "consumed" => store_error(
+                StoreErrorCode::WaitAlreadyConsumed,
+                "matching wait was already consumed",
+            ),
+            "expired" => store_error(StoreErrorCode::WaitExpired, "matching wait expired"),
+            _ => store_error(StoreErrorCode::WaitMismatch, "matching wait is not open"),
+        });
+    }
+    if wait.expected_event_type != command.event_type
+        || wait.match_key_hash.as_slice() != command.match_key_hash.as_bytes().as_slice()
+    {
+        return Err(store_error(
+            StoreErrorCode::WaitMismatch,
+            "external event no longer matches the locked wait",
+        ));
+    }
+    if wait.expires_at.is_some_and(|expires| expires <= db_now) {
+        return Err(store_error(
+            StoreErrorCode::WaitExpired,
+            "matching wait expired",
+        ));
+    }
+    if wait
+        .resume_deadline
+        .is_some_and(|deadline| deadline <= db_now)
+    {
+        return Err(store_error(
+            StoreErrorCode::DeadlineExceeded,
+            "wait resume task deadline has elapsed",
+        ));
+    }
+    positive_u32(wait.resume_max_attempts, "wait resume max attempts")?;
+    LogicalKey::parse(wait.resume_logical_key.clone())
+        .map_err(|_| inconsistent("wait contains an invalid resume task logical key"))?;
+    parse_task_kind(&wait.resume_task_kind)?;
+    validate_match_contract(&wait.match_contract, &json_value(&command.payload)?)?;
+    Ok(())
+}
+
+fn validate_match_contract(contract: &Value, payload: &Value) -> StoreResult<()> {
+    let contract = contract
+        .as_object()
+        .ok_or_else(|| inconsistent("wait match contract is not a JSON object"))?;
+    if let Some(required) = contract.get("required") {
+        let required = required
+            .as_array()
+            .ok_or_else(|| inconsistent("wait required contract is not an array"))?;
+        let payload = payload.as_object().ok_or_else(|| {
+            store_error(
+                StoreErrorCode::WaitMismatch,
+                "event payload does not satisfy the wait contract",
+            )
+        })?;
+        for field in required {
+            let field = field
+                .as_str()
+                .ok_or_else(|| inconsistent("wait required contract contains a non-string"))?;
+            if !payload.contains_key(field) {
+                return Err(store_error(
+                    StoreErrorCode::WaitMismatch,
+                    "event payload does not satisfy the wait contract",
+                ));
+            }
+        }
+    }
+    if let Some(equals) = contract.get("equals") {
+        let equals = equals
+            .as_object()
+            .ok_or_else(|| inconsistent("wait equals contract is not an object"))?;
+        let payload = payload.as_object().ok_or_else(|| {
+            store_error(
+                StoreErrorCode::WaitMismatch,
+                "event payload does not satisfy the wait contract",
+            )
+        })?;
+        if equals
+            .iter()
+            .any(|(key, expected)| payload.get(key) != Some(expected))
+        {
+            return Err(store_error(
+                StoreErrorCode::WaitMismatch,
+                "event payload does not satisfy the wait contract",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn consume_wait(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    wait_id: Uuid,
+    event_id: Uuid,
+    db_now: i64,
+) -> StoreResult<()> {
+    let updated = transaction
+        .execute(
+            "UPDATE agent_loom.wait_subscriptions SET status = 'consumed', active_slot = NULL, \
+                consumed_by_event_id = $3, \
+                consumed_at = to_timestamp(($4::bigint)::double precision / 1000000.0), \
+                updated_at = to_timestamp(($4::bigint)::double precision / 1000000.0) \
+             WHERE tenant_id = $1 AND wait_id = $2 AND status = 'open'",
+            &[&tenant_id, &wait_id, &event_id, &db_now],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if updated != 1 {
+        return Err(store_error(
+            StoreErrorCode::WaitAlreadyConsumed,
+            "matching wait was consumed concurrently",
+        ));
+    }
+    Ok(())
+}
+
+async fn reactivate_waiting_stage(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    stage_execution_id: Option<Uuid>,
+    wait_type: &str,
+    db_now: i64,
+) -> StoreResult<()> {
+    let Some(stage_execution_id) = stage_execution_id else {
+        return Ok(());
+    };
+    if wait_type != "approval" {
+        return Ok(());
+    }
+    let updated = transaction
+        .execute(
+            "UPDATE agent_loom.stage_executions SET status = 'active', version = version + 1, \
+                updated_at = to_timestamp(($4::bigint)::double precision / 1000000.0) \
+             WHERE tenant_id = $1 AND run_id = $2 AND stage_execution_id = $3 \
+               AND status = 'waiting_approval'",
+            &[&tenant_id, &run_id, &stage_execution_id, &db_now],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if updated != 1 {
+        return Err(store_error(
+            StoreErrorCode::InvalidTransition,
+            "approval wait stage is not waiting for approval",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_wait_resume_task(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    event_id: Uuid,
+    db_now: i64,
+    generation: i64,
+    checkpoint_sequence: i64,
+    wait: &LockedWait,
+    command: &ApplyEvent,
+    paused: bool,
+) -> StoreResult<()> {
+    let task_id = uuid(wait.resume_task_id.into_bytes());
+    let status = if paused { "scheduled" } else { "queued" };
+    let max_attempts = wait.resume_max_attempts;
+    let input = json!({
+        "wait_id": wait.wait_id,
+        "event_id": uuid(command.event_id.into_bytes()),
+        "event_type": &command.event_type,
+        "event_payload": json_value(&command.payload)?,
+        "resume_input": &wait.resume_input,
+    });
+    let inserted = transaction
+        .execute(
+            "INSERT INTO agent_loom.tasks (\
+                task_id, tenant_id, run_id, stage_execution_id, logical_key, kind, status, \
+                generation, based_on_checkpoint_sequence, priority, available_at, attempt, \
+                max_attempts, lease_owner, lease_token, lease_expires_at, input_json, \
+                result_json, error_code, error_json, deadline, created_event_id, created_at, \
+                updated_at, completed_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                to_timestamp(($11::bigint)::double precision / 1000000.0), 0, $12, \
+                NULL, NULL, NULL, $13, NULL, NULL, NULL, \
+                to_timestamp(($14::bigint)::double precision / 1000000.0), $15, \
+                to_timestamp(($11::bigint)::double precision / 1000000.0), \
+                to_timestamp(($11::bigint)::double precision / 1000000.0), NULL)",
+            &[
+                &task_id,
+                &tenant_id,
+                &run_id,
+                &wait.stage_execution_id,
+                &wait.resume_logical_key,
+                &wait.resume_task_kind,
+                &status,
+                &generation,
+                &checkpoint_sequence,
+                &wait.resume_priority,
+                &db_now,
+                &max_attempts,
+                &input,
+                &wait.resume_deadline,
+                &event_id,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if inserted != 1 {
+        return Err(inconsistent("resume task insert did not affect one row"));
+    }
+    Ok(())
+}
+
+async fn run_has_leased_task(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+) -> StoreResult<bool> {
+    transaction
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM agent_loom.tasks \
+             WHERE tenant_id = $1 AND run_id = $2 AND status = 'leased')",
+            &[&tenant_id, &run_id],
+        )
+        .await
+        .map(|row| row.get(0))
+        .map_err(map_database_error)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlKind {
     Pause,
@@ -1686,9 +2387,11 @@ async fn execute_control(
             sequence: locked.next_event_sequence_i64,
             event_type: kind.event_type(),
             payload: &event_payload,
+            payload_schema_version: 1,
             producer: "control-plane",
             context,
             correlation_id,
+            occurred_at: None,
             recorded_at: db_now,
         },
     )
@@ -1890,8 +2593,10 @@ async fn rebase_preserved_tasks(
                         to_timestamp(($4::bigint)::double precision / 1000000.0) \
                     THEN 'queued' ELSE status END, \
                 updated_at = to_timestamp(($4::bigint)::double precision / 1000000.0) \
-             WHERE tenant_id = $1 AND run_id = $2 AND generation <> $3 \
-               AND status IN ('scheduled', 'queued', 'retry_scheduled')",
+             WHERE tenant_id = $1 AND run_id = $2 \
+               AND status IN ('scheduled', 'queued', 'retry_scheduled') \
+               AND (generation <> $3 OR (status = 'scheduled' AND available_at <= \
+                    to_timestamp(($4::bigint)::double precision / 1000000.0)))",
             &[&tenant_id, &run_id, &generation, &db_now],
         )
         .await
@@ -2243,9 +2948,11 @@ struct EventInsert<'a> {
     sequence: i64,
     event_type: &'a str,
     payload: &'a Value,
+    payload_schema_version: i64,
     producer: &'a str,
     context: &'a CommandContext,
     correlation_id: Uuid,
+    occurred_at: Option<i64>,
     recorded_at: i64,
 }
 
@@ -2256,8 +2963,9 @@ async fn insert_event(transaction: &Transaction<'_>, event: EventInsert<'_>) -> 
                 event_id, tenant_id, run_id, sequence, event_type, payload_json, \
                 payload_schema_version, producer, actor_ref, correlation_id, causation_id, \
                 idempotency_key, occurred_at, recorded_at\
-             ) VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $9, NULL, $10, NULL, \
-                to_timestamp(($11::bigint)::double precision / 1000000.0))",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, \
+                to_timestamp(($12::bigint)::double precision / 1000000.0), \
+                to_timestamp(($13::bigint)::double precision / 1000000.0))",
             &[
                 &event.event_id,
                 &event.tenant_id,
@@ -2265,10 +2973,12 @@ async fn insert_event(transaction: &Transaction<'_>, event: EventInsert<'_>) -> 
                 &event.sequence,
                 &event.event_type,
                 &event.payload,
+                &event.payload_schema_version,
                 &event.producer,
                 &event.context.actor_ref,
                 &event.correlation_id,
                 &event.context.idempotency_key.as_str(),
+                &event.occurred_at,
                 &event.recorded_at,
             ],
         )
@@ -2678,6 +3388,7 @@ struct NextTransition {
     follow_ups: Vec<DurableFollowUp>,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn apply_next_actions(
     transaction: &Transaction<'_>,
     tenant_id: Uuid,
@@ -2736,17 +3447,26 @@ async fn apply_next_actions(
             let match_hash = wait.match_key_hash.as_bytes().as_slice();
             let contract = json_value(&wait.match_contract)?;
             let expires_at = wait.expires_at.map(UnixMicros::get);
+            let resume_task_id = uuid(wait.resume_task.task_id.into_bytes());
+            let resume_task_kind = task_kind(wait.resume_task.kind);
+            let resume_max_attempts = i64::from(wait.resume_task.max_attempts);
+            let resume_input = json_value(&wait.resume_task.input)?;
+            let resume_deadline = wait.resume_task.deadline.map(UnixMicros::get);
             transaction
                 .execute(
                     "INSERT INTO agent_loom.wait_subscriptions (\
                         wait_id, tenant_id, run_id, stage_execution_id, wait_type, \
                         expected_event_type, match_key_hash, match_contract_json, status, \
                         active_slot, expires_at, consumed_by_event_id, created_event_id, \
-                        created_at, consumed_at, updated_at\
+                        created_at, consumed_at, updated_at, resume_task_id, \
+                        resume_logical_key, resume_task_kind, resume_priority, \
+                        resume_max_attempts, resume_input_json, resume_deadline\
                      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', 1, \
                         to_timestamp(($9::bigint)::double precision / 1000000.0), NULL, $10, \
                         to_timestamp(($11::bigint)::double precision / 1000000.0), NULL, \
-                        to_timestamp(($11::bigint)::double precision / 1000000.0))",
+                        to_timestamp(($11::bigint)::double precision / 1000000.0), \
+                        $12, $13, $14, $15, $16, $17, \
+                        to_timestamp(($18::bigint)::double precision / 1000000.0))",
                     &[
                         &wait_id,
                         &tenant_id,
@@ -2759,6 +3479,13 @@ async fn apply_next_actions(
                         &expires_at,
                         &event_id,
                         &db_now,
+                        &resume_task_id,
+                        &wait.resume_task.logical_key.as_str(),
+                        &resume_task_kind,
+                        &wait.resume_task.priority,
+                        &resume_max_attempts,
+                        &resume_input,
+                        &resume_deadline,
                     ],
                 )
                 .await
@@ -3084,6 +3811,32 @@ fn failure_committed(
     }
 }
 
+fn event_committed(
+    disposition: CommandDisposition,
+    snapshot: RunSnapshot,
+    event_id: Option<EventId>,
+    resume_task_id: Option<TaskId>,
+) -> Committed<RunSnapshot> {
+    let run_id = snapshot.run_id;
+    let mut post_commit_hints = vec![
+        PostCommitHint::RunEventsAvailable { run_id },
+        PostCommitHint::InvalidateRunCache { run_id },
+    ];
+    if resume_task_id.is_some() {
+        post_commit_hints.push(PostCommitHint::WakeWorkers);
+    }
+    Committed {
+        disposition,
+        value: snapshot,
+        event_ids: event_id.into_iter().collect(),
+        durable_follow_ups: resume_task_id
+            .map(|task_id| DurableFollowUp::Task { task_id })
+            .into_iter()
+            .collect(),
+        post_commit_hints,
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct RunReceipt {
     #[serde(rename = "type")]
@@ -3232,8 +3985,8 @@ mod tests {
         WorkerId,
     };
     use agent_loom_durable_store::{
-        EventCursor, ExpectedRun, FinalRunResult, LeaseProof, NewCheckpoint, QueryContext,
-        TaskResult,
+        EventCursor, ExpectedRun, FinalRunResult, LeaseProof, NewCheckpoint, NewWaitSubscription,
+        QueryContext, TaskResult, WaitResumeTask,
     };
 
     use super::*;
@@ -3292,6 +4045,56 @@ mod tests {
         assert_eq!(dead_letter.run_status, "waiting");
         assert_eq!(dead_letter.retry_at, None);
         assert!(!dead_letter.terminal);
+    }
+
+    #[test]
+    fn external_event_rejects_failed_verification_and_missing_schema() {
+        let mut command = ApplyEvent {
+            expected_run: ExpectedRun {
+                run_id: RunId::from_bytes([1; 16]),
+                version: None,
+                execution_generation: None,
+            },
+            event_id: EventId::from_bytes([2; 16]),
+            event_type: "approval.granted".to_owned(),
+            match_key_hash: Digest::from_bytes([3; 32]),
+            payload_schema_version: 1,
+            payload: payload(&json!({"approved": true})),
+            signature_verification: SignatureVerification::Failed,
+            occurred_at: None,
+        };
+        assert_eq!(
+            validate_apply_event(&command)
+                .expect_err("failed signature is rejected")
+                .code,
+            StoreErrorCode::ConstraintViolation
+        );
+        command.signature_verification = SignatureVerification::Verified;
+        command.payload_schema_version = 0;
+        assert_eq!(
+            validate_apply_event(&command)
+                .expect_err("missing schema is rejected")
+                .code,
+            StoreErrorCode::ConstraintViolation
+        );
+    }
+
+    #[test]
+    fn wait_match_contract_checks_required_and_equal_fields() {
+        let contract = json!({
+            "required": ["approved", "reviewer"],
+            "equals": {"approved": true}
+        });
+        assert_eq!(
+            validate_match_contract(&contract, &json!({"approved": true, "reviewer": "alice"})),
+            Ok(())
+        );
+        assert_eq!(
+            validate_match_contract(&contract, &json!({"approved": false}))
+                .expect_err("mismatched payload is rejected")
+                .code,
+            StoreErrorCode::WaitMismatch
+        );
     }
 
     #[test]
@@ -3705,6 +4508,240 @@ mod tests {
             .expect("fail run from non-retryable task failure");
         assert_eq!(failed.value.status, RunStatus::Failed);
         assert!(failed.value.terminal_invariant_holds());
+
+        let wait_run_id = RunId::from_bytes(ids(70));
+        let wait_task_id = TaskId::from_bytes(ids(71));
+        executor
+            .create_run(
+                &mut client,
+                &command_context(tenant_id, ids(74), "create_run", &tenant_key, 74),
+                smoke_run(
+                    wait_run_id,
+                    wait_task_id,
+                    EventId::from_bytes(ids(72)),
+                    CheckpointId::from_bytes(ids(73)),
+                    now_micros,
+                    "approval-wait",
+                ),
+            )
+            .await
+            .expect("create approval wait run");
+        let wait_worker = WorkerId::from_bytes(ids(75));
+        let wait_token = LeaseToken::from_bytes([76; 32]);
+        executor
+            .claim_task(
+                &mut client,
+                &command_context(tenant_id, ids(76), "claim_task", &tenant_key, 76),
+                ClaimTask {
+                    worker_id: wait_worker,
+                    lease_token: wait_token.clone(),
+                    lease_duration: DurationMicros::new(60_000_000),
+                    candidate_window: 8,
+                },
+            )
+            .await
+            .expect("claim approval wait task")
+            .expect("approval wait task is claimable");
+        let wait_completion_event = EventId::from_bytes(ids(77));
+        let match_key_hash = Digest::from_bytes([81; 32]);
+        let resume_task_id = TaskId::from_bytes(ids(82));
+        let waiting = executor
+            .complete_task(
+                &mut client,
+                &command_context(tenant_id, ids(79), "complete_task", &tenant_key, 79),
+                CompleteTask {
+                    expected_run: ExpectedRun {
+                        run_id: wait_run_id,
+                        version: Some(1),
+                        execution_generation: Some(0),
+                    },
+                    lease: LeaseProof {
+                        task_id: wait_task_id,
+                        worker_id: wait_worker,
+                        token: wait_token,
+                        execution_generation: 0,
+                    },
+                    completion_event_id: wait_completion_event,
+                    checkpoint: NewCheckpoint {
+                        checkpoint_id: CheckpointId::from_bytes(ids(78)),
+                        sequence: 2,
+                        schema_version: 1,
+                        workflow_version_id: None,
+                        coordinator_agent_version_id: None,
+                        execution_generation: 0,
+                        state: payload(&json!({"waiting_for": "approval"})),
+                        state_digest: Digest::from_bytes([78; 32]),
+                        created_event_id: wait_completion_event,
+                    },
+                    task_result: TaskResult {
+                        output: payload(&json!({"proposal": "ready"})),
+                    },
+                    stage_mutation: None,
+                    artifacts: Vec::new(),
+                    next: NextActions::Wait(NewWaitSubscription {
+                        wait_id: agent_loom_domain::WaitId::from_bytes(ids(80)),
+                        stage_execution_id: None,
+                        wait_type: "approval".to_owned(),
+                        expected_event_type: "approval.granted".to_owned(),
+                        match_key_hash,
+                        match_contract: payload(&json!({"required": ["approved"]})),
+                        expires_at: None,
+                        resume_task: WaitResumeTask {
+                            task_id: resume_task_id,
+                            logical_key: LogicalKey::parse("smoke/approval-resume")
+                                .expect("logical key"),
+                            kind: TaskKind::Model,
+                            priority: 10,
+                            max_attempts: 2,
+                            input: payload(&json!({"instruction": "continue delivery"})),
+                            deadline: None,
+                        },
+                        created_event_id: wait_completion_event,
+                    }),
+                },
+            )
+            .await
+            .expect("enter approval wait");
+        assert_eq!(waiting.value.status, RunStatus::ApprovalRequired);
+
+        let paused_wait_run = executor
+            .pause_run(
+                &mut client,
+                &command_context(tenant_id, ids(91), "pause_run", &tenant_key, 91),
+                ControlRun {
+                    expected_run: ExpectedRun {
+                        run_id: wait_run_id,
+                        version: Some(2),
+                        execution_generation: Some(0),
+                    },
+                    event_id: EventId::from_bytes(ids(92)),
+                    reason: "pause while awaiting approval".to_owned(),
+                },
+            )
+            .await
+            .expect("pause approval wait run");
+        assert_eq!(paused_wait_run.value.status, RunStatus::Paused);
+        assert_eq!(paused_wait_run.value.execution_generation, 1);
+
+        let apply_context = command_context(tenant_id, ids(83), "apply_event", &tenant_key, 83);
+        let external_event = ApplyEvent {
+            expected_run: ExpectedRun {
+                run_id: wait_run_id,
+                version: Some(3),
+                execution_generation: Some(1),
+            },
+            event_id: EventId::from_bytes(ids(84)),
+            event_type: "approval.granted".to_owned(),
+            match_key_hash,
+            payload_schema_version: 2,
+            payload: payload(&json!({"approved": true, "reviewer": "smoke"})),
+            signature_verification: SignatureVerification::Verified,
+            occurred_at: Some(UnixMicros::new(now_micros)),
+        };
+        let applied_event = executor
+            .apply_event(&mut client, &apply_context, external_event.clone())
+            .await
+            .expect("consume approval event");
+        assert_eq!(applied_event.value.status, RunStatus::Paused);
+        assert_eq!(applied_event.value.version, 4);
+        assert!(applied_event.durable_follow_ups.is_empty());
+        let event_duplicate = executor
+            .apply_event(&mut client, &apply_context, external_event)
+            .await
+            .expect("replay approval event");
+        assert_eq!(event_duplicate.disposition, CommandDisposition::Duplicate);
+        assert_eq!(event_duplicate.value, applied_event.value);
+        let second_event_error = executor
+            .apply_event(
+                &mut client,
+                &command_context(tenant_id, ids(85), "apply_event", &tenant_key, 85),
+                ApplyEvent {
+                    expected_run: ExpectedRun {
+                        run_id: wait_run_id,
+                        version: Some(4),
+                        execution_generation: Some(1),
+                    },
+                    event_id: EventId::from_bytes(ids(86)),
+                    event_type: "approval.granted".to_owned(),
+                    match_key_hash,
+                    payload_schema_version: 2,
+                    payload: payload(&json!({"approved": true})),
+                    signature_verification: SignatureVerification::Verified,
+                    occurred_at: None,
+                },
+            )
+            .await
+            .expect_err("a wait can only be consumed once");
+        assert_eq!(second_event_error.code, StoreErrorCode::WaitAlreadyConsumed);
+        let resumed_task_status: String = client
+            .query_one(
+                "SELECT status FROM agent_loom.tasks \
+                 WHERE tenant_id = $1 AND task_id = $2",
+                &[&tenant_uuid, &uuid(resume_task_id.into_bytes())],
+            )
+            .await
+            .expect("query resume task")
+            .get(0);
+        assert_eq!(resumed_task_status, "scheduled");
+        let applied_schema_version: i64 = client
+            .query_one(
+                "SELECT payload_schema_version FROM agent_loom.events \
+                 WHERE tenant_id = $1 AND event_id = $2",
+                &[&tenant_uuid, &uuid(ids(84))],
+            )
+            .await
+            .expect("query applied event")
+            .get(0);
+        assert_eq!(applied_schema_version, 2);
+        let resumed_wait_run = executor
+            .resume_run(
+                &mut client,
+                &command_context(tenant_id, ids(93), "resume_run", &tenant_key, 93),
+                ControlRun {
+                    expected_run: ExpectedRun {
+                        run_id: wait_run_id,
+                        version: Some(4),
+                        execution_generation: Some(1),
+                    },
+                    event_id: EventId::from_bytes(ids(94)),
+                    reason: "resume after approval arrived".to_owned(),
+                },
+            )
+            .await
+            .expect("resume approval run");
+        assert_eq!(resumed_wait_run.value.status, RunStatus::Queued);
+        let resumed_claim = executor
+            .claim_task(
+                &mut client,
+                &command_context(tenant_id, ids(87), "claim_task", &tenant_key, 87),
+                ClaimTask {
+                    worker_id: WorkerId::from_bytes(ids(87)),
+                    lease_token: LeaseToken::from_bytes([88; 32]),
+                    lease_duration: DurationMicros::new(60_000_000),
+                    candidate_window: 8,
+                },
+            )
+            .await
+            .expect("claim resume task")
+            .expect("resume task is claimable");
+        assert_eq!(resumed_claim.value.task.task_id, resume_task_id);
+        let cancelled_wait_run = executor
+            .cancel_run(
+                &mut client,
+                &command_context(tenant_id, ids(89), "cancel_run", &tenant_key, 89),
+                ControlRun {
+                    expected_run: ExpectedRun {
+                        run_id: wait_run_id,
+                        version: Some(6),
+                        execution_generation: Some(1),
+                    },
+                    event_id: EventId::from_bytes(ids(90)),
+                    reason: "finish apply-event smoke path".to_owned(),
+                },
+            )
+            .await
+            .expect("cancel apply-event smoke run");
+        assert_eq!(cancelled_wait_run.value.status, RunStatus::Cancelled);
 
         let control_run_id = RunId::from_bytes(ids(12));
         let control_task_id = TaskId::from_bytes(ids(13));

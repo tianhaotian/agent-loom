@@ -356,10 +356,14 @@ wait_id, tenant_id, run_id, stage_execution_id,
 wait_type, expected_event_type, match_key_hash,
 match_contract_json, status, active_slot,
 expires_at, consumed_by_event_id, created_event_id,
-created_at, consumed_at, updated_at
+created_at, consumed_at, updated_at,
+resume_task_id, resume_logical_key, resume_task_kind,
+resume_priority, resume_max_attempts, resume_input_json, resume_deadline
 ```
 
 `match_key_hash` 用于索引匹配；原始敏感匹配值应加密保存或只保存在受控外部系统。
+
+`resume_*` 字段是在 Wait 创建事务中冻结的恢复 Task 计划。外部事件只能消费 Wait 并实例化该计划，不能直接指定任意后继 Task；暂停期间到达的事件会生成受控制门阻塞的 `scheduled` Task。
 
 为兼容不支持部分唯一索引的 Provider，使用 `active_slot` 表达“只允许一个 open 等价等待”：
 
