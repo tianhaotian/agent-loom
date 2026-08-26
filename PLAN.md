@@ -323,8 +323,10 @@ Kafka、NATS 或 Redis Streams 可以在高吞吐事件分发时引入，但必�
 
 已完成共享领域/Store/Adapter 契约骨架、`0000` 至 `0010` PostgreSQL/MySQL 对等迁移、migration runner/执行状态机，以及 PostgreSQL migration executor。PostgreSQL 事务垂直切片现已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 两阶段记录、AgentExecution 提交/事件/结果记录和 Pause/Resume/Cancel；连接池封装已完整实现对象安全的 `DurableStore`。Worker、事件、外部执行与控制命令统一使用显式层级锁序。失败路径已区分 retry、fatal 与 Dead Letter，Wait 持久化恢复计划，Tool/Agent backoff 持久化 due time，Agent event receipt、local Event、cursor 与 Run sequence 同事务提交。Tool/Agent due-work 扫描、确定性 Runtime Scheduler tick、原子应用与恢复 Worker 已贯通到实际 Adapter 调用与结果回写：dispatcher 按 tenant 装载 invocation envelope，通过 Registry 解析服务端 Adapter，由可注入工厂解析短期凭据/trace/deadline，并在重放前校验 Tool 副作用等级与 Agent submission 幂等能力快照。外部结果使用提交后的 Run fence 和确定性 Command/Event 身份回写。Runtime 已按 adapter/recovery/scheduler/service 重组；通用 PollingService 提供有界并发、分级退避、进度报告和优雅停机，Scheduler、Recovery Worker 与 Lease Reclaimer 均通过数据库无关 Job 接入。恢复启动事务会原子完成一次性 reconcile Task；通用 Lease Reclaimer 使用数据库时间原子结束过期 TaskAttempt、清除 Lease、追加 Event 并推进 Run cursor，续租/回收由行锁与条件更新决定唯一获胜者。后续按以下顺序推进：
 
-1. 在 CI 的 PostgreSQL 16+ 测试库启用 `AGENT_LOOM_TEST_POSTGRES_URL`，持续执行真实 migration、重复命令、领取/续租/完成/失败、暂停/恢复/取消和 cancel/complete 竞争 smoke test；继续补充多 Worker 领取、续租/回收竞争与故障注入测试。
-2. 将共享 conformance harness 从 schema 形状测试扩展为 Provider 黑盒行为测试，并实现 MySQL 对等事务路径；优先覆盖 Lease 续租/回收竞争。
+CI 已配置独立的 workspace 质量门禁和 PostgreSQL 16 服务 Job；后者通过 `AGENT_LOOM_TEST_POSTGRES_URL` 串行执行真实 migration 与事务垂直切片。后续按以下顺序推进：
+
+1. 补充多 Worker 领取、续租/回收竞争与事务故障注入测试，并逐步把真实行为用例下沉为 Provider 黑盒 conformance harness。
+2. 实现 MySQL 对等事务路径；优先覆盖 Lease 续租/回收竞争。
 3. 补齐 stale external execution、Wait timeout 与 Run deadline 的扫描及应用事务。
 4. 实现 Mock Agent Server Adapter 和业产研 Workflow fixture，跑通需求分析至部署的模拟 E2E。
 5. 按部署需求选择 `0011_optional_outbox`；将 `0012_runtime_grants` 作为数据库权限加固迁移或等价 IaC，而不是基础领域正确性的前置条件。

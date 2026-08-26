@@ -58,3 +58,5 @@ AGENT_LOOM_TEST_POSTGRES_URL='postgresql://...' cargo test -p agent-loom-store-p
 ```
 
 smoke test 会在目标数据库创建唯一测试 Tenant/Run 作为审计记录；不要指向生产数据库。
+
+GitHub Actions 会分别执行 workspace 质量门禁和 PostgreSQL 16 真实事务测试。数据库 Job 通过 `AGENT_LOOM_TEST_POSTGRES_URL` 启用 migration 与事务垂直切片，并使用单线程测试避免同库迁移用例并发干扰。
