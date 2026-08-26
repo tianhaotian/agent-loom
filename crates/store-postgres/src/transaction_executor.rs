@@ -9,11 +9,12 @@ use agent_loom_durable_store::{
     AgentWorkflowAction, AppendAgentEvents, ApplyDueWork, ApplyEvent, BeginAgentResubmission,
     BeginToolRetryAttempt, ClaimTask, ClaimedTask, CommandContext, CommandDisposition, Committed,
     CompleteTask, CompletionShapeError, ControlRun, CreateRun, DueWorkOutcome, DueWorkTarget,
-    DurableFollowUp, ExecutionRetryClass, ExpectedRun, FailTask, InitialTask, LeaseProof,
-    NewArtifactRef, NewTask, NewWaitSubscription, NextActions, NormalizedAgentEventInput,
-    PostCommitHint, PrepareAgentExecution, PrepareToolExecution, RecordAgentOutcome,
-    RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, SignatureVerification, StoreError,
-    StoreErrorCode, StoreResult, ToolRecordedOutcome,
+    DurableFollowUp, ExecutionRetryClass, ExpectedRun, FailTask, InitialTask, LeaseExpiryAction,
+    LeaseProof, LeaseReclaimOutcome, NewArtifactRef, NewTask, NewWaitSubscription, NextActions,
+    NormalizedAgentEventInput, PostCommitHint, PrepareAgentExecution, PrepareToolExecution,
+    ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission, RecordToolOutcome,
+    RenewTaskLease, SignatureVerification, StoreError, StoreErrorCode, StoreResult,
+    ToolRecordedOutcome,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -591,6 +592,231 @@ impl PostgresTransactionExecutor {
             durable_follow_ups: Vec::new(),
             post_commit_hints: Vec::new(),
         })
+    }
+
+    /// Reclaims at most one expired Task Lease using the authoritative database
+    /// clock and atomically records the `TaskAttempt`, Event, and Run projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for idempotency misuse, corrupt Lease state,
+    /// a Run CAS conflict, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn reclaim_expired_lease(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: ReclaimExpiredLease,
+    ) -> StoreResult<Option<Committed<LeaseReclaimOutcome>>> {
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        match acquire_receipt(
+            &transaction,
+            context,
+            db_now,
+            self.config.receipt_ttl_micros,
+        )
+        .await?
+        {
+            ReceiptGuard::Existing(receipt) => {
+                let outcome = decode_lease_reclaim_receipt(context.tenant_id, &receipt.outcome)?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(outcome.map(|value| Committed {
+                    disposition: CommandDisposition::Duplicate,
+                    value,
+                    event_ids: receipt.event_id.map(event_id).into_iter().collect(),
+                    durable_follow_ups: Vec::new(),
+                    post_commit_hints: Vec::new(),
+                }));
+            }
+            ReceiptGuard::Acquired => {}
+        }
+
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let candidate = transaction
+            .query_opt(
+                "SELECT t.run_id, t.task_id \
+                 FROM agent_loom.tasks t \
+                 JOIN agent_loom.runs r ON r.tenant_id = t.tenant_id AND r.run_id = t.run_id \
+                 WHERE t.tenant_id = $1 AND t.status = 'leased' \
+                   AND t.lease_expires_at <= \
+                       to_timestamp(($2::bigint)::double precision / 1000000.0) \
+                   AND r.terminal_event_id IS NULL \
+                 ORDER BY t.lease_expires_at, t.task_id LIMIT 1",
+                &[&tenant_id, &db_now],
+            )
+            .await
+            .map_err(map_database_error)?;
+        let Some(candidate) = candidate else {
+            let receipt = encode_lease_reclaim_receipt(None)?;
+            finish_receipt(&transaction, context, "no_op", &receipt, None, None).await?;
+            transaction.commit().await.map_err(map_database_error)?;
+            return Ok(None);
+        };
+        let run_id: Uuid = candidate.get(0);
+        let task_id: Uuid = candidate.get(1);
+        let run = lock_event_run(&transaction, tenant_id, run_id).await?;
+        let task = transaction
+            .query_opt(
+                "SELECT status, attempt, max_attempts, \
+                        CASE WHEN lease_expires_at IS NULL THEN NULL ELSE \
+                            (extract(epoch FROM lease_expires_at) * 1000000)::bigint END \
+                 FROM agent_loom.tasks \
+                 WHERE tenant_id = $1 AND run_id = $2 AND task_id = $3 FOR UPDATE",
+                &[&tenant_id, &run_id, &task_id],
+            )
+            .await
+            .map_err(map_database_error)?
+            .ok_or_else(|| inconsistent("expired Lease candidate disappeared"))?;
+        let status: String = task.get(0);
+        let attempt: i64 = task.get(1);
+        let max_attempts: i64 = task.get(2);
+        let lease_expires_at: Option<i64> = task.get(3);
+        if status != "leased" || lease_expires_at.is_none_or(|value| value > db_now) {
+            let receipt = encode_lease_reclaim_receipt(None)?;
+            finish_receipt(&transaction, context, "no_op", &receipt, None, None).await?;
+            transaction.commit().await.map_err(map_database_error)?;
+            return Ok(None);
+        }
+        if attempt <= 0 || max_attempts <= 0 || attempt > max_attempts {
+            return Err(inconsistent(
+                "expired Task Lease has invalid attempt metadata",
+            ));
+        }
+
+        let action = if attempt < max_attempts {
+            LeaseExpiryAction::RetryScheduled
+        } else {
+            LeaseExpiryAction::DeadLettered
+        };
+        let (task_status, event_type, projected_run_status) = match action {
+            LeaseExpiryAction::RetryScheduled => {
+                ("retry_scheduled", "task.lease_expired", "retrying")
+            }
+            LeaseExpiryAction::DeadLettered => ("dead_lettered", "task.dead_lettered", "waiting"),
+        };
+        let terminal = action == LeaseExpiryAction::DeadLettered;
+        let task_updated = transaction
+            .execute(
+                "UPDATE agent_loom.tasks SET status = $4, generation = $5, \
+                    available_at = to_timestamp(($6::bigint)::double precision / 1000000.0), \
+                    lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, \
+                    error_code = 'lease_expired', \
+                    completed_at = CASE WHEN $7 THEN \
+                        to_timestamp(($6::bigint)::double precision / 1000000.0) ELSE NULL END, \
+                    updated_at = to_timestamp(($6::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND task_id = $2 AND attempt = $3 \
+                   AND status = 'leased' AND lease_expires_at <= \
+                       to_timestamp(($6::bigint)::double precision / 1000000.0)",
+                &[
+                    &tenant_id,
+                    &task_id,
+                    &attempt,
+                    &task_status,
+                    &run.execution_generation,
+                    &db_now,
+                    &terminal,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if task_updated != 1 {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "Task Lease changed during expiry reclamation",
+            ));
+        }
+        let attempt_updated = transaction
+            .execute(
+                "UPDATE agent_loom.task_attempts SET \
+                    finished_at = to_timestamp(($4::bigint)::double precision / 1000000.0), \
+                    outcome = 'lease_expired', error_code = 'lease_expired' \
+                 WHERE tenant_id = $1 AND task_id = $2 AND attempt = $3 \
+                   AND finished_at IS NULL",
+                &[&tenant_id, &task_id, &attempt, &db_now],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if attempt_updated != 1 {
+            return Err(inconsistent(
+                "expired Task Lease has no open matching attempt",
+            ));
+        }
+
+        let event_id = uuid(command.reclaimed_event_id.into_bytes());
+        let event_payload = json!({
+            "task_id": task_id,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "action": match action {
+                LeaseExpiryAction::RetryScheduled => "retry_scheduled",
+                LeaseExpiryAction::DeadLettered => "dead_lettered",
+            },
+        });
+        insert_event(
+            &transaction,
+            EventInsert {
+                event_id,
+                tenant_id,
+                run_id,
+                sequence: run.next_event_sequence,
+                event_type,
+                payload: &event_payload,
+                payload_schema_version: 1,
+                producer: "scheduler",
+                context,
+                correlation_id: uuid(context.correlation_id.into_bytes()),
+                occurred_at: None,
+                recorded_at: db_now,
+            },
+        )
+        .await?;
+        let next_sequence = run
+            .next_event_sequence
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("run event sequence overflow"))?;
+        advance_run_event_batch(
+            &transaction,
+            tenant_id,
+            run_id,
+            run.version,
+            run.execution_generation,
+            next_sequence,
+            projected_run_status,
+            db_now,
+        )
+        .await?;
+
+        let outcome = LeaseReclaimOutcome {
+            tenant_id: context.tenant_id,
+            run_id: run_id_from_uuid(run_id),
+            task_id: task_id_from_uuid(task_id),
+            attempt: positive_u32(attempt, "Task attempt")?,
+            action,
+            reclaimed_at: UnixMicros::new(db_now),
+        };
+        let receipt = encode_lease_reclaim_receipt(Some(&outcome))?;
+        finish_receipt(
+            &transaction,
+            context,
+            "applied",
+            &receipt,
+            Some(event_id),
+            Some(("task", task_id, attempt)),
+        )
+        .await?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(Some(Committed {
+            disposition: CommandDisposition::Applied,
+            value: outcome,
+            event_ids: vec![command.reclaimed_event_id],
+            durable_follow_ups: Vec::new(),
+            post_commit_hints: if action == LeaseExpiryAction::RetryScheduled {
+                vec![PostCommitHint::WakeWorkers]
+            } else {
+                Vec::new()
+            },
+        }))
     }
 
     /// Finalizes the active Task attempt and atomically projects the Run to a
@@ -3087,7 +3313,7 @@ async fn lock_claim_candidate(
                    to_timestamp(($2::bigint)::double precision / 1000000.0)) \
                AND t.attempt < t.max_attempts \
                AND ($4::text IS NULL OR t.kind = $4) \
-               AND r.status IN ('queued', 'running') \
+               AND r.status IN ('queued', 'running', 'retrying') \
                AND t.generation = r.execution_generation \
              ORDER BY t.priority DESC, t.available_at, t.task_id LIMIT $3",
             &[&tenant_id, &db_now, &window, &required_kind],
@@ -3102,7 +3328,8 @@ async fn lock_claim_candidate(
             .query_opt(
                 "SELECT version, execution_generation, next_event_sequence \
                  FROM agent_loom.runs \
-                 WHERE tenant_id = $1 AND run_id = $2 AND status IN ('queued', 'running') \
+                 WHERE tenant_id = $1 AND run_id = $2 \
+                   AND status IN ('queued', 'running', 'retrying') \
                  FOR UPDATE SKIP LOCKED",
                 &[&tenant_id, &run_id],
             )
@@ -5488,6 +5715,20 @@ async fn freeze_leased_tasks(
 ) -> StoreResult<()> {
     transaction
         .execute(
+            "UPDATE agent_loom.task_attempts a SET \
+                finished_at = to_timestamp(($3::bigint)::double precision / 1000000.0), \
+                outcome = 'cancelled', error_code = 'run_paused' \
+             WHERE a.tenant_id = $1 AND a.run_id = $2 AND a.finished_at IS NULL \
+               AND EXISTS (SELECT 1 FROM agent_loom.tasks t \
+                           WHERE t.tenant_id = a.tenant_id \
+                             AND t.task_id = a.task_id \
+                             AND t.status = 'leased')",
+            &[&tenant_id, &run_id, &db_now],
+        )
+        .await
+        .map_err(map_database_error)?;
+    transaction
+        .execute(
             "UPDATE agent_loom.tasks SET status = 'retry_scheduled', \
                 available_at = to_timestamp(($3::bigint)::double precision / 1000000.0), \
                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, \
@@ -7249,6 +7490,97 @@ struct DueWorkReceipt {
     applied_at: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct LeaseReclaimReceipt {
+    #[serde(rename = "type")]
+    outcome_type: String,
+    run_id: Option<Uuid>,
+    task_id: Option<Uuid>,
+    attempt: Option<u32>,
+    action: Option<String>,
+    reclaimed_at: Option<i64>,
+}
+
+fn encode_lease_reclaim_receipt(outcome: Option<&LeaseReclaimOutcome>) -> StoreResult<Value> {
+    let receipt = match outcome {
+        Some(outcome) => LeaseReclaimReceipt {
+            outcome_type: "lease_reclaimed".to_owned(),
+            run_id: Some(uuid(outcome.run_id.into_bytes())),
+            task_id: Some(uuid(outcome.task_id.into_bytes())),
+            attempt: Some(outcome.attempt),
+            action: Some(
+                match outcome.action {
+                    LeaseExpiryAction::RetryScheduled => "retry_scheduled",
+                    LeaseExpiryAction::DeadLettered => "dead_lettered",
+                }
+                .to_owned(),
+            ),
+            reclaimed_at: Some(outcome.reclaimed_at.get()),
+        },
+        None => LeaseReclaimReceipt {
+            outcome_type: "lease_reclaim_none".to_owned(),
+            run_id: None,
+            task_id: None,
+            attempt: None,
+            action: None,
+            reclaimed_at: None,
+        },
+    };
+    serde_json::to_value(receipt)
+        .map_err(|_| inconsistent("failed to encode Lease reclaim receipt"))
+}
+
+fn decode_lease_reclaim_receipt(
+    tenant_id: TenantId,
+    value: &Value,
+) -> StoreResult<Option<LeaseReclaimOutcome>> {
+    let receipt: LeaseReclaimReceipt = serde_json::from_value(value.clone())
+        .map_err(|_| inconsistent("stored receipt is not a Lease reclaim outcome"))?;
+    if receipt.outcome_type == "lease_reclaim_none" {
+        if receipt.run_id.is_some()
+            || receipt.task_id.is_some()
+            || receipt.attempt.is_some()
+            || receipt.action.is_some()
+            || receipt.reclaimed_at.is_some()
+        {
+            return Err(inconsistent("empty Lease reclaim receipt has outcome data"));
+        }
+        return Ok(None);
+    }
+    if receipt.outcome_type != "lease_reclaimed" {
+        return Err(inconsistent(
+            "stored command receipt has the wrong Lease reclaim type",
+        ));
+    }
+    let action = match receipt.action.as_deref() {
+        Some("retry_scheduled") => LeaseExpiryAction::RetryScheduled,
+        Some("dead_lettered") => LeaseExpiryAction::DeadLettered,
+        _ => return Err(inconsistent("Lease reclaim receipt has an invalid action")),
+    };
+    Ok(Some(LeaseReclaimOutcome {
+        tenant_id,
+        run_id: run_id_from_uuid(
+            receipt
+                .run_id
+                .ok_or_else(|| inconsistent("Lease reclaim receipt has no Run ID"))?,
+        ),
+        task_id: task_id_from_uuid(
+            receipt
+                .task_id
+                .ok_or_else(|| inconsistent("Lease reclaim receipt has no Task ID"))?,
+        ),
+        attempt: receipt
+            .attempt
+            .ok_or_else(|| inconsistent("Lease reclaim receipt has no attempt"))?,
+        action,
+        reclaimed_at: UnixMicros::new(
+            receipt
+                .reclaimed_at
+                .ok_or_else(|| inconsistent("Lease reclaim receipt has no timestamp"))?,
+        ),
+    }))
+}
+
 fn encode_due_work_receipt(outcome: &DueWorkOutcome) -> StoreResult<Value> {
     let (target_kind, execution_id) = match outcome.target {
         DueWorkTarget::Tool(id) => ("tool", uuid(id.into_bytes())),
@@ -7736,6 +8068,31 @@ mod tests {
     }
 
     #[test]
+    fn lease_reclaim_receipt_round_trip_preserves_action() {
+        let outcome = LeaseReclaimOutcome {
+            tenant_id: TenantId::from_bytes([1; 16]),
+            run_id: RunId::from_bytes([2; 16]),
+            task_id: TaskId::from_bytes([3; 16]),
+            attempt: 2,
+            action: LeaseExpiryAction::RetryScheduled,
+            reclaimed_at: UnixMicros::new(4),
+        };
+        let encoded =
+            encode_lease_reclaim_receipt(Some(&outcome)).expect("encode Lease reclaim receipt");
+        assert_eq!(
+            decode_lease_reclaim_receipt(outcome.tenant_id, &encoded)
+                .expect("decode Lease reclaim receipt"),
+            Some(outcome)
+        );
+        let empty = encode_lease_reclaim_receipt(None).expect("encode empty reclaim receipt");
+        assert_eq!(
+            decode_lease_reclaim_receipt(TenantId::from_bytes([1; 16]), &empty)
+                .expect("decode empty reclaim receipt"),
+            None
+        );
+    }
+
+    #[test]
     fn claim_receipt_round_trip_preserves_input_and_run_version() {
         let claimed = ClaimedTask {
             task: TaskSnapshot {
@@ -7816,6 +8173,9 @@ mod tests {
         assert!(source.contains("leased recovery Task has no open matching attempt"));
         assert!(source.contains("recovery Task was not authorized"));
         assert!(source.contains("($4::text IS NULL OR t.kind = $4)"));
+        assert!(source.contains("status IN ('queued', 'running', 'retrying')"));
+        assert!(source.contains("outcome = 'lease_expired'"));
+        assert!(source.contains("ORDER BY t.lease_expires_at, t.task_id LIMIT 1"));
     }
 
     #[tokio::test]

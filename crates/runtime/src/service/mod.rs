@@ -12,8 +12,11 @@ use std::{
     time::Duration,
 };
 
-use agent_loom_domain::{CommandId, Digest, IdempotencyKey, LeaseToken, WorkerId};
-use agent_loom_durable_store::{CommandContext, DueWorkCursor, QueryContext};
+use agent_loom_domain::{CommandId, Digest, EventId, IdempotencyKey, LeaseToken, WorkerId};
+use agent_loom_durable_store::{
+    CommandContext, Committed, DueWorkCursor, DurableStore, LeaseReclaimOutcome, QueryContext,
+    ReclaimExpiredLease, StoreFuture,
+};
 use sha2::{Digest as _, Sha256};
 use tokio::{sync::watch, task::JoinSet, time::sleep};
 
@@ -288,6 +291,28 @@ pub trait RecoveryIdentitySource: Send + Sync {
     fn next(&self, slot: u32) -> Result<RecoveryLeaseIdentity, PollingJobError>;
 }
 
+/// Minimal Store surface used by the expired-Lease reclaimer.
+pub trait LeaseReclaimStore: Send + Sync {
+    fn reclaim_expired_lease<'a>(
+        &'a self,
+        context: &'a CommandContext,
+        command: ReclaimExpiredLease,
+    ) -> StoreFuture<'a, Option<Committed<LeaseReclaimOutcome>>>;
+}
+
+impl<T> LeaseReclaimStore for T
+where
+    T: DurableStore + ?Sized,
+{
+    fn reclaim_expired_lease<'a>(
+        &'a self,
+        context: &'a CommandContext,
+        command: ReclaimExpiredLease,
+    ) -> StoreFuture<'a, Option<Committed<LeaseReclaimOutcome>>> {
+        DurableStore::reclaim_expired_lease(self, context, command)
+    }
+}
+
 pub struct SeededRecoveryIdentitySource {
     worker_id: WorkerId,
     process_seed: LeaseToken,
@@ -401,9 +426,67 @@ where
     }
 }
 
+#[derive(Debug)]
+pub struct LeaseReclaimPollingJob<S, I> {
+    store: S,
+    context_template: CommandContext,
+    identities: I,
+}
+
+impl<S, I> LeaseReclaimPollingJob<S, I> {
+    pub const fn new(store: S, context_template: CommandContext, identities: I) -> Self {
+        Self {
+            store,
+            context_template,
+            identities,
+        }
+    }
+}
+
+impl<S, I> PollingJob for LeaseReclaimPollingJob<S, I>
+where
+    S: LeaseReclaimStore,
+    I: RecoveryIdentitySource,
+{
+    fn run_once(&self, slot: u32) -> PollingFuture<'_> {
+        Box::pin(async move {
+            let identity = self.identities.next(slot)?;
+            let context =
+                polling_command_context(&self.context_template, &identity, "lease-reclaim")?;
+            let outcome = self
+                .store
+                .reclaim_expired_lease(
+                    &context,
+                    ReclaimExpiredLease {
+                        reclaimed_event_id: EventId::from_bytes(context.command_id.into_bytes()),
+                    },
+                )
+                .await
+                .map_err(|error| polling_error(&error.to_string()))?;
+            Ok(if outcome.is_some() {
+                PollingActivity::Progress {
+                    completed: 1,
+                    failed: 0,
+                    last_failure: None,
+                }
+            } else {
+                PollingActivity::Idle
+            })
+        })
+    }
+}
+
 fn recovery_claim_context(
     template: &CommandContext,
     identity: &RecoveryLeaseIdentity,
+) -> Result<CommandContext, PollingJobError> {
+    polling_command_context(template, identity, "recovery-claim")
+}
+
+fn polling_command_context(
+    template: &CommandContext,
+    identity: &RecoveryLeaseIdentity,
+    operation: &str,
 ) -> Result<CommandContext, PollingJobError> {
     let token_digest: [u8; 32] = Sha256::digest(identity.lease_token.as_bytes()).into();
     let mut token_hex = String::with_capacity(64);
@@ -411,7 +494,7 @@ fn recovery_claim_context(
         write!(token_hex, "{byte:02x}")
             .map_err(|_| polling_error("Recovery claim identity could not be formatted"))?;
     }
-    let logical_identity = format!("recovery-claim/{}/{token_hex}", identity.worker_id);
+    let logical_identity = format!("{operation}/{}/{token_hex}", identity.worker_id);
     let command_digest: [u8; 32] = Sha256::digest(logical_identity.as_bytes()).into();
     let mut command_id = [0; 16];
     command_id.copy_from_slice(&command_digest[..16]);

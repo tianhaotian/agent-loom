@@ -230,7 +230,9 @@ scheduled → queued → leased → succeeded
 ### 5.3 Lease 回收
 
 - Scheduler 只能回收数据库时间已经过期的 Lease。
-- 回收事务以 Task 当前 lease token 为条件，递增 attempt，并转为 `retry_scheduled`、`queued`、`dead_lettered` 或 `cancelled`。
+- 回收事务锁定 Run 后重新校验 Task 仍为 `leased` 且 `lease_expires_at <= database_now`，原子结束当前 TaskAttempt 并清除 Lease。
+- 当前 attempt 尚未达到 `max_attempts` 时转为 `retry_scheduled`；下一次成功领取才递增 attempt。达到上限时转为 `dead_lettered`。
+- 回收必须追加 `task.lease_expired` 或 `task.dead_lettered` Event，并与 Task、TaskAttempt、Run version/event sequence 在一个事务内提交。
 - 旧 Worker 随后提交时返回 `LEASE_LOST`，不能覆盖新 Worker 结果。
 - 续租和回收竞争时，第一个成功的条件更新获胜。
 

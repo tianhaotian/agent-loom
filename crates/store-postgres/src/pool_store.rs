@@ -4,10 +4,10 @@ use agent_loom_durable_store::{
     AgentEventBatchOutcome, AgentInvocation, AppendAgentEvents, ApplyDueWork, ApplyEvent,
     BeginAgentResubmission, BeginToolRetryAttempt, ClaimTask, ClaimedTask, CommandContext,
     Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery,
-    DurableStore, EventCursor, EventPage, FailTask, PrepareAgentExecution, PrepareToolExecution,
-    QueryContext, RecordAgentOutcome, RecordAgentSubmission, RecordToolOutcome, RenewTaskLease,
-    RetryClass, StoreCapabilities, StoreError, StoreErrorCode, StoreFuture, StoreResult,
-    ToolInvocation,
+    DurableStore, EventCursor, EventPage, FailTask, LeaseReclaimOutcome, PrepareAgentExecution,
+    PrepareToolExecution, QueryContext, ReclaimExpiredLease, RecordAgentOutcome,
+    RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, RetryClass, StoreCapabilities,
+    StoreError, StoreErrorCode, StoreFuture, StoreResult, ToolInvocation,
 };
 use deadpool_postgres::{Object, Pool};
 
@@ -164,6 +164,19 @@ impl DurableStore for PostgresStore {
             let mut client = self.connection().await?;
             self.executor
                 .renew_task_lease(&mut client, context, command)
+                .await
+        })
+    }
+
+    fn reclaim_expired_lease<'a>(
+        &'a self,
+        context: &'a CommandContext,
+        command: ReclaimExpiredLease,
+    ) -> StoreFuture<'a, Option<Committed<LeaseReclaimOutcome>>> {
+        Box::pin(async move {
+            let mut client = self.connection().await?;
+            self.executor
+                .reclaim_expired_lease(&mut client, context, command)
                 .await
         })
     }

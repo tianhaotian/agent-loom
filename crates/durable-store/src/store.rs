@@ -9,8 +9,9 @@ use crate::{
     AgentEventBatchOutcome, AgentInvocation, AppendAgentEvents, ApplyDueWork, ApplyEvent,
     BeginAgentResubmission, BeginToolRetryAttempt, ClaimTask, ClaimedTask, Committed, CompleteTask,
     ControlRun, CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery, EventCursor, EventPage,
-    FailTask, PrepareAgentExecution, PrepareToolExecution, QueryContext, RecordAgentOutcome,
-    RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, StoreResult, ToolInvocation,
+    FailTask, LeaseReclaimOutcome, PrepareAgentExecution, PrepareToolExecution, QueryContext,
+    ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission, RecordToolOutcome,
+    RenewTaskLease, StoreResult, ToolInvocation,
 };
 
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = StoreResult<T>> + Send + 'a>>;
@@ -91,6 +92,12 @@ pub trait DurableStore: Send + Sync {
         context: &'a crate::CommandContext,
         command: RenewTaskLease,
     ) -> StoreFuture<'a, Committed<ClaimedTask>>;
+
+    fn reclaim_expired_lease<'a>(
+        &'a self,
+        context: &'a crate::CommandContext,
+        command: ReclaimExpiredLease,
+    ) -> StoreFuture<'a, Option<Committed<LeaseReclaimOutcome>>>;
 
     fn complete_task<'a>(
         &'a self,

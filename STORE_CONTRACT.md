@@ -253,6 +253,11 @@ pub trait DurableStore: Send + Sync {
         cmd: RenewLease,
     ) -> StoreFuture<'a, Committed<LeaseSnapshot>>;
 
+    fn reclaim_expired_lease<'a>(
+        &'a self,
+        cmd: ReclaimExpiredLease,
+    ) -> StoreFuture<'a, Option<Committed<LeaseReclaimOutcome>>>;
+
     fn complete_task<'a>(
         &'a self,
         cmd: CompleteTask,
