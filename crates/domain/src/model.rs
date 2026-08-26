@@ -163,6 +163,7 @@ pub struct AgentExecutionSnapshot {
     pub remote_session_ref: Option<String>,
     pub event_cursor: Option<String>,
     pub cursor_version: u64,
+    pub retry_at: Option<UnixMicros>,
     pub updated_at: UnixMicros,
 }
 

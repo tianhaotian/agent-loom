@@ -167,6 +167,16 @@ mod tests {
     }
 
     #[test]
+    fn agent_retry_schedule_is_persisted_by_both_providers() {
+        for migrations in [postgres::MIGRATIONS, mysql::MIGRATIONS] {
+            let sql = migrations[9].sql;
+            assert!(sql.contains("retry_at"));
+            assert!(sql.contains("ck_agent_execs__retry_schedule"));
+            assert!(sql.contains("ix_agent_execs__retry_due"));
+        }
+    }
+
+    #[test]
     fn artifact_versions_and_lineage_are_provider_equivalent() {
         for migrations in [postgres::MIGRATIONS, mysql::MIGRATIONS] {
             let sql = migrations[5].sql;

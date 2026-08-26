@@ -198,9 +198,9 @@ PostgreSQL 即使允许事务 DDL，也采用相同 step journal；`CREATE INDEX
 | `artifact_refs` | immutable append | 交付物引用 | `0005` |
 | `tool_executions` | mutable projection | Tool 副作用与重试时间 | `0006` + `0008` |
 | `tool_execution_attempts` | immutable append | Tool 请求审计 | `0006` |
-| `agent_executions` | mutable projection | 远程 Agent 映射 | `0006` |
+| `agent_executions` | mutable projection | 远程 Agent 映射与重试时间 | `0006` + `0009` |
 | `agent_event_receipts` | immutable guard | 远程 Event 去重 | `0006` |
-| `outbox_messages` | mutable delivery | 可选消息投递 | `0009` optional |
+| `outbox_messages` | mutable delivery | 可选消息投递 | `0010` optional |
 
 `agent_event_receipts` 是 `append_agent_events` 的必要去重守卫。只把 vendor event ID 放进 JSON 无法建立跨 Provider 的可靠唯一约束。
 
@@ -538,6 +538,7 @@ UNIQUE (tenant_id, endpoint_id, idempotency_key)
 UNIQUE (tenant_id, endpoint_id, remote_run_ref)  # remote ref 非空时
 FK run/stage/task/endpoint/agent_version（均带 tenant）
 CHECK version >= 0 AND cursor_version >= 0
+CHECK retry_at IS NULL OR status = reconciling
 ```
 
 PostgreSQL/MySQL 普通 UNIQUE 都允许多个 NULL，因此 nullable `remote_run_ref` 可以直接使用复合 UNIQUE；空字符串必须在 Adapter 边界拒绝。
@@ -545,6 +546,7 @@ PostgreSQL/MySQL 普通 UNIQUE 都允许多个 NULL，因此 nullable `remote_ru
 索引：
 
 - `(status, updated_at, agent_execution_id)` 供 stale submission/event sync；
+- `(status, retry_at, agent_execution_id)` 供数据库时间驱动的 due retry 扫描；
 - `(tenant_id, run_id, status, updated_at, agent_execution_id)`；
 - `(tenant_id, endpoint_id, remote_session_ref, updated_at, agent_execution_id)`。
 
@@ -893,19 +895,25 @@ Provider 不能把所有 unique violation 都返回同一模糊错误。迁移�
 - 回填既有 retry 状态并增加状态/时间一致性 CHECK；
 - 增加 due retry 扫描索引。
 
-### `0009_optional_outbox`
+### `0009_agent_retry_schedule`
+
+- 为 AgentExecution 增加数据库时间语义的 `retry_at`；
+- 增加 `retry_at IS NULL OR status = 'reconciling'` 一致性 CHECK；
+- 增加 due retry 扫描索引。
+
+### `0010_optional_outbox`
 
 - 仅启用消息分发 feature 的部署执行；
 - 创建 outbox_messages 和领取/回收索引；
 - 不改变 DurableStore 基础正确性或默认 capability。
 
-### `0010_runtime_grants`
+### `0011_runtime_grants`
 
 - 应用 runtime writer/reader 的最小权限；
 - 收紧 append-only 表 UPDATE/DELETE；
 - 校验 migration owner 与 Runtime credential 不同。
 
-每个批次结束运行 schema introspection 和最小插入/回滚 smoke test。基础 Provider 的 schema readiness 以所有必需 migration（当前为 `0000` 至 `0008`）成功且 Provider 黑盒测试通过为准。`0009_optional_outbox` 不进入基础正确性门槛；生产部署还必须通过最小权限检查，权限可以由 `0010_runtime_grants` 或部署平台的等价 IaC 实现。
+每个批次结束运行 schema introspection 和最小插入/回滚 smoke test。基础 Provider 的 schema readiness 以所有必需 migration（当前为 `0000` 至 `0009`）成功且 Provider 黑盒测试通过为准。`0010_optional_outbox` 不进入基础正确性门槛；生产部署还必须通过最小权限检查，权限可以由 `0011_runtime_grants` 或部署平台的等价 IaC 实现。
 
 ## 19. Expand → Backfill → Switch → Contract
 
@@ -1063,7 +1071,7 @@ schema_constraint_violation_total{constraint_tag}
 
 1. 初始化 Rust workspace：`domain`、`durable-store`、`store-postgres`、`store-mysql`、`adapter-core`。
 2. 定义共享 ID、Instant、Digest、Status 和 canonical JSON codec。
-3. 为 `0000`—`0008` 生成两套 migration 文件和 schema snapshot 测试。
+3. 为 `0000`—`0009` 生成两套 migration 文件和 schema snapshot 测试。
 4. 建立 `durable-store` conformance harness 与数据库容器测试矩阵。
 5. 实现最小 `create_run → claim_task → complete_task → event query` 垂直链路。
 6. 接入 `workflow.delivery.v1` fixture 和 Mock Agent/DevOps Server，逐步跑通三条 E2E。

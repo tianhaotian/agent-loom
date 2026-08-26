@@ -321,11 +321,11 @@ Kafka、NATS 或 Redis Streams 可以在高吞吐事件分发时引入，但必�
 
 ## 11. 下一步
 
-已完成共享领域/Store/Adapter 契约骨架、`0000` 至 `0008` PostgreSQL/MySQL 对等迁移、migration runner/执行状态机，以及 PostgreSQL migration executor。PostgreSQL 事务垂直切片现已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 两阶段记录和 Pause/Resume/Cancel；Worker、事件、外部执行与控制命令统一使用显式层级锁序。失败路径已区分 retry、fatal 与 Dead Letter，Wait 持久化恢复计划，Tool backoff 持久化 due time。后续按以下顺序推进：
+已完成共享领域/Store/Adapter 契约骨架、`0000` 至 `0009` PostgreSQL/MySQL 对等迁移、migration runner/执行状态机，以及 PostgreSQL migration executor。PostgreSQL 事务垂直切片现已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 两阶段记录、AgentExecution 提交/事件/结果记录和 Pause/Resume/Cancel；Worker、事件、外部执行与控制命令统一使用显式层级锁序。失败路径已区分 retry、fatal 与 Dead Letter，Wait 持久化恢复计划，Tool/Agent backoff 持久化 due time，Agent event receipt、local Event、cursor 与 Run sequence 同事务提交。后续按以下顺序推进：
 
 1. 在 CI 的 PostgreSQL 16+ 测试库启用 `AGENT_LOOM_TEST_POSTGRES_URL`，持续执行真实 migration、重复命令、领取/续租/完成/失败、暂停/恢复/取消和 cancel/complete 竞争 smoke test；继续补充多 Worker 领取、续租/回收竞争与故障注入测试。
-2. 为 PostgreSQL 补齐连接池边界与完整 `DurableStore` 实现：Tool retry/reconcile due-work 与 AgentExecution 操作，保持所有状态推进使用 receipt、行锁或 CAS。
+2. 实现 Agent 规范化事件到 Wait/Task/Artifact/Execution outcome 的确定性投影，并补齐 Tool/Agent retry/reconcile due-work；保持所有状态推进使用 receipt、行锁或 CAS。
 3. 将共享 conformance harness 从 schema 形状测试扩展为 Provider 黑盒行为测试，并实现 MySQL 对等事务路径。
 4. 实现 Scheduler/Worker 最小循环、Lease 回收与数据库时间驱动的 due-work 扫描。
 5. 实现 Mock Agent Server Adapter 和业产研 Workflow fixture，跑通需求分析至部署的模拟 E2E。
-6. 按部署需求选择 `0009_optional_outbox`；将 `0010_runtime_grants` 作为数据库权限加固迁移或等价 IaC，而不是基础领域正确性的前置条件。
+6. 按部署需求选择 `0010_optional_outbox`；将 `0011_runtime_grants` 作为数据库权限加固迁移或等价 IaC，而不是基础领域正确性的前置条件。

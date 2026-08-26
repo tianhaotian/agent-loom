@@ -109,6 +109,7 @@ pub enum AgentSubmissionOutcome {
     Rejected {
         error_code: String,
         retry: ExecutionRetryClass,
+        retry_at: Option<agent_loom_domain::UnixMicros>,
     },
 }
 
@@ -153,6 +154,9 @@ impl AppendAgentEvents {
     /// Returns [`AgentEventBatchShapeError`] for duplicate receipts/dedupe keys,
     /// malformed event identity, or an authoritative event without a local ID.
     pub fn validate_shape(&self) -> Result<(), AgentEventBatchShapeError> {
+        if self.next_cursor.as_ref().is_some_and(String::is_empty) {
+            return Err(AgentEventBatchShapeError::InvalidCursor);
+        }
         for (index, event) in self.events.iter().enumerate() {
             if event.event_kind.is_empty()
                 || event.payload_schema_version == 0
@@ -190,6 +194,7 @@ impl AppendAgentEvents {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentEventBatchShapeError {
+    InvalidCursor,
     InvalidEvent { index: usize },
     AuthorityMismatch { index: usize },
     DuplicateReceipt { index: usize },
@@ -220,6 +225,7 @@ impl RecordAgentOutcome {
 pub struct AgentEventBatchOutcome {
     pub tenant_id: TenantId,
     pub agent_execution_id: AgentExecutionId,
+    pub run_id: agent_loom_domain::RunId,
     pub accepted_receipts: Vec<AgentEventReceiptId>,
     pub duplicate_receipts: Vec<AgentEventReceiptId>,
     pub cursor_version: u64,
@@ -260,6 +266,26 @@ mod tests {
         assert_eq!(
             batch.validate_shape(),
             Err(AgentEventBatchShapeError::DuplicateDedupeKey { index: 1 })
+        );
+    }
+
+    #[test]
+    fn agent_event_batch_rejects_an_empty_remote_cursor() {
+        let batch = AppendAgentEvents {
+            expected_run: ExpectedRun {
+                run_id: agent_loom_domain::RunId::from_bytes([1; 16]),
+                version: Some(1),
+                execution_generation: Some(0),
+            },
+            agent_execution_id: AgentExecutionId::from_bytes([2; 16]),
+            expected_cursor_version: 0,
+            next_cursor: Some(String::new()),
+            events: Vec::new(),
+        };
+
+        assert_eq!(
+            batch.validate_shape(),
+            Err(AgentEventBatchShapeError::InvalidCursor)
         );
     }
 

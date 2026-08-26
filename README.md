@@ -15,11 +15,11 @@ crates/store-mysql     MySQL/InnoDB Provider 与物理迁移
 
 `domain`、`durable-store` 与 `adapter-core` 继续保持零外部依赖；Provider crate 可以引入各自的数据库驱动和异步运行时，但驱动类型不得泄漏到共享领域契约。
 
-已实现 `0000_migration_meta` 至 `0008_tool_retry_schedule` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt、Checkpoint、Wait、Artifact、ToolExecution 与 AgentExecution。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、Wait 单次消费槽与恢复计划、Tool 重试时间、Artifact 版本血缘、外部执行幂等与 Agent Event 去重。
+已实现 `0000_migration_meta` 至 `0009_agent_retry_schedule` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt、Checkpoint、Wait、Artifact、ToolExecution 与 AgentExecution。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、Wait 单次消费槽与恢复计划、Tool/Agent 重试时间、Artifact 版本血缘、外部执行幂等与 Agent Event 去重。
 
-PostgreSQL 已接入真实驱动执行层：migration executor 使用 SHA-256 physical checksum、session advisory lock、step journal 和逐批 schema introspection；事务垂直切片已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 准备/结果记录，以及 Pause/Resume/Cancel。写路径包含 receipt 并发幂等闸门、显式层级锁序、`FOR UPDATE SKIP LOCKED`、Lease fencing、Run version/generation CAS，以及 Event、Checkpoint、Stage、Artifact 和后续动作的原子提交。
+PostgreSQL 已接入真实驱动执行层：migration executor 使用 SHA-256 physical checksum、session advisory lock、step journal 和逐批 schema introspection；事务垂直切片已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 准备/结果记录、AgentExecution 提交/事件/结果记录，以及 Pause/Resume/Cancel。写路径包含 receipt 并发幂等闸门、显式层级锁序、`FOR UPDATE SKIP LOCKED`、Lease fencing、Run version/generation CAS，以及 Event、Checkpoint、Stage、Artifact 和后续动作的原子提交。
 
-续租使用数据库时间校验并延长 Task/TaskAttempt 的同一 Lease，不推进 Run 版本；失败事务会原子完成 attempt、清除 Lease、追加 Event，并区分 retry、不可重试终态与 Dead Letter。外部事件按 Event type 与 `match_key_hash` 单次消费 Wait，并实例化预存恢复计划。Tool 外部调用采用两阶段窗口：先提交 execution/attempt/Event 意图，再记录 adapter outcome；不确定结果持久化对账动作，backoff 必须持久化 `retry_at`。Pause/Resume/Cancel 继续使用 execution generation、唯一终态 Event 和外部停止/对账意图。该切片目前接受连接池借出的 `&mut tokio_postgres::Client`；完整 Provider 仍需补齐连接池封装、Tool due-work 与 AgentExecution 操作。
+续租使用数据库时间校验并延长 Task/TaskAttempt 的同一 Lease，不推进 Run 版本；失败事务会原子完成 attempt、清除 Lease、追加 Event，并区分 retry、不可重试终态与 Dead Letter。外部事件按 Event type 与 `match_key_hash` 单次消费 Wait，并实例化预存恢复计划。Tool 与 Agent 外部调用采用两阶段窗口：先提交 execution/Event 意图，再记录 adapter outcome；不确定结果持久化对账动作，backoff 必须持久化 `retry_at`。Agent 事件批次会原子完成 receipt/raw digest 去重、本地 Event 追加、远端 cursor CAS 和 Run 序列推进；Pause/Cancel 后的迟到结果保留审计但受 Run version/generation fencing。该切片目前接受连接池借出的 `&mut tokio_postgres::Client`；完整 Provider 仍需补齐连接池封装、due-work，以及规范化 Agent 事件到 Wait/Task/Artifact 的领域投影。
 
 ## 设计文档
 

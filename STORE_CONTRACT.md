@@ -492,6 +492,8 @@ prepare_agent_execution（提交 submitting 意图）
 
 `submitting` 长时间未保存 remote reference 时必须进入 reconcile，而不是重新 submit。Pause/Cancel 事务把 Execution 标记为 stop requested 并创建稳定 logical key 的 stop Task；PostCommitHint 只唤醒 Worker。
 
+Agent 提交拒绝使用与 Tool 相同的 `ExecutionRetryClass`。`SameRequestBackoff` 必须携带 `retry_at` 并投影为 `reconciling`；其他分类不得携带 retry time。`record_agent_submission` 即使发现 Run version/generation 已变化，也必须保存外部提交证据，但不得借此推进已被 fencing 的业务状态。
+
 ### 8.3 远程事件批次
 
 `append_agent_events` 必须在一个事务中：
@@ -504,6 +506,8 @@ prepare_agent_execution（提交 submitting 意图）
 6. 保存 Receipt 并提交。
 
 cursor 更新失败时整批回滚，客户端可以安全从旧 cursor 重读。
+
+底层批次事务只接受已规范化事件并维护 receipt/Event/cursor 原子性；将具体 `event_kind` 派生为 Wait、Task、Artifact 或 Execution outcome 的规则属于 Runtime 投影层，必须先生成确定性命令内容后再进入该事务，禁止 Provider 根据 vendor payload 临时推断。
 
 ## 9. Scheduler 契约
 

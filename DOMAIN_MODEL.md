@@ -409,7 +409,7 @@ endpoint_id, agent_version_id, idempotency_key, request_hash,
 remote_run_ref, remote_session_ref, status, version,
 capabilities_snapshot_json, event_cursor, cursor_version,
 stop_requested_at, stop_outcome, result_json, error_code,
-last_synced_at, created_at, updated_at, completed_at
+retry_at, last_synced_at, created_at, updated_at, completed_at
 ```
 
 约束：
@@ -418,6 +418,7 @@ last_synced_at, created_at, updated_at, completed_at
 - 唯一：`(tenant_id, endpoint_id, idempotency_key)`；
 - 非空 remote reference 时应在 Endpoint 作用域唯一；
 - event cursor 更新必须匹配 `cursor_version`，避免两个同步 Worker 互相覆盖；
+- `SameRequestBackoff` 映射到 `reconciling` 并必须设置数据库时间语义的 `retry_at`；其他 Agent 状态不得残留该字段；
 - capabilities snapshot 创建后不可覆盖，能力重新发现只影响新 AgentExecution。
 
 远程 Agent 进入 running 后，提交 Task 创建 WaitSubscription 或短时 poll Task，并释放 Worker。AgentExecution 的 running 不要求 Run 保持 running；Run 可以投影为 waiting。

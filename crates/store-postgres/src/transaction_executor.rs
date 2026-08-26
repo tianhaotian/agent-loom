@@ -1,14 +1,17 @@
 use agent_loom_domain::{
-    AgentExecutionId, CheckpointId, EventId, JsonPayload, LogicalKey, RunId, RunSnapshot,
+    AgentEventReceiptId, AgentExecutionId, AgentExecutionSnapshot, AgentExecutionStatus,
+    AgentVersionId, CheckpointId, EndpointId, EventId, JsonPayload, LogicalKey, RunId, RunSnapshot,
     RunStatus, StageExecutionId, StageStatus, TaskId, TaskKind, TaskSnapshot, TaskStatus, TenantId,
     ToolExecutionId, ToolExecutionSnapshot, ToolExecutionStatus, UnixMicros, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
-    ApplyEvent, ClaimTask, ClaimedTask, CommandContext, CommandDisposition, Committed,
-    CompleteTask, CompletionShapeError, ControlRun, CreateRun, DurableFollowUp,
-    ExecutionRetryClass, ExpectedRun, FailTask, InitialTask, LeaseProof, NewTask, NextActions,
-    PostCommitHint, PrepareToolExecution, RecordToolOutcome, RenewTaskLease, SignatureVerification,
-    StoreError, StoreErrorCode, StoreResult, ToolRecordedOutcome,
+    AgentEventBatchOutcome, AgentSubmissionOutcome, AppendAgentEvents, ApplyEvent, ClaimTask,
+    ClaimedTask, CommandContext, CommandDisposition, Committed, CompleteTask, CompletionShapeError,
+    ControlRun, CreateRun, DurableFollowUp, ExecutionRetryClass, ExpectedRun, FailTask,
+    InitialTask, LeaseProof, NewTask, NextActions, NormalizedAgentEventInput, PostCommitHint,
+    PrepareAgentExecution, PrepareToolExecution, RecordAgentOutcome, RecordAgentSubmission,
+    RecordToolOutcome, RenewTaskLease, SignatureVerification, StoreError, StoreErrorCode,
+    StoreResult, ToolRecordedOutcome,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1444,6 +1447,775 @@ impl PostgresTransactionExecutor {
         ))
     }
 
+    /// Persists a remote Agent submission intent before calling the Agent
+    /// Server. Endpoint idempotency is checked independently of command replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable store error for malformed metadata, stale/lost leases,
+    /// conflicting endpoint idempotency identity, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn prepare_agent_execution(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: PrepareAgentExecution,
+    ) -> StoreResult<Committed<AgentExecutionSnapshot>> {
+        validate_prepare_agent(&command)?;
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        match acquire_receipt(
+            &transaction,
+            context,
+            db_now,
+            self.config.receipt_ttl_micros,
+        )
+        .await?
+        {
+            ReceiptGuard::Existing(receipt) => {
+                let snapshot = decode_agent_receipt(context.tenant_id, &receipt.outcome)?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(agent_committed(
+                    CommandDisposition::Duplicate,
+                    snapshot,
+                    receipt.event_id.map(event_id),
+                    Vec::new(),
+                ));
+            }
+            ReceiptGuard::Acquired => {}
+        }
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let locked = lock_worker_task(
+            &transaction,
+            tenant_id,
+            uuid(command.expected_run.run_id.into_bytes()),
+            uuid(command.lease.task_id.into_bytes()),
+        )
+        .await?;
+        validate_worker_fences(
+            &command.expected_run,
+            &command.lease,
+            &locked,
+            db_now,
+            "Agent submission preparation",
+        )?;
+        if locked.stage_execution_id
+            != command
+                .stage_execution_id
+                .map(|value| uuid(value.into_bytes()))
+        {
+            return Err(invalid_command(
+                "Agent execution stage does not match the leased task",
+            ));
+        }
+        let endpoint_id = uuid(command.endpoint_id.into_bytes());
+        if let Some(existing) = lock_agent_by_idempotency(
+            &transaction,
+            tenant_id,
+            endpoint_id,
+            command.idempotency_key.as_str(),
+        )
+        .await?
+        {
+            validate_existing_agent(&command, &locked, &existing)?;
+            let snapshot = existing.snapshot(context.tenant_id)?;
+            let outcome = encode_agent_receipt(&snapshot)?;
+            finish_receipt(
+                &transaction,
+                context,
+                "no_op",
+                &outcome,
+                None,
+                Some((
+                    "agent_execution",
+                    existing.agent_execution_id,
+                    existing.version,
+                )),
+            )
+            .await?;
+            transaction.commit().await.map_err(map_database_error)?;
+            return Ok(agent_committed(
+                CommandDisposition::NoOp,
+                snapshot,
+                None,
+                Vec::new(),
+            ));
+        }
+        let execution_id = uuid(command.agent_execution_id.into_bytes());
+        let stage_id = command
+            .stage_execution_id
+            .map(|value| uuid(value.into_bytes()));
+        let agent_version_id = uuid(command.agent_version_id.into_bytes());
+        let request_hash = command.request_hash.as_bytes().as_slice();
+        let capabilities = json_value(&command.capabilities_snapshot)?;
+        transaction
+            .execute(
+                "INSERT INTO agent_loom.agent_executions (\
+                    agent_execution_id, tenant_id, run_id, stage_execution_id, task_id, \
+                    endpoint_id, agent_version_id, idempotency_key, request_hash, \
+                    remote_run_ref, remote_session_ref, status, version, \
+                    capabilities_snapshot_json, event_cursor, cursor_version, \
+                    stop_requested_at, stop_outcome, result_json, error_code, last_synced_at, \
+                    created_at, updated_at, completed_at, retry_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, \
+                    'submitting', 0, $10, NULL, 0, NULL, NULL, NULL, NULL, NULL, \
+                    to_timestamp(($11::bigint)::double precision / 1000000.0), \
+                    to_timestamp(($11::bigint)::double precision / 1000000.0), NULL, NULL)",
+                &[
+                    &execution_id,
+                    &tenant_id,
+                    &locked.run_id,
+                    &stage_id,
+                    &locked.task_id,
+                    &endpoint_id,
+                    &agent_version_id,
+                    &command.idempotency_key.as_str(),
+                    &request_hash,
+                    &capabilities,
+                    &db_now,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        let event_id = uuid(command.prepared_event_id.into_bytes());
+        let event_payload = json!({
+            "agent_execution_id": execution_id,
+            "task_id": locked.task_id,
+            "endpoint_id": endpoint_id,
+            "agent_version_id": agent_version_id,
+        });
+        insert_event(
+            &transaction,
+            EventInsert {
+                event_id,
+                tenant_id,
+                run_id: locked.run_id,
+                sequence: locked.next_event_sequence,
+                event_type: "agent.execution_prepared",
+                payload: &event_payload,
+                payload_schema_version: 1,
+                producer: "worker",
+                context,
+                correlation_id: uuid(context.correlation_id.into_bytes()),
+                occurred_at: None,
+                recorded_at: db_now,
+            },
+        )
+        .await?;
+        advance_run_event_cursor(
+            &transaction,
+            tenant_id,
+            locked.run_id,
+            locked.run_version,
+            locked.execution_generation,
+            db_now,
+        )
+        .await?;
+        let snapshot = AgentExecutionSnapshot {
+            tenant_id: context.tenant_id,
+            agent_execution_id: command.agent_execution_id,
+            run_id: command.expected_run.run_id,
+            stage_execution_id: command.stage_execution_id,
+            task_id: command.lease.task_id,
+            endpoint_id: command.endpoint_id,
+            agent_version_id: command.agent_version_id,
+            status: AgentExecutionStatus::Submitting,
+            version: 0,
+            remote_run_ref: None,
+            remote_session_ref: None,
+            event_cursor: None,
+            cursor_version: 0,
+            retry_at: None,
+            updated_at: UnixMicros::new(db_now),
+        };
+        let outcome = encode_agent_receipt(&snapshot)?;
+        finish_receipt(
+            &transaction,
+            context,
+            "applied",
+            &outcome,
+            Some(event_id),
+            Some(("agent_execution", execution_id, 0)),
+        )
+        .await?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(agent_committed(
+            CommandDisposition::Applied,
+            snapshot,
+            Some(command.prepared_event_id),
+            Vec::new(),
+        ))
+    }
+
+    /// Records the result of submitting to a remote Agent Server. Late results
+    /// remain auditable after pause/cancel but never mutate the Run status.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable store error for malformed outcome metadata, stale
+    /// Agent version, ownership mismatch, idempotency misuse, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn record_agent_submission(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: RecordAgentSubmission,
+    ) -> StoreResult<Committed<AgentExecutionSnapshot>> {
+        let projection = project_agent_submission(&command.outcome)?;
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        match acquire_receipt(
+            &transaction,
+            context,
+            db_now,
+            self.config.receipt_ttl_micros,
+        )
+        .await?
+        {
+            ReceiptGuard::Existing(receipt) => {
+                let snapshot = decode_agent_receipt(context.tenant_id, &receipt.outcome)?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(agent_committed(
+                    CommandDisposition::Duplicate,
+                    snapshot,
+                    receipt.event_id.map(event_id),
+                    Vec::new(),
+                ));
+            }
+            ReceiptGuard::Acquired => {}
+        }
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_id = uuid(command.expected_run.run_id.into_bytes());
+        let run = lock_event_run(&transaction, tenant_id, run_id).await?;
+        let execution_id = uuid(command.agent_execution_id.into_bytes());
+        let execution = lock_agent_by_id(&transaction, tenant_id, execution_id).await?;
+        if execution.run_id != run_id {
+            return Err(store_error(
+                StoreErrorCode::NotFound,
+                "Agent execution belongs to another run",
+            ));
+        }
+        if execution.version != to_i64(command.expected_version, "Agent execution version")? {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "Agent execution version changed",
+            ));
+        }
+        if execution.status != "submitting" {
+            return Err(store_error(
+                StoreErrorCode::InvalidTransition,
+                "Agent execution is not awaiting submission outcome",
+            ));
+        }
+        let next_version = execution
+            .version
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("Agent execution version overflow"))?;
+        let terminal = projection.status.is_terminal();
+        let status = agent_status(projection.status);
+        let updated = transaction
+            .execute(
+                "UPDATE agent_loom.agent_executions SET status = $3, version = $4, \
+                    remote_run_ref = $5, remote_session_ref = $6, error_code = $7, \
+                    retry_at = to_timestamp(($8::bigint)::double precision / 1000000.0), \
+                    completed_at = CASE WHEN $9 THEN \
+                        to_timestamp(($10::bigint)::double precision / 1000000.0) ELSE NULL END, \
+                    updated_at = to_timestamp(($10::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND agent_execution_id = $2 \
+                   AND version = $11 AND status = 'submitting'",
+                &[
+                    &tenant_id,
+                    &execution_id,
+                    &status,
+                    &next_version,
+                    &projection.remote_run_ref,
+                    &projection.remote_session_ref,
+                    &projection.error_code,
+                    &projection.retry_at,
+                    &terminal,
+                    &db_now,
+                    &execution.version,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if updated != 1 {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "Agent execution changed while recording submission",
+            ));
+        }
+        let fenced = command
+            .expected_run
+            .version
+            .is_some_and(|value| i64::try_from(value).ok() != Some(run.version))
+            || command
+                .expected_run
+                .execution_generation
+                .is_some_and(|value| i64::try_from(value).ok() != Some(run.execution_generation));
+        let event_id = uuid(command.submission_event_id.into_bytes());
+        let event_payload = json!({
+            "agent_execution_id": execution_id,
+            "status": status,
+            "version": next_version,
+            "remote_run_ref": &projection.remote_run_ref,
+            "error_code": &projection.error_code,
+            "fenced": fenced,
+        });
+        insert_event(
+            &transaction,
+            EventInsert {
+                event_id,
+                tenant_id,
+                run_id,
+                sequence: run.next_event_sequence,
+                event_type: projection.event_type,
+                payload: &event_payload,
+                payload_schema_version: 1,
+                producer: "agent-adapter",
+                context,
+                correlation_id: uuid(context.correlation_id.into_bytes()),
+                occurred_at: None,
+                recorded_at: db_now,
+            },
+        )
+        .await?;
+        advance_run_event_cursor(
+            &transaction,
+            tenant_id,
+            run_id,
+            run.version,
+            run.execution_generation,
+            db_now,
+        )
+        .await?;
+        let snapshot = AgentExecutionSnapshot {
+            tenant_id: context.tenant_id,
+            agent_execution_id: command.agent_execution_id,
+            run_id: command.expected_run.run_id,
+            stage_execution_id: execution.stage_execution_id.map(stage_id_from_uuid),
+            task_id: task_id_from_uuid(execution.task_id),
+            endpoint_id: EndpointId::from_bytes(execution.endpoint_id.into_bytes()),
+            agent_version_id: AgentVersionId::from_bytes(execution.agent_version_id.into_bytes()),
+            status: projection.status,
+            version: nonnegative_u64(next_version, "Agent execution version")?,
+            remote_run_ref: projection.remote_run_ref.clone(),
+            remote_session_ref: projection.remote_session_ref.clone(),
+            event_cursor: execution.event_cursor,
+            cursor_version: nonnegative_u64(execution.cursor_version, "Agent cursor version")?,
+            retry_at: projection.retry_at.map(UnixMicros::new),
+            updated_at: UnixMicros::new(db_now),
+        };
+        let mut follow_ups = Vec::new();
+        if projection.status.requires_reconciliation() {
+            follow_ups.push(DurableFollowUp::ReconcileAgent {
+                execution_id: command.agent_execution_id,
+            });
+        }
+        if let Some(not_before) = projection.retry_at {
+            follow_ups.push(DurableFollowUp::ScanDueWork {
+                not_before: UnixMicros::new(not_before),
+            });
+        }
+        let outcome = encode_agent_receipt(&snapshot)?;
+        finish_receipt(
+            &transaction,
+            context,
+            "applied",
+            &outcome,
+            Some(event_id),
+            Some(("agent_execution", execution_id, next_version)),
+        )
+        .await?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(agent_committed(
+            CommandDisposition::Applied,
+            snapshot,
+            Some(command.submission_event_id),
+            follow_ups,
+        ))
+    }
+
+    /// Deduplicates a remote Agent event batch, appends authoritative local
+    /// Events, and advances the remote cursor with a single CAS transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable store error for malformed batches, raw digest conflicts,
+    /// stale cursor versions, ownership mismatch, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn append_agent_events(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: AppendAgentEvents,
+    ) -> StoreResult<Committed<AgentEventBatchOutcome>> {
+        command
+            .validate_shape()
+            .map_err(|error| invalid_command(&format!("invalid Agent event batch: {error:?}")))?;
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        match acquire_receipt(
+            &transaction,
+            context,
+            db_now,
+            self.config.receipt_ttl_micros,
+        )
+        .await?
+        {
+            ReceiptGuard::Existing(receipt) => {
+                let (outcome, event_ids) =
+                    decode_agent_batch_receipt(context.tenant_id, &receipt.outcome)?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(agent_batch_committed(
+                    CommandDisposition::Duplicate,
+                    outcome,
+                    event_ids,
+                ));
+            }
+            ReceiptGuard::Acquired => {}
+        }
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_id = uuid(command.expected_run.run_id.into_bytes());
+        let run = lock_event_run(&transaction, tenant_id, run_id).await?;
+        let execution_id = uuid(command.agent_execution_id.into_bytes());
+        let execution = lock_agent_by_id(&transaction, tenant_id, execution_id).await?;
+        if execution.run_id != run_id {
+            return Err(store_error(
+                StoreErrorCode::NotFound,
+                "Agent execution belongs to another run",
+            ));
+        }
+        let expected_cursor = to_i64(command.expected_cursor_version, "Agent cursor version")?;
+        if execution.cursor_version != expected_cursor {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "Agent event cursor version changed",
+            ));
+        }
+        let mut accepted_receipts = Vec::new();
+        let mut duplicate_receipts = Vec::new();
+        let mut local_event_ids = Vec::new();
+        let mut next_sequence = run.next_event_sequence;
+        for input in &command.events {
+            let receipt_id = uuid(input.receipt_id.into_bytes());
+            let dedupe_key = input.dedupe_key.as_bytes().as_slice();
+            if let Some(existing) = lock_agent_event_receipt(
+                &transaction,
+                tenant_id,
+                execution_id,
+                receipt_id,
+                dedupe_key,
+            )
+            .await?
+            {
+                if existing.receipt_id != receipt_id
+                    || existing.agent_execution_id != execution_id
+                    || existing.dedupe_key.as_slice() != dedupe_key
+                    || existing.raw_digest.as_slice() != input.raw_digest.as_bytes().as_slice()
+                {
+                    return Err(store_error(
+                        StoreErrorCode::IdempotencyKeyReused,
+                        "Agent event dedupe identity was reused with different content",
+                    ));
+                }
+                duplicate_receipts.push(input.receipt_id);
+                continue;
+            }
+            let local_event_id = input.local_event_id.map(|value| uuid(value.into_bytes()));
+            if let Some(local_event_id) = local_event_id {
+                let payload = json_value(&input.payload)?;
+                insert_event(
+                    &transaction,
+                    EventInsert {
+                        event_id: local_event_id,
+                        tenant_id,
+                        run_id,
+                        sequence: next_sequence,
+                        event_type: &input.event_kind,
+                        payload: &payload,
+                        payload_schema_version: i64::from(input.payload_schema_version),
+                        producer: "agent-server",
+                        context,
+                        correlation_id: uuid(context.correlation_id.into_bytes()),
+                        occurred_at: None,
+                        recorded_at: db_now,
+                    },
+                )
+                .await?;
+                next_sequence = next_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| inconsistent("run event sequence overflow"))?;
+                local_event_ids.push(event_id_from_uuid(local_event_id));
+            }
+            insert_agent_event_receipt(
+                &transaction,
+                tenant_id,
+                execution_id,
+                run_id,
+                receipt_id,
+                local_event_id,
+                input,
+                db_now,
+            )
+            .await?;
+            accepted_receipts.push(input.receipt_id);
+        }
+        let next_cursor_version = execution
+            .cursor_version
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("Agent cursor version overflow"))?;
+        let next_agent_version = execution
+            .version
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("Agent execution version overflow"))?;
+        let agent_updated = transaction
+            .execute(
+                "UPDATE agent_loom.agent_executions SET event_cursor = $4, \
+                    cursor_version = $5, version = $6, \
+                    last_synced_at = to_timestamp(($7::bigint)::double precision / 1000000.0), \
+                    updated_at = to_timestamp(($7::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND agent_execution_id = $2 AND cursor_version = $3",
+                &[
+                    &tenant_id,
+                    &execution_id,
+                    &execution.cursor_version,
+                    &command.next_cursor,
+                    &next_cursor_version,
+                    &next_agent_version,
+                    &db_now,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if agent_updated != 1 {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "Agent event cursor changed while applying batch",
+            ));
+        }
+        advance_run_event_batch(
+            &transaction,
+            tenant_id,
+            run_id,
+            run.version,
+            run.execution_generation,
+            next_sequence,
+            db_now,
+        )
+        .await?;
+        let outcome = AgentEventBatchOutcome {
+            tenant_id: context.tenant_id,
+            agent_execution_id: command.agent_execution_id,
+            run_id: command.expected_run.run_id,
+            accepted_receipts,
+            duplicate_receipts,
+            cursor_version: nonnegative_u64(next_cursor_version, "Agent cursor version")?,
+            run_status: parse_run_status(&run.status)?,
+        };
+        let receipt = encode_agent_batch_receipt(&outcome, &local_event_ids)?;
+        finish_receipt(
+            &transaction,
+            context,
+            "applied",
+            &receipt,
+            local_event_ids
+                .first()
+                .map(|value| uuid(value.into_bytes())),
+            Some(("agent_execution", execution_id, next_agent_version)),
+        )
+        .await?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(agent_batch_committed(
+            CommandDisposition::Applied,
+            outcome,
+            local_event_ids,
+        ))
+    }
+
+    /// Records a terminal or reconciliation Agent outcome while retaining late
+    /// evidence after Run generation changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable store error for invalid outcome shape, stale Agent
+    /// version, ownership mismatch, idempotency misuse, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn record_agent_outcome(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: RecordAgentOutcome,
+    ) -> StoreResult<Committed<AgentExecutionSnapshot>> {
+        validate_agent_outcome(&command)?;
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        match acquire_receipt(
+            &transaction,
+            context,
+            db_now,
+            self.config.receipt_ttl_micros,
+        )
+        .await?
+        {
+            ReceiptGuard::Existing(receipt) => {
+                let snapshot = decode_agent_receipt(context.tenant_id, &receipt.outcome)?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(agent_committed(
+                    CommandDisposition::Duplicate,
+                    snapshot,
+                    receipt.event_id.map(event_id),
+                    Vec::new(),
+                ));
+            }
+            ReceiptGuard::Acquired => {}
+        }
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_id = uuid(command.expected_run.run_id.into_bytes());
+        let execution_id = uuid(command.agent_execution_id.into_bytes());
+        let candidate = find_agent_task(&transaction, tenant_id, execution_id).await?;
+        let run = lock_event_run(&transaction, tenant_id, run_id).await?;
+        let task = lock_agent_task(&transaction, tenant_id, run_id, candidate).await?;
+        let execution = lock_agent_by_id(&transaction, tenant_id, execution_id).await?;
+        if execution.run_id != run_id || execution.task_id != candidate {
+            return Err(store_error(
+                StoreErrorCode::NotFound,
+                "Agent execution belongs to another task or run",
+            ));
+        }
+        let expected_version = to_i64(command.expected_version, "Agent execution version")?;
+        if execution.version != expected_version {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "Agent execution version changed",
+            ));
+        }
+        let next_version = execution
+            .version
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("Agent execution version overflow"))?;
+        let status = agent_status(command.status);
+        let result = command.result.as_ref().map(json_value).transpose()?;
+        let terminal = command.status.is_terminal();
+        let updated = transaction
+            .execute(
+                "UPDATE agent_loom.agent_executions SET status = $3, version = $4, \
+                    result_json = $5, error_code = $6, retry_at = NULL, \
+                    completed_at = CASE WHEN $7 THEN \
+                        to_timestamp(($8::bigint)::double precision / 1000000.0) ELSE NULL END, \
+                    updated_at = to_timestamp(($8::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND agent_execution_id = $2 AND version = $9 \
+                   AND status IN ('running', 'stopping', 'outcome_unknown', \
+                                  'reconciling', 'manual_review')",
+                &[
+                    &tenant_id,
+                    &execution_id,
+                    &status,
+                    &next_version,
+                    &result,
+                    &command.error_code,
+                    &terminal,
+                    &db_now,
+                    &execution.version,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if updated != 1 {
+            return Err(store_error(
+                StoreErrorCode::InvalidTransition,
+                "Agent execution does not accept the requested outcome",
+            ));
+        }
+        let fenced = command
+            .expected_run
+            .version
+            .is_some_and(|value| i64::try_from(value).ok() != Some(run.version))
+            || command
+                .expected_run
+                .execution_generation
+                .is_some_and(|value| {
+                    i64::try_from(value).ok() != Some(run.execution_generation)
+                        || i64::try_from(value).ok() != Some(task.generation)
+                });
+        let event_id = uuid(command.outcome_event_id.into_bytes());
+        let event_payload = json!({
+            "agent_execution_id": execution_id,
+            "status": status,
+            "version": next_version,
+            "error_code": &command.error_code,
+            "fenced": fenced,
+        });
+        insert_event(
+            &transaction,
+            EventInsert {
+                event_id,
+                tenant_id,
+                run_id,
+                sequence: run.next_event_sequence,
+                event_type: "agent.execution_outcome_recorded",
+                payload: &event_payload,
+                payload_schema_version: 1,
+                producer: "agent-adapter",
+                context,
+                correlation_id: uuid(context.correlation_id.into_bytes()),
+                occurred_at: None,
+                recorded_at: db_now,
+            },
+        )
+        .await?;
+        advance_run_event_cursor(
+            &transaction,
+            tenant_id,
+            run_id,
+            run.version,
+            run.execution_generation,
+            db_now,
+        )
+        .await?;
+        let snapshot = AgentExecutionSnapshot {
+            tenant_id: context.tenant_id,
+            agent_execution_id: command.agent_execution_id,
+            run_id: command.expected_run.run_id,
+            stage_execution_id: execution.stage_execution_id.map(stage_id_from_uuid),
+            task_id: task_id_from_uuid(execution.task_id),
+            endpoint_id: EndpointId::from_bytes(execution.endpoint_id.into_bytes()),
+            agent_version_id: AgentVersionId::from_bytes(execution.agent_version_id.into_bytes()),
+            status: command.status,
+            version: nonnegative_u64(next_version, "Agent execution version")?,
+            remote_run_ref: execution.remote_run_ref,
+            remote_session_ref: execution.remote_session_ref,
+            event_cursor: execution.event_cursor,
+            cursor_version: nonnegative_u64(execution.cursor_version, "Agent cursor version")?,
+            retry_at: None,
+            updated_at: UnixMicros::new(db_now),
+        };
+        let follow_ups = if command.status.requires_reconciliation() {
+            vec![DurableFollowUp::ReconcileAgent {
+                execution_id: command.agent_execution_id,
+            }]
+        } else {
+            Vec::new()
+        };
+        let outcome = encode_agent_receipt(&snapshot)?;
+        finish_receipt(
+            &transaction,
+            context,
+            "applied",
+            &outcome,
+            Some(event_id),
+            Some(("agent_execution", execution_id, next_version)),
+        )
+        .await?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(agent_committed(
+            CommandDisposition::Applied,
+            snapshot,
+            Some(command.outcome_event_id),
+            follow_ups,
+        ))
+    }
+
     /// Atomically validates the lease and Run fence, appends the completion
     /// Event and Checkpoint, finalizes the Task, applies stage/artifact writes,
     /// schedules the next action, and advances the Run projection.
@@ -2861,6 +3633,414 @@ fn project_tool_outcome(outcome: &ToolRecordedOutcome) -> StoreResult<ProjectedT
         },
     };
     Ok(projected)
+}
+
+#[derive(Debug)]
+struct LockedAgentExecution {
+    agent_execution_id: Uuid,
+    run_id: Uuid,
+    stage_execution_id: Option<Uuid>,
+    task_id: Uuid,
+    endpoint_id: Uuid,
+    agent_version_id: Uuid,
+    request_hash: Vec<u8>,
+    status: String,
+    version: i64,
+    remote_run_ref: Option<String>,
+    remote_session_ref: Option<String>,
+    event_cursor: Option<String>,
+    cursor_version: i64,
+    retry_at: Option<i64>,
+    updated_at: i64,
+}
+
+impl LockedAgentExecution {
+    fn snapshot(&self, tenant_id: TenantId) -> StoreResult<AgentExecutionSnapshot> {
+        Ok(AgentExecutionSnapshot {
+            tenant_id,
+            agent_execution_id: AgentExecutionId::from_bytes(self.agent_execution_id.into_bytes()),
+            run_id: run_id_from_uuid(self.run_id),
+            stage_execution_id: self.stage_execution_id.map(stage_id_from_uuid),
+            task_id: task_id_from_uuid(self.task_id),
+            endpoint_id: EndpointId::from_bytes(self.endpoint_id.into_bytes()),
+            agent_version_id: AgentVersionId::from_bytes(self.agent_version_id.into_bytes()),
+            status: parse_agent_status(&self.status)?,
+            version: nonnegative_u64(self.version, "Agent execution version")?,
+            remote_run_ref: self.remote_run_ref.clone(),
+            remote_session_ref: self.remote_session_ref.clone(),
+            event_cursor: self.event_cursor.clone(),
+            cursor_version: nonnegative_u64(self.cursor_version, "Agent cursor version")?,
+            retry_at: self.retry_at.map(UnixMicros::new),
+            updated_at: UnixMicros::new(self.updated_at),
+        })
+    }
+}
+
+fn validate_prepare_agent(command: &PrepareAgentExecution) -> StoreResult<()> {
+    json_value(&command.capabilities_snapshot)?;
+    Ok(())
+}
+
+const AGENT_EXECUTION_SELECT: &str = "SELECT agent_execution_id, run_id, stage_execution_id, task_id, endpoint_id, \
+            agent_version_id, request_hash, status, version, remote_run_ref, \
+            remote_session_ref, event_cursor, cursor_version, \
+            CASE WHEN retry_at IS NULL THEN NULL \
+                ELSE (extract(epoch FROM retry_at) * 1000000)::bigint END, \
+            (extract(epoch FROM updated_at) * 1000000)::bigint \
+     FROM agent_loom.agent_executions ";
+
+fn decode_locked_agent(row: &Row) -> LockedAgentExecution {
+    LockedAgentExecution {
+        agent_execution_id: row.get(0),
+        run_id: row.get(1),
+        stage_execution_id: row.get(2),
+        task_id: row.get(3),
+        endpoint_id: row.get(4),
+        agent_version_id: row.get(5),
+        request_hash: row.get(6),
+        status: row.get(7),
+        version: row.get(8),
+        remote_run_ref: row.get(9),
+        remote_session_ref: row.get(10),
+        event_cursor: row.get(11),
+        cursor_version: row.get(12),
+        retry_at: row.get(13),
+        updated_at: row.get(14),
+    }
+}
+
+async fn lock_agent_by_idempotency(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    endpoint_id: Uuid,
+    idempotency_key: &str,
+) -> StoreResult<Option<LockedAgentExecution>> {
+    let sql = format!(
+        "{AGENT_EXECUTION_SELECT} \
+         WHERE tenant_id = $1 AND endpoint_id = $2 AND idempotency_key = $3 FOR UPDATE"
+    );
+    transaction
+        .query_opt(&sql, &[&tenant_id, &endpoint_id, &idempotency_key])
+        .await
+        .map(|row| row.as_ref().map(decode_locked_agent))
+        .map_err(map_database_error)
+}
+
+async fn lock_agent_by_id(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    execution_id: Uuid,
+) -> StoreResult<LockedAgentExecution> {
+    let sql = format!(
+        "{AGENT_EXECUTION_SELECT} \
+         WHERE tenant_id = $1 AND agent_execution_id = $2 FOR UPDATE"
+    );
+    transaction
+        .query_opt(&sql, &[&tenant_id, &execution_id])
+        .await
+        .map_err(map_database_error)?
+        .as_ref()
+        .map(decode_locked_agent)
+        .ok_or_else(|| store_error(StoreErrorCode::NotFound, "Agent execution was not found"))
+}
+
+fn validate_existing_agent(
+    command: &PrepareAgentExecution,
+    task: &LockedWorkerTask,
+    existing: &LockedAgentExecution,
+) -> StoreResult<()> {
+    if existing.run_id != task.run_id
+        || existing.task_id != task.task_id
+        || existing.stage_execution_id != task.stage_execution_id
+        || existing.endpoint_id != uuid(command.endpoint_id.into_bytes())
+        || existing.agent_version_id != uuid(command.agent_version_id.into_bytes())
+        || existing.request_hash.as_slice() != command.request_hash.as_bytes().as_slice()
+    {
+        return Err(store_error(
+            StoreErrorCode::IdempotencyKeyReused,
+            "Agent idempotency key was reused for a different request",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ProjectedAgentSubmission {
+    status: AgentExecutionStatus,
+    remote_run_ref: Option<String>,
+    remote_session_ref: Option<String>,
+    error_code: Option<String>,
+    retry_at: Option<i64>,
+    event_type: &'static str,
+}
+
+fn project_agent_submission(
+    outcome: &AgentSubmissionOutcome,
+) -> StoreResult<ProjectedAgentSubmission> {
+    match outcome {
+        AgentSubmissionOutcome::Accepted {
+            remote_run_ref,
+            remote_session_ref,
+        } => {
+            if remote_run_ref.is_empty()
+                || remote_session_ref.as_ref().is_some_and(String::is_empty)
+            {
+                return Err(invalid_command(
+                    "accepted Agent submission has invalid remote identity",
+                ));
+            }
+            Ok(ProjectedAgentSubmission {
+                status: AgentExecutionStatus::Running,
+                remote_run_ref: Some(remote_run_ref.clone()),
+                remote_session_ref: remote_session_ref.clone(),
+                error_code: None,
+                retry_at: None,
+                event_type: "agent.submission_accepted",
+            })
+        }
+        AgentSubmissionOutcome::Uncertain => Ok(ProjectedAgentSubmission {
+            status: AgentExecutionStatus::OutcomeUnknown,
+            remote_run_ref: None,
+            remote_session_ref: None,
+            error_code: None,
+            retry_at: None,
+            event_type: "agent.submission_outcome_unknown",
+        }),
+        AgentSubmissionOutcome::Rejected {
+            error_code,
+            retry,
+            retry_at,
+        } => {
+            if error_code.is_empty() {
+                return Err(invalid_command(
+                    "rejected Agent submission has no error code",
+                ));
+            }
+            let status = match retry {
+                ExecutionRetryClass::Never => AgentExecutionStatus::Failed,
+                ExecutionRetryClass::ManualReview => AgentExecutionStatus::ManualReview,
+                ExecutionRetryClass::SameRequestBackoff
+                | ExecutionRetryClass::ReconnectAndResume
+                | ExecutionRetryClass::QueryOutcome => AgentExecutionStatus::Reconciling,
+            };
+            let retry_at = retry_at.map(UnixMicros::get);
+            if (*retry == ExecutionRetryClass::SameRequestBackoff) != retry_at.is_some() {
+                return Err(invalid_command(
+                    "Agent retry time must be present only for scheduled backoff",
+                ));
+            }
+            Ok(ProjectedAgentSubmission {
+                status,
+                remote_run_ref: None,
+                remote_session_ref: None,
+                error_code: Some(error_code.clone()),
+                retry_at,
+                event_type: "agent.submission_rejected",
+            })
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LockedAgentEventReceipt {
+    receipt_id: Uuid,
+    agent_execution_id: Uuid,
+    dedupe_key: Vec<u8>,
+    raw_digest: Vec<u8>,
+}
+
+async fn lock_agent_event_receipt(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    execution_id: Uuid,
+    receipt_id: Uuid,
+    dedupe_key: &[u8],
+) -> StoreResult<Option<LockedAgentEventReceipt>> {
+    let rows = transaction
+        .query(
+            "SELECT agent_event_receipt_id, agent_execution_id, dedupe_key, raw_digest \
+             FROM agent_loom.agent_event_receipts \
+             WHERE tenant_id = $1 AND (agent_event_receipt_id = $2 OR \
+                   (agent_execution_id = $3 AND dedupe_key = $4)) FOR UPDATE",
+            &[&tenant_id, &receipt_id, &execution_id, &dedupe_key],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if rows.len() > 1 {
+        return Err(store_error(
+            StoreErrorCode::IdempotencyKeyReused,
+            "Agent event receipt and dedupe key resolve to different events",
+        ));
+    }
+    Ok(rows.first().map(|row| LockedAgentEventReceipt {
+        receipt_id: row.get(0),
+        agent_execution_id: row.get(1),
+        dedupe_key: row.get(2),
+        raw_digest: row.get(3),
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_agent_event_receipt(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    execution_id: Uuid,
+    run_id: Uuid,
+    receipt_id: Uuid,
+    local_event_id: Option<Uuid>,
+    input: &NormalizedAgentEventInput,
+    db_now: i64,
+) -> StoreResult<()> {
+    let source_sequence = input
+        .source_sequence
+        .map(|value| to_i64(value, "Agent event source sequence"))
+        .transpose()?;
+    let inserted = transaction
+        .execute(
+            "INSERT INTO agent_loom.agent_event_receipts (\
+                agent_event_receipt_id, tenant_id, agent_execution_id, run_id, dedupe_key, \
+                source_event_id, source_sequence, source_cursor, event_kind, raw_digest, \
+                local_event_id, recorded_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                to_timestamp(($12::bigint)::double precision / 1000000.0))",
+            &[
+                &receipt_id,
+                &tenant_id,
+                &execution_id,
+                &run_id,
+                &input.dedupe_key.as_bytes().as_slice(),
+                &input.source_event_id,
+                &source_sequence,
+                &input.source_cursor,
+                &input.event_kind,
+                &input.raw_digest.as_bytes().as_slice(),
+                &local_event_id,
+                &db_now,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if inserted != 1 {
+        return Err(inconsistent(
+            "Agent event receipt insert did not affect one row",
+        ));
+    }
+    Ok(())
+}
+
+async fn advance_run_event_batch(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    version: i64,
+    generation: i64,
+    next_event_sequence: i64,
+    db_now: i64,
+) -> StoreResult<()> {
+    let updated = transaction
+        .execute(
+            "UPDATE agent_loom.runs SET version = version + 1, next_event_sequence = $5, \
+                updated_at = to_timestamp(($6::bigint)::double precision / 1000000.0) \
+             WHERE tenant_id = $1 AND run_id = $2 AND version = $3 \
+               AND execution_generation = $4",
+            &[
+                &tenant_id,
+                &run_id,
+                &version,
+                &generation,
+                &next_event_sequence,
+                &db_now,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if updated != 1 {
+        return Err(store_error(
+            StoreErrorCode::VersionConflict,
+            "run changed while appending an Agent event batch",
+        ));
+    }
+    Ok(())
+}
+
+async fn find_agent_task(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    execution_id: Uuid,
+) -> StoreResult<Uuid> {
+    transaction
+        .query_opt(
+            "SELECT task_id FROM agent_loom.agent_executions \
+             WHERE tenant_id = $1 AND agent_execution_id = $2",
+            &[&tenant_id, &execution_id],
+        )
+        .await
+        .map_err(map_database_error)?
+        .map(|row| row.get(0))
+        .ok_or_else(|| store_error(StoreErrorCode::NotFound, "Agent execution was not found"))
+}
+
+#[derive(Debug)]
+struct LockedAgentTask {
+    generation: i64,
+}
+
+async fn lock_agent_task(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    task_id: Uuid,
+) -> StoreResult<LockedAgentTask> {
+    let row = transaction
+        .query_opt(
+            "SELECT run_id, generation FROM agent_loom.tasks \
+             WHERE tenant_id = $1 AND task_id = $2 FOR UPDATE",
+            &[&tenant_id, &task_id],
+        )
+        .await
+        .map_err(map_database_error)?
+        .ok_or_else(|| store_error(StoreErrorCode::NotFound, "Agent task was not found"))?;
+    if row.get::<_, Uuid>(0) != run_id {
+        return Err(store_error(
+            StoreErrorCode::NotFound,
+            "Agent task belongs to another run",
+        ));
+    }
+    Ok(LockedAgentTask {
+        generation: row.get(1),
+    })
+}
+
+fn validate_agent_outcome(command: &RecordAgentOutcome) -> StoreResult<()> {
+    if !command.shape_is_valid() {
+        return Err(invalid_command(
+            "Agent outcome status is not terminal or recoverable",
+        ));
+    }
+    if command.error_code.as_ref().is_some_and(String::is_empty) {
+        return Err(invalid_command("Agent outcome has an empty error code"));
+    }
+    let shape_is_valid = match command.status {
+        AgentExecutionStatus::Succeeded => command.result.is_some() && command.error_code.is_none(),
+        AgentExecutionStatus::Failed => command.result.is_none() && command.error_code.is_some(),
+        AgentExecutionStatus::Cancelled
+        | AgentExecutionStatus::OutcomeUnknown
+        | AgentExecutionStatus::Reconciling
+        | AgentExecutionStatus::ManualReview => command.result.is_none(),
+        AgentExecutionStatus::Planned
+        | AgentExecutionStatus::Submitting
+        | AgentExecutionStatus::Running
+        | AgentExecutionStatus::Stopping => false,
+    };
+    if !shape_is_valid {
+        return Err(invalid_command(
+            "Agent outcome result and error do not match its status",
+        ));
+    }
+    if let Some(result) = &command.result {
+        json_value(result)?;
+    }
+    Ok(())
 }
 
 fn validate_existing_tool(
@@ -4506,6 +5686,39 @@ const fn tool_status(value: ToolExecutionStatus) -> &'static str {
     }
 }
 
+fn parse_agent_status(value: &str) -> StoreResult<AgentExecutionStatus> {
+    match value {
+        "planned" => Ok(AgentExecutionStatus::Planned),
+        "submitting" => Ok(AgentExecutionStatus::Submitting),
+        "running" => Ok(AgentExecutionStatus::Running),
+        "stopping" => Ok(AgentExecutionStatus::Stopping),
+        "succeeded" => Ok(AgentExecutionStatus::Succeeded),
+        "failed" => Ok(AgentExecutionStatus::Failed),
+        "cancelled" => Ok(AgentExecutionStatus::Cancelled),
+        "outcome_unknown" => Ok(AgentExecutionStatus::OutcomeUnknown),
+        "reconciling" => Ok(AgentExecutionStatus::Reconciling),
+        "manual_review" => Ok(AgentExecutionStatus::ManualReview),
+        _ => Err(inconsistent(
+            "database contains an unknown Agent execution status",
+        )),
+    }
+}
+
+const fn agent_status(value: AgentExecutionStatus) -> &'static str {
+    match value {
+        AgentExecutionStatus::Planned => "planned",
+        AgentExecutionStatus::Submitting => "submitting",
+        AgentExecutionStatus::Running => "running",
+        AgentExecutionStatus::Stopping => "stopping",
+        AgentExecutionStatus::Succeeded => "succeeded",
+        AgentExecutionStatus::Failed => "failed",
+        AgentExecutionStatus::Cancelled => "cancelled",
+        AgentExecutionStatus::OutcomeUnknown => "outcome_unknown",
+        AgentExecutionStatus::Reconciling => "reconciling",
+        AgentExecutionStatus::ManualReview => "manual_review",
+    }
+}
+
 const fn stage_status(status: StageStatus) -> &'static str {
     match status {
         StageStatus::Planned => "planned",
@@ -4636,6 +5849,50 @@ fn tool_committed(
             PostCommitHint::RunEventsAvailable { run_id },
             PostCommitHint::InvalidateRunCache { run_id },
         ],
+    }
+}
+
+fn agent_committed(
+    disposition: CommandDisposition,
+    snapshot: AgentExecutionSnapshot,
+    event_id: Option<EventId>,
+    durable_follow_ups: Vec<DurableFollowUp>,
+) -> Committed<AgentExecutionSnapshot> {
+    let run_id = snapshot.run_id;
+    Committed {
+        disposition,
+        value: snapshot,
+        event_ids: event_id.into_iter().collect(),
+        durable_follow_ups,
+        post_commit_hints: vec![
+            PostCommitHint::RunEventsAvailable { run_id },
+            PostCommitHint::InvalidateRunCache { run_id },
+        ],
+    }
+}
+
+fn agent_batch_committed(
+    disposition: CommandDisposition,
+    outcome: AgentEventBatchOutcome,
+    event_ids: Vec<EventId>,
+) -> Committed<AgentEventBatchOutcome> {
+    let mut post_commit_hints = vec![PostCommitHint::InvalidateRunCache {
+        run_id: outcome.run_id,
+    }];
+    if !event_ids.is_empty() {
+        post_commit_hints.insert(
+            0,
+            PostCommitHint::RunEventsAvailable {
+                run_id: outcome.run_id,
+            },
+        );
+    }
+    Committed {
+        disposition,
+        value: outcome,
+        event_ids,
+        durable_follow_ups: Vec::new(),
+        post_commit_hints,
     }
 }
 
@@ -4771,6 +6028,156 @@ fn decode_tool_receipt(tenant_id: TenantId, value: &Value) -> StoreResult<ToolEx
         retry_at: receipt.retry_at.map(UnixMicros::new),
         updated_at: UnixMicros::new(receipt.updated_at),
     })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AgentReceipt {
+    #[serde(rename = "type")]
+    outcome_type: String,
+    agent_execution_id: Uuid,
+    run_id: Uuid,
+    stage_execution_id: Option<Uuid>,
+    task_id: Uuid,
+    endpoint_id: Uuid,
+    agent_version_id: Uuid,
+    status: String,
+    version: u64,
+    remote_run_ref: Option<String>,
+    remote_session_ref: Option<String>,
+    event_cursor: Option<String>,
+    cursor_version: u64,
+    retry_at: Option<i64>,
+    updated_at: i64,
+}
+
+fn encode_agent_receipt(snapshot: &AgentExecutionSnapshot) -> StoreResult<Value> {
+    serde_json::to_value(AgentReceipt {
+        outcome_type: "agent_execution".to_owned(),
+        agent_execution_id: uuid(snapshot.agent_execution_id.into_bytes()),
+        run_id: uuid(snapshot.run_id.into_bytes()),
+        stage_execution_id: snapshot
+            .stage_execution_id
+            .map(|value| uuid(value.into_bytes())),
+        task_id: uuid(snapshot.task_id.into_bytes()),
+        endpoint_id: uuid(snapshot.endpoint_id.into_bytes()),
+        agent_version_id: uuid(snapshot.agent_version_id.into_bytes()),
+        status: agent_status(snapshot.status).to_owned(),
+        version: snapshot.version,
+        remote_run_ref: snapshot.remote_run_ref.clone(),
+        remote_session_ref: snapshot.remote_session_ref.clone(),
+        event_cursor: snapshot.event_cursor.clone(),
+        cursor_version: snapshot.cursor_version,
+        retry_at: snapshot.retry_at.map(UnixMicros::get),
+        updated_at: snapshot.updated_at.get(),
+    })
+    .map_err(|_| inconsistent("failed to encode AgentExecution receipt"))
+}
+
+fn decode_agent_receipt(tenant_id: TenantId, value: &Value) -> StoreResult<AgentExecutionSnapshot> {
+    let receipt: AgentReceipt = serde_json::from_value(value.clone())
+        .map_err(|_| inconsistent("stored receipt is not an AgentExecution outcome"))?;
+    if receipt.outcome_type != "agent_execution" {
+        return Err(inconsistent(
+            "stored command receipt has the wrong outcome type",
+        ));
+    }
+    Ok(AgentExecutionSnapshot {
+        tenant_id,
+        agent_execution_id: AgentExecutionId::from_bytes(receipt.agent_execution_id.into_bytes()),
+        run_id: run_id_from_uuid(receipt.run_id),
+        stage_execution_id: receipt.stage_execution_id.map(stage_id_from_uuid),
+        task_id: task_id_from_uuid(receipt.task_id),
+        endpoint_id: EndpointId::from_bytes(receipt.endpoint_id.into_bytes()),
+        agent_version_id: AgentVersionId::from_bytes(receipt.agent_version_id.into_bytes()),
+        status: parse_agent_status(&receipt.status)?,
+        version: receipt.version,
+        remote_run_ref: receipt.remote_run_ref,
+        remote_session_ref: receipt.remote_session_ref,
+        event_cursor: receipt.event_cursor,
+        cursor_version: receipt.cursor_version,
+        retry_at: receipt.retry_at.map(UnixMicros::new),
+        updated_at: UnixMicros::new(receipt.updated_at),
+    })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AgentBatchReceipt {
+    #[serde(rename = "type")]
+    outcome_type: String,
+    agent_execution_id: Uuid,
+    run_id: Uuid,
+    accepted_receipts: Vec<Uuid>,
+    duplicate_receipts: Vec<Uuid>,
+    cursor_version: u64,
+    run_status: String,
+    event_ids: Vec<Uuid>,
+}
+
+fn encode_agent_batch_receipt(
+    outcome: &AgentEventBatchOutcome,
+    event_ids: &[EventId],
+) -> StoreResult<Value> {
+    serde_json::to_value(AgentBatchReceipt {
+        outcome_type: "agent_event_batch".to_owned(),
+        agent_execution_id: uuid(outcome.agent_execution_id.into_bytes()),
+        run_id: uuid(outcome.run_id.into_bytes()),
+        accepted_receipts: outcome
+            .accepted_receipts
+            .iter()
+            .map(|value| uuid(value.into_bytes()))
+            .collect(),
+        duplicate_receipts: outcome
+            .duplicate_receipts
+            .iter()
+            .map(|value| uuid(value.into_bytes()))
+            .collect(),
+        cursor_version: outcome.cursor_version,
+        run_status: run_status(outcome.run_status).to_owned(),
+        event_ids: event_ids
+            .iter()
+            .map(|value| uuid(value.into_bytes()))
+            .collect(),
+    })
+    .map_err(|_| inconsistent("failed to encode Agent event batch receipt"))
+}
+
+fn decode_agent_batch_receipt(
+    tenant_id: TenantId,
+    value: &Value,
+) -> StoreResult<(AgentEventBatchOutcome, Vec<EventId>)> {
+    let receipt: AgentBatchReceipt = serde_json::from_value(value.clone())
+        .map_err(|_| inconsistent("stored receipt is not an Agent event batch outcome"))?;
+    if receipt.outcome_type != "agent_event_batch" {
+        return Err(inconsistent(
+            "stored command receipt has the wrong outcome type",
+        ));
+    }
+    Ok((
+        AgentEventBatchOutcome {
+            tenant_id,
+            agent_execution_id: AgentExecutionId::from_bytes(
+                receipt.agent_execution_id.into_bytes(),
+            ),
+            run_id: run_id_from_uuid(receipt.run_id),
+            accepted_receipts: receipt
+                .accepted_receipts
+                .into_iter()
+                .map(|value| AgentEventReceiptId::from_bytes(value.into_bytes()))
+                .collect(),
+            duplicate_receipts: receipt
+                .duplicate_receipts
+                .into_iter()
+                .map(|value| AgentEventReceiptId::from_bytes(value.into_bytes()))
+                .collect(),
+            cursor_version: receipt.cursor_version,
+            run_status: parse_run_status(&receipt.run_status)?,
+        },
+        receipt
+            .event_ids
+            .into_iter()
+            .map(event_id_from_uuid)
+            .collect(),
+    ))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -5006,6 +6413,72 @@ mod tests {
             decode_tool_receipt(snapshot.tenant_id, &encoded).expect("decode Tool receipt"),
             snapshot
         );
+    }
+
+    #[test]
+    fn agent_retry_projection_requires_a_durable_due_time() {
+        let projected = project_agent_submission(&AgentSubmissionOutcome::Rejected {
+            error_code: "busy".to_owned(),
+            retry: ExecutionRetryClass::SameRequestBackoff,
+            retry_at: Some(UnixMicros::new(123)),
+        })
+        .expect("valid Agent retry projection");
+        assert_eq!(projected.status, AgentExecutionStatus::Reconciling);
+        assert_eq!(projected.retry_at, Some(123));
+
+        let error = project_agent_submission(&AgentSubmissionOutcome::Rejected {
+            error_code: "busy".to_owned(),
+            retry: ExecutionRetryClass::SameRequestBackoff,
+            retry_at: None,
+        })
+        .expect_err("in-memory-only Agent retry is rejected");
+        assert_eq!(error.code, StoreErrorCode::ConstraintViolation);
+    }
+
+    #[test]
+    fn agent_receipt_round_trip_preserves_cursor_and_retry_schedule() {
+        let snapshot = AgentExecutionSnapshot {
+            tenant_id: TenantId::from_bytes([1; 16]),
+            agent_execution_id: AgentExecutionId::from_bytes([2; 16]),
+            run_id: RunId::from_bytes([3; 16]),
+            stage_execution_id: Some(StageExecutionId::from_bytes([4; 16])),
+            task_id: TaskId::from_bytes([5; 16]),
+            endpoint_id: EndpointId::from_bytes([6; 16]),
+            agent_version_id: AgentVersionId::from_bytes([7; 16]),
+            status: AgentExecutionStatus::Reconciling,
+            version: 3,
+            remote_run_ref: Some("remote-run".to_owned()),
+            remote_session_ref: Some("remote-session".to_owned()),
+            event_cursor: Some("cursor-4".to_owned()),
+            cursor_version: 4,
+            retry_at: Some(UnixMicros::new(500)),
+            updated_at: UnixMicros::new(400),
+        };
+        let encoded = encode_agent_receipt(&snapshot).expect("encode Agent receipt");
+        assert_eq!(
+            decode_agent_receipt(snapshot.tenant_id, &encoded).expect("decode Agent receipt"),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn agent_batch_receipt_round_trip_preserves_event_ids() {
+        let outcome = AgentEventBatchOutcome {
+            tenant_id: TenantId::from_bytes([1; 16]),
+            agent_execution_id: AgentExecutionId::from_bytes([2; 16]),
+            run_id: RunId::from_bytes([3; 16]),
+            accepted_receipts: vec![AgentEventReceiptId::from_bytes([4; 16])],
+            duplicate_receipts: vec![AgentEventReceiptId::from_bytes([5; 16])],
+            cursor_version: 2,
+            run_status: RunStatus::Running,
+        };
+        let event_ids = vec![EventId::from_bytes([6; 16]), EventId::from_bytes([7; 16])];
+        let encoded =
+            encode_agent_batch_receipt(&outcome, &event_ids).expect("encode Agent event batch");
+        let (decoded, decoded_event_ids) =
+            decode_agent_batch_receipt(outcome.tenant_id, &encoded).expect("decode Agent batch");
+        assert_eq!(decoded, outcome);
+        assert_eq!(decoded_event_ids, event_ids);
     }
 
     #[test]
