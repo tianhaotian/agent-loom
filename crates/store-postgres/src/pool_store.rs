@@ -1,7 +1,7 @@
 use agent_loom_domain::{AgentExecutionId, ToolExecutionId};
 use agent_loom_domain::{
-    AgentExecutionSnapshot, ArtifactRefSnapshot, OutboxMessage, PlanRevisionSnapshot, RunId,
-    RunSnapshot, StageExecutionSnapshot, ToolExecutionSnapshot, WaitSnapshot, WorkflowId,
+    AgentExecutionSnapshot, ArtifactRefSnapshot, JsonPayload, OutboxMessage, PlanRevisionSnapshot,
+    RunId, RunSnapshot, StageExecutionSnapshot, ToolExecutionSnapshot, WaitSnapshot, WorkflowId,
     WorkflowSnapshot,
 };
 use agent_loom_durable_store::{
@@ -85,6 +85,17 @@ impl DurableStore for PostgresStore {
         Box::pin(async move {
             let client = self.connection().await?;
             self.executor.get_run(&client, context, run_id).await
+        })
+    }
+
+    fn get_run_input<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        run_id: RunId,
+    ) -> StoreFuture<'a, Option<JsonPayload>> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor.get_run_input(&client, context, run_id).await
         })
     }
 

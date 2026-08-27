@@ -36,7 +36,7 @@ PostgreSQL 已接入真实驱动执行层：migration executor 使用 SHA-256 ph
 
 每个权威 Event 还会在同一 PostgreSQL 事务中创建唯一 `(tenant, event, topic)` 的 `run.events` Outbox 消息。Outbox Publisher 使用数据库时间领取短 Lease，发布成功后以 publisher/token/attempt fencing 确认；失败会持久化下一次可用时间，进程在外部发送后、确认前崩溃则在 Lease 到期后按 at-least-once 语义重放。旧 Publisher 无法确认被新 Worker 接管的消息。MVP 的真实 Publisher 输出结构化 JSON 日志；接入 Broker 时只需替换 Publisher，消费者仍须按 `event_id` 幂等。
 
-Run 创建事务同时保存不可变 PlanRevision 1。后续完整 ExecutionPlan 快照可通过 `/v1/runs/{run_id}/plan-revisions` 幂等提交和查询；Store 同时 fence Run version、execution generation 与当前 Plan revision，并原子追加 `run.plan_revised` Event/Outbox，因此并发或过期 Replan 不会覆盖已提交计划。
+Run 创建事务同时保存不可变 PlanRevision 1。后续完整 ExecutionPlan 快照可通过 `/v1/runs/{run_id}/plan-revisions` 幂等提交和查询；Store 同时 fence Run version、execution generation 与当前 Plan revision，并原子追加 `run.plan_revised` Event/Outbox 和 append-only 新 Task，因此并发或过期 Replan 不会覆盖已提交计划。既有 Task/Stage 不允许被 revision 静默删除或改写，新增 Task 绑定原始 Run input，并使用 revision Event 作为可追踪的创建因果。
 
 ExecutionPlan 的初始 Task 可以声明有向无环依赖、`all`/`any` JoinPolicy，以及成功状态或结果 JSON Pointer 等值条件。根 Task 直接入队，其余 Task 保持 `scheduled`；前置 Task 完成时，Store 在同一事务锁定并评估依赖，只把满足条件的后继 Task 原子切换为 `queued`，重复完成或并发检查不会重复激活。
 

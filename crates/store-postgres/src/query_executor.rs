@@ -60,6 +60,31 @@ impl crate::PostgresTransactionExecutor {
             .transpose()
     }
 
+    /// Reads the immutable input bound to a Run.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for unavailable PostgreSQL or malformed
+    /// persisted JSON.
+    pub async fn get_run_input(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        run_id: RunId,
+    ) -> StoreResult<Option<JsonPayload>> {
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_id = uuid(run_id.into_bytes());
+        client
+            .query_opt(
+                "SELECT input_json FROM agent_loom.runs WHERE tenant_id = $1 AND run_id = $2",
+                &[&tenant_id, &run_id],
+            )
+            .await
+            .map_err(map_database_error)?
+            .map(|row| decode_json_payload(&row.get::<_, Value>(0)))
+            .transpose()
+    }
+
     /// Lists immutable Plan revisions for one Run in revision order.
     ///
     /// # Errors

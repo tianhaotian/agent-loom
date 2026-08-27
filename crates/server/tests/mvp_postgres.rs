@@ -1093,6 +1093,7 @@ fn decode_test_id(value: &str) -> Result<[u8; 16], ()> {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn plan_revisions_are_version_fenced_idempotent_and_auditable() {
     let Ok(database_url) = std::env::var("AGENT_LOOM_TEST_POSTGRES_URL") else {
         return;
@@ -1109,6 +1110,16 @@ async fn plan_revisions_are_version_fenced_idempotent_and_auditable() {
 
     let mut revised_plan = initial[0]["plan"].clone();
     revised_plan["extension"] = json!({"revision_test": 2});
+    revised_plan["initial_tasks"]
+        .as_array_mut()
+        .expect("Plan Tasks are an array")
+        .push(json!({
+            "key": "revision-added-task",
+            "handler": "delivery-mvp",
+            "kind": "model",
+            "priority": 10000,
+            "input": {"operation": "replanned"}
+        }));
     let request = json!({
         "base_revision": 1,
         "plan": revised_plan,
@@ -1124,6 +1135,36 @@ async fn plan_revisions_are_version_fenced_idempotent_and_auditable() {
     .expect("decode Plan revision response");
     assert_eq!(applied_body["plan_revision"], 2);
     assert_eq!(applied_body["disposition"], "applied");
+
+    let claimed = application
+        .store
+        .claim_task(
+            &test_command_context(application.tenant_id, nonce, "claim-replanned-task"),
+            ClaimTask {
+                worker_id: WorkerId::from_bytes(test_id(nonce, "replan-worker")),
+                lease_token: LeaseToken::from_bytes([31; 32]),
+                lease_duration: DurationMicros::new(5_000_000),
+                candidate_window: 8,
+                kind: Some(TaskKind::Model),
+            },
+        )
+        .await
+        .expect("claim dynamically added Task")
+        .expect("dynamic Task is queued atomically with Plan revision");
+    assert_eq!(
+        claimed.value.task.logical_key.as_str(),
+        "revision-added-task"
+    );
+    let claimed_input: Value = serde_json::from_slice(claimed.value.task.input.as_bytes())
+        .expect("decode dynamically materialized Task input");
+    assert_eq!(
+        claimed_input["payload"]["run_input"]["goal"],
+        "publish reliably"
+    );
+    assert_eq!(
+        claimed_input["payload"]["task_spec"]["operation"],
+        "replanned"
+    );
 
     let duplicate = post_plan_revision(&application, &run_id, "plan-revision-2", &request).await;
     assert_eq!(duplicate.status(), StatusCode::OK);

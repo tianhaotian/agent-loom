@@ -3844,7 +3844,11 @@ impl PostgresTransactionExecutor {
                         CASE WHEN deadline IS NULL THEN NULL \
                              ELSE (extract(epoch FROM deadline) * 1000000)::bigint END, \
                         (extract(epoch FROM updated_at) * 1000000)::bigint, \
-                        current_plan_revision_id, current_plan_revision \
+                        current_plan_revision_id, current_plan_revision, \
+                        (SELECT c.sequence FROM agent_loom.checkpoints c \
+                         WHERE c.tenant_id = runs.tenant_id \
+                           AND c.run_id = runs.run_id \
+                           AND c.checkpoint_id = runs.current_checkpoint_id) \
                  FROM agent_loom.runs WHERE tenant_id = $1 AND run_id = $2 FOR UPDATE",
                 &[&tenant_id, &run_id],
             )
@@ -3885,6 +3889,7 @@ impl PostgresTransactionExecutor {
             "schema_version": command.revision.schema_version,
             "plan_key": command.revision.plan_key.as_str(),
             "change_summary": change_summary,
+            "added_tasks": command.new_tasks.iter().map(|task| task.logical_key.as_str()).collect::<Vec<_>>(),
         });
         insert_event(
             &transaction,
@@ -3904,6 +3909,58 @@ impl PostgresTransactionExecutor {
             },
         )
         .await?;
+
+        let checkpoint_sequence: i64 = row
+            .get::<_, Option<i64>>(12)
+            .ok_or_else(|| inconsistent("run has no current Checkpoint"))?;
+        for task in &command.new_tasks {
+            insert_initial_task(
+                &transaction,
+                tenant_id,
+                run_id,
+                event_id,
+                checkpoint_sequence,
+                locked.generation_i64,
+                db_now,
+                task,
+            )
+            .await?;
+        }
+        for task in &command.new_tasks {
+            insert_initial_task_dependencies(
+                &transaction,
+                tenant_id,
+                run_id,
+                event_id,
+                db_now,
+                task,
+            )
+            .await?;
+        }
+        let mut follow_up_ids = command
+            .new_tasks
+            .iter()
+            .filter(|task| task.dependencies.is_empty())
+            .map(|task| task.task_id)
+            .collect::<HashSet<_>>();
+        for prerequisite in command
+            .new_tasks
+            .iter()
+            .flat_map(|task| &task.dependencies)
+            .map(|dependency| dependency.prerequisite_task_id)
+            .collect::<HashSet<_>>()
+        {
+            follow_up_ids.extend(
+                activate_dependent_tasks(
+                    &transaction,
+                    tenant_id,
+                    run_id,
+                    uuid(prerequisite.into_bytes()),
+                    db_now,
+                )
+                .await?,
+            );
+        }
         insert_plan_revision(
             &transaction,
             tenant_id,
@@ -3976,7 +4033,10 @@ impl PostgresTransactionExecutor {
             CommandDisposition::Applied,
             snapshot,
             Some(command.event_id),
-            Vec::new(),
+            follow_up_ids
+                .into_iter()
+                .map(|task_id| DurableFollowUp::Task { task_id })
+                .collect(),
         ))
     }
 }
@@ -8074,6 +8134,36 @@ fn validate_plan_revision(command: &RevisePlan) -> StoreResult<()> {
     }
     json_value(&revision.plan)?;
     json_value(&revision.change_summary)?;
+    for task in &command.new_tasks {
+        if task.task_id.is_nil() || task.max_attempts == 0 {
+            return Err(invalid_command("revised Task shape is invalid"));
+        }
+        for dependency in &task.dependencies {
+            let condition = json_value(&dependency.condition)?;
+            if dependency.prerequisite_task_id == task.task_id
+                || !dependency_condition_shape_is_valid(&condition)
+            {
+                return Err(invalid_command("revised Task dependency is invalid"));
+            }
+        }
+    }
+    if command.new_tasks.iter().enumerate().any(|(index, task)| {
+        command.new_tasks[index + 1..]
+            .iter()
+            .any(|other| other.task_id == task.task_id || other.logical_key == task.logical_key)
+            || task
+                .dependencies
+                .iter()
+                .enumerate()
+                .any(|(dependency_index, dependency)| {
+                    task.dependencies[dependency_index + 1..]
+                        .iter()
+                        .any(|other| other.prerequisite_task_id == dependency.prerequisite_task_id)
+                })
+    }) || initial_task_dependencies_have_cycle(&command.new_tasks)
+    {
+        return Err(invalid_command("revised Task graph is invalid"));
+    }
     Ok(())
 }
 

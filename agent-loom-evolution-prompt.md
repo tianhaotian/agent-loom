@@ -135,7 +135,7 @@ Agent Loom 不应该内置：
 - Wait 主要验证了 approval
 - Child Run、Fan-out/Fan-in、Handoff 尚未完成
 - Transactional Outbox 已对所有权威 Event 形成事务写入、Lease 发布、失败重试和崩溃接管闭环，当前真实 Publisher 为结构化 JSON 日志
-- PlanRevision 已覆盖初始 revision、完整快照历史、HTTP 幂等提交、Run/Plan 双重 fencing 和 Event/Outbox 审计；初始 ExecutionPlan 已支持无环 Dependency、`all/any` JoinPolicy、成功/结果投影 Condition 和事务内唯一激活。动态修订后的任务实例化、Context、Child Run、Fan-out/Fan-in、Cron、外部 Broker、多租户和生产可观测性尚不完整
+- PlanRevision 已覆盖初始 revision、完整快照历史、HTTP 幂等提交、Run/Plan 双重 fencing、Event/Outbox 审计，以及 append-only 动态 Task 的同事务实例化；ExecutionPlan 已支持无环 Dependency、`all/any` JoinPolicy、成功/结果投影 Condition 和事务内唯一激活。动态 Stage 删除/改写尚未开放；Context、Child Run、Fan-out/Fan-in、Cron、外部 Broker、多租户和生产可观测性尚不完整
 
 首先检查当前代码和 git 状态，不要仅依赖上述描述。若描述已经过时，以当前代码和测试为准。
 

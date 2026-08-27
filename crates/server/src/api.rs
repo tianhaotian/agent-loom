@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    execution_plan::{materialize_execution_plan, parse_execution_plan},
+    execution_plan::{
+        materialize_execution_plan, materialize_plan_task_additions, parse_execution_plan,
+    },
     identity::{command_context, decode_id, hash_bytes, now_micros, random_id},
 };
 
@@ -347,7 +349,39 @@ async fn revise_plan(
     let plan_payload = payload(&request.plan)?;
     let plan = parse_execution_plan(&plan_payload)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let change_summary = payload(&request.change_summary)?;
+    let query = query_context(&state);
+    let current_revision = state
+        .store
+        .list_plan_revisions(&query, run_id)
+        .await?
+        .into_iter()
+        .find(|revision| revision.revision == request.base_revision)
+        .ok_or_else(|| ApiError::conflict("base Plan revision was not found"))?;
+    let current_plan = parse_execution_plan(&current_revision.plan)
+        .map_err(|_| ApiError::internal("current Plan revision is invalid"))?;
+    let run_input = state
+        .store
+        .get_run_input(&query, run_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Run was not found"))?;
+    let run_input: Value = serde_json::from_slice(run_input.as_bytes())
+        .map_err(|_| ApiError::internal("persisted Run input is invalid"))?;
+    let new_tasks = materialize_plan_task_additions(
+        &current_plan,
+        &plan,
+        run_id,
+        &run_input,
+        UnixMicros::new(now_micros()),
+    )
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let added_tasks = new_tasks
+        .iter()
+        .map(|task| task.logical_key.as_str())
+        .collect::<Vec<_>>();
+    let change_summary = payload(&json!({
+        "requested": request.change_summary,
+        "added_tasks": added_tasks,
+    }))?;
     let key = required_idempotency(&headers)?;
     let request_bytes = serde_json::to_vec(&request)
         .map_err(|_| ApiError::bad_request("Plan revision request cannot be encoded"))?;
@@ -382,6 +416,7 @@ async fn revise_plan(
                     change_summary,
                     created_event_id: event_id,
                 },
+                new_tasks,
             },
         )
         .await?;
@@ -1017,6 +1052,14 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             code: "not_found",
+            message: message.into(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "conflict",
             message: message.into(),
         }
     }

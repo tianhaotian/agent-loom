@@ -267,6 +267,39 @@ pub(crate) fn materialize_execution_plan(
     })
 }
 
+pub(crate) fn materialize_plan_task_additions(
+    current: &ExecutionPlan,
+    revised: &ExecutionPlan,
+    run_id: RunId,
+    run_input: &Value,
+    available_at: UnixMicros,
+) -> Result<Vec<InitialTask>, PlanError> {
+    current.validate_shape().map_err(PlanError::InvalidShape)?;
+    revised.validate_shape().map_err(PlanError::InvalidShape)?;
+    if current.schema_version != revised.schema_version
+        || current.plan_key != revised.plan_key
+        || current.stages != revised.stages
+        || current.initial_tasks.iter().any(|existing| {
+            revised
+                .initial_tasks
+                .iter()
+                .find(|candidate| candidate.logical_key == existing.logical_key)
+                != Some(existing)
+        })
+    {
+        return Err(PlanError::UnsupportedRevisionMutation);
+    }
+    let mut materialized =
+        materialize_execution_plan(revised, run_id, run_input, available_at)?.initial_tasks;
+    materialized.retain(|task| {
+        !current
+            .initial_tasks
+            .iter()
+            .any(|existing| existing.logical_key == task.logical_key)
+    });
+    Ok(materialized)
+}
+
 pub(crate) fn stage_execution_id(run_id: RunId, stage_key: &LogicalKey) -> StageExecutionId {
     StageExecutionId::from_bytes(derived_id("stage", &format!("{run_id}/{stage_key}")))
 }
@@ -296,6 +329,7 @@ pub(crate) enum PlanError {
     InvalidKey,
     InvalidPayload,
     InvalidShape(ExecutionPlanShapeError),
+    UnsupportedRevisionMutation,
 }
 
 impl fmt::Display for PlanError {
@@ -314,6 +348,9 @@ impl fmt::Display for PlanError {
             Self::InvalidShape(error) => {
                 write!(formatter, "Execution plan shape is invalid: {error:?}")
             }
+            Self::UnsupportedRevisionMutation => formatter.write_str(
+                "Plan revision may only append Tasks; existing Stages and Tasks are immutable",
+            ),
         }
     }
 }
@@ -405,5 +442,51 @@ mod tests {
         .expect_err("unsupported schema");
 
         assert_eq!(error, PlanError::UnsupportedSchema);
+    }
+
+    #[test]
+    fn plan_revision_materializes_only_append_only_tasks() {
+        let current = parse_execution_plan(&spec(&json!({
+            "schema": "agent-loom.execution-plan/v1",
+            "plan_key": "adaptive",
+            "initial_tasks": [
+                {"key": "entry", "handler": "adaptive", "kind": "model"}
+            ]
+        })))
+        .expect("parse current Plan");
+        let revised = parse_execution_plan(&spec(&json!({
+            "schema": "agent-loom.execution-plan/v1",
+            "plan_key": "adaptive",
+            "initial_tasks": [
+                {"key": "entry", "handler": "adaptive", "kind": "model"},
+                {"key": "follow-up", "handler": "adaptive", "kind": "tool", "depends_on": [{"task": "entry"}]}
+            ]
+        })))
+        .expect("parse revised Plan");
+
+        let additions = materialize_plan_task_additions(
+            &current,
+            &revised,
+            RunId::from_bytes([9; 16]),
+            &json!({"goal": "adapt"}),
+            UnixMicros::new(300),
+        )
+        .expect("materialize appended Task");
+        assert_eq!(additions.len(), 1);
+        assert_eq!(additions[0].logical_key.as_str(), "follow-up");
+        assert_eq!(additions[0].dependencies.len(), 1);
+
+        let mut changed = revised.clone();
+        changed.initial_tasks[0].priority = 1;
+        assert_eq!(
+            materialize_plan_task_additions(
+                &current,
+                &changed,
+                RunId::from_bytes([9; 16]),
+                &json!({}),
+                UnixMicros::new(300),
+            ),
+            Err(PlanError::UnsupportedRevisionMutation)
+        );
     }
 }

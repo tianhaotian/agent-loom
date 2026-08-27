@@ -89,6 +89,7 @@ pub struct RevisePlan {
     pub expected_plan_revision: u64,
     pub event_id: EventId,
     pub revision: NewPlanRevision,
+    pub new_tasks: Vec<InitialTask>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin};
 
 use agent_loom_domain::{
-    AgentExecutionId, AgentExecutionSnapshot, ArtifactRefSnapshot, OutboxMessage,
+    AgentExecutionId, AgentExecutionSnapshot, ArtifactRefSnapshot, JsonPayload, OutboxMessage,
     PlanRevisionSnapshot, RunId, RunSnapshot, StageExecutionSnapshot, ToolExecutionId,
     ToolExecutionSnapshot, WaitSnapshot, WorkflowId, WorkflowSnapshot,
 };
@@ -54,6 +54,12 @@ pub trait DurableStore: Send + Sync {
         context: &'a QueryContext,
         run_id: RunId,
     ) -> StoreFuture<'a, Option<RunSnapshot>>;
+
+    fn get_run_input<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        run_id: RunId,
+    ) -> StoreFuture<'a, Option<JsonPayload>>;
 
     fn revise_plan<'a>(
         &'a self,

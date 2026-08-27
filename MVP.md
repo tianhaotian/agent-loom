@@ -83,7 +83,7 @@ curl -sS -H 'authorization: Bearer replace-with-at-least-16-characters' \
 
 ### 查询和提交 PlanRevision
 
-`GET /v1/runs/RUN_ID/plan-revisions` 返回从 revision 1 开始的完整不可变历史。`POST` 使用完整 `agent-loom.execution-plan/v1` 快照，并要求 `Idempotency-Key` 与当前 `base_revision`；提交会用 Run version、execution generation 和 Plan revision 双重 fencing，原子追加 `run.plan_revised` Event、Outbox 和新 revision。
+`GET /v1/runs/RUN_ID/plan-revisions` 返回从 revision 1 开始的完整不可变历史。`POST` 使用完整 `agent-loom.execution-plan/v1` 快照，并要求 `Idempotency-Key` 与当前 `base_revision`；提交会用 Run version、execution generation 和 Plan revision 双重 fencing，原子追加 `run.plan_revised` Event、Outbox、新 revision 和新增 Task。V1 动态修订采用 append-only 约束：可以追加 Task 和修改不透明 extension，但不能删除或改写已有 Task/Stage；新增 Task 继续绑定创建 Run 时的原始 input，并可依赖既有或同批新增 Task。
 
 ### 暂停、恢复、取消
 
