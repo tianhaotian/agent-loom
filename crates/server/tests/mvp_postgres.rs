@@ -8,14 +8,15 @@ use agent_loom_domain::{
     EventId, IdempotencyKey, JsonPayload, LeaseToken, RunId, ScopeKey, WorkerId,
 };
 use agent_loom_durable_store::{
-    AgentEventQuery, AgentSubmissionOutcome, ClaimTask, CommandContext, ControlRun,
-    DurableStore as _, ExpectedRun, LeaseProof, PrepareAgentExecution, QueryContext,
+    AgentEventQuery, AgentSubmissionOutcome, ClaimTask, CommandContext, CommandDisposition,
+    ControlRun, DurableStore as _, ExpectedRun, LeaseProof, PrepareAgentExecution, QueryContext,
     RecordAgentSubmission,
 };
 use agent_loom_runtime::{
     AgentEventDispatcher as _, AgentEventPollOutcome, AgentEventWorker, AgentEventWorkerConfig,
     AgentStatusPollOutcome, AgentStatusWorker, AgentStatusWorkerConfig, AgentStopPollOutcome,
-    AgentStopWorker, AgentStopWorkerConfig, PollingActivity, PollingJob as _,
+    AgentStopWorker, AgentStopWorkerConfig, ExternalRecoveryDispatcher as _, PollingActivity,
+    PollingJob as _, RecoveryDispatchFence, StartedRecovery,
 };
 use agent_loom_server::{
     MaintenancePollingConfig, MaintenancePollingJob, ServerConfig, WorkflowWorker,
@@ -664,10 +665,10 @@ async fn running_agent_events_are_cursor_fenced_deduplicated_and_terminally_reco
         )
         .await
         .expect("prepare Agent execution");
-    let submitted = application
+    let uncertain = application
         .store
         .record_agent_submission(
-            &test_command_context(application.tenant_id, nonce, "accept-agent-events"),
+            &test_command_context(application.tenant_id, nonce, "uncertain-agent-events"),
             RecordAgentSubmission {
                 expected_run: ExpectedRun {
                     run_id,
@@ -676,24 +677,48 @@ async fn running_agent_events_are_cursor_fenced_deduplicated_and_terminally_reco
                 },
                 agent_execution_id: execution_id,
                 expected_version: prepared.value.version,
-                outcome: AgentSubmissionOutcome::Accepted {
-                    remote_run_ref: "remote-events-e2e".to_owned(),
-                    remote_session_ref: Some("remote-events-session-e2e".to_owned()),
-                    remote_protocol_version: "1".to_owned(),
-                },
+                outcome: AgentSubmissionOutcome::Uncertain,
                 submission_event_id: EventId::from_bytes(test_id(nonce, "event-submitted")),
             },
         )
         .await
-        .expect("accept Agent execution");
-    assert_eq!(submitted.value.status, AgentExecutionStatus::Running);
-    assert!(submitted.value.status_poll_at.is_some());
-
+        .expect("record uncertain Agent submission");
+    assert_eq!(uncertain.value.status, AgentExecutionStatus::OutcomeUnknown);
     let query_context = QueryContext {
         tenant_id: application.tenant_id,
         actor_ref: "agent-events-e2e".to_owned(),
         authoritative: true,
     };
+    let current_run = application
+        .store
+        .get_run(&query_context, run_id)
+        .await
+        .expect("query uncertain Run")
+        .expect("uncertain Run exists");
+    let dispatcher = mock_dispatcher(
+        application.store.clone(),
+        application.endpoint_id,
+        application.coordinator_agent_version_id,
+    )
+    .expect("build event Mock Agent dispatcher");
+    dispatcher
+        .dispatch(StartedRecovery::Agent {
+            execution: uncertain.value,
+            disposition: CommandDisposition::Applied,
+            fence: RecoveryDispatchFence {
+                expected_run: ExpectedRun {
+                    run_id,
+                    version: Some(current_run.version),
+                    execution_generation: Some(current_run.execution_generation),
+                },
+                execution_generation: current_run.execution_generation,
+                correlation_id: CorrelationId::from_bytes(test_id(nonce, "reconcile-correlation")),
+                actor_ref: "agent-events-reconcile-e2e".to_owned(),
+            },
+        })
+        .await
+        .expect("reconcile uncertain submission without resubmitting");
+
     let stale_candidate = application
         .store
         .scan_agent_events(&query_context, AgentEventQuery { limit: 1 })
@@ -703,12 +728,6 @@ async fn running_agent_events_are_cursor_fenced_deduplicated_and_terminally_reco
         .into_iter()
         .next()
         .expect("submitted Agent is immediately due");
-    let dispatcher = mock_dispatcher(
-        application.store.clone(),
-        application.endpoint_id,
-        application.coordinator_agent_version_id,
-    )
-    .expect("build event Mock Agent dispatcher");
     let event_worker = AgentEventWorker::new(
         application.store.clone(),
         dispatcher.clone(),

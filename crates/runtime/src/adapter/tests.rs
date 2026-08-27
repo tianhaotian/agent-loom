@@ -252,7 +252,11 @@ impl AgentServerAdapter for FakeAgentAdapter {
         &'a self,
         _context: &'a AdapterCallContext,
     ) -> AdapterFuture<'a, Option<RemoteAgentRef>> {
-        Box::pin(async { Ok(None) })
+        let remote = self
+            .status_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.remote.clone());
+        Box::pin(async move { Ok(remote) })
     }
 
     fn get_status<'a>(
@@ -625,6 +629,103 @@ async fn agent_dispatch_decodes_request_and_records_remote_identity() {
             && remote_protocol_version == "test-v1"
     ));
     assert_eq!(recorded.expected_version, 4);
+}
+
+#[tokio::test]
+async fn uncertain_agent_submission_is_reconciled_before_any_resubmission() {
+    let state = state();
+    let submitted = Arc::new(Mutex::new(None));
+    let remote = RemoteAgentRef {
+        remote_run_id: "reconciled-run-1".to_owned(),
+        remote_session_id: Some("reconciled-session-1".to_owned()),
+        protocol_version: "test-v1".to_owned(),
+    };
+    let agent: Arc<dyn AgentServerAdapter> = Arc::new(FakeAgentAdapter {
+        seen: Arc::clone(&submitted),
+        stop_calls: Arc::new(Mutex::new(Vec::new())),
+        stop_outcome: StopRequestOutcome::Unsupported,
+        status_snapshot: Some(RemoteAgentSnapshot {
+            remote: remote.clone(),
+            status: RemoteAgentStatus::Running,
+            result: None,
+        }),
+        event_batch: None,
+    });
+    let dispatcher = dispatcher(
+        FakeStore(Arc::clone(&state)),
+        registry_tool(Arc::new(Mutex::new(None)), false),
+        agent,
+    );
+    let mut execution = agent_snapshot();
+    execution.status = AgentExecutionStatus::OutcomeUnknown;
+    execution.version = 5;
+
+    crate::ExternalRecoveryDispatcher::dispatch(
+        &dispatcher,
+        StartedRecovery::Agent {
+            execution,
+            disposition: CommandDisposition::Applied,
+            fence: fence(),
+        },
+    )
+    .await
+    .expect("submission reconciliation");
+
+    assert!(submitted.lock().expect("submission lock").is_none());
+    let recorded = state
+        .agent_outcome
+        .lock()
+        .expect("agent outcome lock")
+        .clone()
+        .expect("recorded reconciliation");
+    assert_eq!(recorded.expected_version, 5);
+    assert!(matches!(
+        recorded.outcome,
+        AgentSubmissionOutcome::Accepted {
+            ref remote_run_ref,
+            ..
+        } if remote_run_ref == "reconciled-run-1"
+    ));
+}
+
+#[tokio::test]
+async fn uncertain_agent_submission_is_resubmitted_only_after_reconciliation_misses() {
+    let state = state();
+    let submitted = Arc::new(Mutex::new(None));
+    let dispatcher = dispatcher(
+        FakeStore(Arc::clone(&state)),
+        registry_tool(Arc::new(Mutex::new(None)), false),
+        registry_agent(Arc::clone(&submitted)),
+    );
+    let mut execution = agent_snapshot();
+    execution.status = AgentExecutionStatus::OutcomeUnknown;
+    execution.version = 5;
+
+    crate::ExternalRecoveryDispatcher::dispatch(
+        &dispatcher,
+        StartedRecovery::Agent {
+            execution,
+            disposition: CommandDisposition::Applied,
+            fence: fence(),
+        },
+    )
+    .await
+    .expect("submission reconciliation and safe resubmission");
+
+    assert!(submitted.lock().expect("submission lock").is_some());
+    let recorded = state
+        .agent_outcome
+        .lock()
+        .expect("agent outcome lock")
+        .clone()
+        .expect("recorded resubmission");
+    assert!(matches!(
+        recorded.outcome,
+        AgentSubmissionOutcome::Accepted {
+            ref remote_run_ref,
+            ..
+        } if remote_run_ref == "remote-run-1"
+    ));
 }
 
 #[tokio::test]

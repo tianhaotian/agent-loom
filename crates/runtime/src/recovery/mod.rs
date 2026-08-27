@@ -484,7 +484,7 @@ mod tests {
                         task_id: command.lease.task_id,
                         endpoint_id: EndpointId::from_bytes([10; 16]),
                         agent_version_id: AgentVersionId::from_bytes([11; 16]),
-                        status: AgentExecutionStatus::Submitting,
+                        status: AgentExecutionStatus::OutcomeUnknown,
                         version: command.expected_version + 1,
                         remote_run_ref: None,
                         remote_session_ref: None,

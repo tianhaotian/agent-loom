@@ -2123,8 +2123,8 @@ impl PostgresTransactionExecutor {
         ))
     }
 
-    /// Re-enters Agent submission from a leased retry reconciliation Task
-    /// while preserving the original Endpoint idempotency identity.
+    /// Starts submission reconciliation from a leased retry Task while
+    /// preserving the original Endpoint idempotency identity.
     ///
     /// # Errors
     ///
@@ -2207,7 +2207,7 @@ impl PostgresTransactionExecutor {
             .ok_or_else(|| inconsistent("Agent execution version overflow"))?;
         let updated = transaction
             .execute(
-                "UPDATE agent_loom.agent_executions SET status = 'submitting', version = $3, \
+                "UPDATE agent_loom.agent_executions SET status = 'outcome_unknown', version = $3, \
                     error_code = NULL, result_json = NULL, completed_at = NULL, \
                     status_poll_at = NULL, \
                     updated_at = to_timestamp(($5::bigint)::double precision / 1000000.0) \
@@ -2238,7 +2238,7 @@ impl PostgresTransactionExecutor {
             &json!({
                 "agent_execution_id": execution_id,
                 "version": next_version,
-                "outcome": "resubmission_started",
+                "outcome": "submission_reconciliation_started",
             }),
         )
         .await?;
@@ -2255,7 +2255,7 @@ impl PostgresTransactionExecutor {
                 tenant_id,
                 run_id,
                 sequence: locked.next_event_sequence,
-                event_type: "agent.resubmission_started",
+                event_type: "agent.submission_reconciliation_started",
                 payload: &event_payload,
                 payload_schema_version: 1,
                 producer: "worker",
@@ -2283,7 +2283,7 @@ impl PostgresTransactionExecutor {
             task_id: task_id_from_uuid(execution.task_id),
             endpoint_id: EndpointId::from_bytes(execution.endpoint_id.into_bytes()),
             agent_version_id: AgentVersionId::from_bytes(execution.agent_version_id.into_bytes()),
-            status: AgentExecutionStatus::Submitting,
+            status: AgentExecutionStatus::OutcomeUnknown,
             version: nonnegative_u64(next_version, "Agent execution version")?,
             remote_run_ref: None,
             remote_session_ref: execution.remote_session_ref,
@@ -2370,7 +2370,9 @@ impl PostgresTransactionExecutor {
                 "Agent execution version changed",
             ));
         }
-        if execution.status != "submitting" && !late_after_stop {
+        if !matches!(execution.status.as_str(), "submitting" | "outcome_unknown")
+            && !late_after_stop
+        {
             return Err(store_error(
                 StoreErrorCode::InvalidTransition,
                 "Agent execution is not awaiting submission outcome",
@@ -8685,7 +8687,7 @@ mod tests {
         assert!(source.contains("Agent retry changed after the due-work scan"));
         assert!(source.contains("retry_at <= to_timestamp"));
         assert!(source.contains("tool.retry_attempt_started"));
-        assert!(source.contains("agent.resubmission_started"));
+        assert!(source.contains("agent.submission_reconciliation_started"));
         assert!(source.matches("complete_recovery_task(").count() >= 3);
         assert!(source.contains("leased recovery Task has no open matching attempt"));
         assert!(source.contains("recovery Task was not authorized"));

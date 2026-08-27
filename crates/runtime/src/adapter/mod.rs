@@ -499,6 +499,7 @@ where
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn dispatch_agent(
         &self,
         execution: agent_loom_domain::AgentExecutionSnapshot,
@@ -544,6 +545,7 @@ where
                 )
                 .await;
         };
+        let reconciling_submission = execution.status == AgentExecutionStatus::OutcomeUnknown;
         if !adapter.capabilities().submission_idempotency
             || !agent_submission_replay_allowed(&invocation.capabilities_snapshot)
         {
@@ -558,6 +560,18 @@ where
                 )
                 .await;
         }
+        if reconciling_submission && !adapter.capabilities().submission_reconciliation {
+            return self
+                .record_agent_error(
+                    &execution,
+                    &fence,
+                    configuration_error(
+                        "AGENT_RECONCILIATION_CAPABILITY_MISSING",
+                        "Agent Server cannot reconcile an uncertain submission",
+                    ),
+                )
+                .await;
+        }
         let seed = context_seed_agent(&invocation, &fence);
         let context = match self.context_factory.create(seed.clone()).await {
             Ok(context) => context,
@@ -568,14 +582,26 @@ where
         if let Err(error) = validate_adapter_context(&context, &seed) {
             return self.record_agent_error(&execution, &fence, error).await;
         }
-        let outcome = match adapter.submit(&context, request).await {
-            Ok(SubmitAgentOutcome::Accepted(remote)) => AgentSubmissionOutcome::Accepted {
-                remote_run_ref: remote.remote_run_id,
-                remote_session_ref: remote.remote_session_id,
-                remote_protocol_version: remote.protocol_version,
-            },
-            Ok(SubmitAgentOutcome::SubmissionUncertain) => AgentSubmissionOutcome::Uncertain,
-            Err(error) => agent_error_outcome(&*self.retry_schedule, &error, execution.version)?,
+        let reconciled = if reconciling_submission {
+            match adapter.reconcile_submission(&context).await {
+                Ok(remote) => remote,
+                Err(error) => {
+                    return self.record_agent_error(&execution, &fence, error).await;
+                }
+            }
+        } else {
+            None
+        };
+        let outcome = if let Some(remote) = reconciled {
+            accepted_submission(remote)
+        } else {
+            match adapter.submit(&context, request).await {
+                Ok(SubmitAgentOutcome::Accepted(remote)) => accepted_submission(remote),
+                Ok(SubmitAgentOutcome::SubmissionUncertain) => AgentSubmissionOutcome::Uncertain,
+                Err(error) => {
+                    agent_error_outcome(&*self.retry_schedule, &error, execution.version)?
+                }
+            }
         };
         self.record_agent(&execution, &fence, outcome).await
     }
@@ -1614,6 +1640,12 @@ fn agent_error_outcome(
     error: &AdapterError,
     version: u64,
 ) -> Result<AgentSubmissionOutcome, ExternalDispatchError> {
+    if matches!(
+        error.retry,
+        AdapterRetryClass::ReconnectAndResume | AdapterRetryClass::QueryOutcome
+    ) {
+        return Ok(AgentSubmissionOutcome::Uncertain);
+    }
     let retry = retry_class(error.retry);
     let retry_at = if retry == ExecutionRetryClass::SameRequestBackoff {
         Some(retry_schedule.retry_at(error, version)?)
@@ -1625,6 +1657,14 @@ fn agent_error_outcome(
         retry,
         retry_at,
     })
+}
+
+fn accepted_submission(remote: RemoteAgentRef) -> AgentSubmissionOutcome {
+    AgentSubmissionOutcome::Accepted {
+        remote_run_ref: remote.remote_run_id,
+        remote_session_ref: remote.remote_session_id,
+        remote_protocol_version: remote.protocol_version,
+    }
 }
 
 fn stop_request_projection(outcome: StopRequestOutcome) -> (AgentExecutionStatus, Option<String>) {
