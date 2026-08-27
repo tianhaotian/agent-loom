@@ -1278,6 +1278,7 @@ async fn context_patches_are_versioned_merged_idempotent_and_lineaged() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn child_runs_are_parent_scoped_idempotent_and_queryable() {
     let Ok(database_url) = std::env::var("AGENT_LOOM_TEST_POSTGRES_URL") else {
         return;
@@ -1287,10 +1288,29 @@ async fn child_runs_are_parent_scoped_idempotent_and_queryable() {
         .expect("system clock after epoch")
         .as_nanos();
     let (application, parent_run_id) = bootstrap_outbox_test(&database_url, nonce).await;
+    let (client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+        .await
+        .expect("connect Child Run fixture database");
+    let connection_task = tokio::spawn(connection);
+    let parent_uuid =
+        uuid::Uuid::from_bytes(decode_test_id(&parent_run_id).expect("decode parent Run ID"));
+    let parent_task_id: uuid::Uuid = client
+        .query_one(
+            "SELECT task_id FROM agent_loom.tasks WHERE tenant_id = $1 AND run_id = $2 \
+             ORDER BY task_id LIMIT 1",
+            &[
+                &uuid::Uuid::from_bytes(application.tenant_id.into_bytes()),
+                &parent_uuid,
+            ],
+        )
+        .await
+        .expect("query parent fan-in Task")
+        .get(0);
     for branch in ["research", "review"] {
         let request = json!({
             "input": {"branch": branch},
             "parent_run_id": parent_run_id,
+            "parent_task_id": parent_task_id.simple().to_string(),
         });
         let response = application
             .router
@@ -1322,6 +1342,74 @@ async fn child_runs_are_parent_scoped_idempotent_and_queryable() {
         .expect("Child Runs response is an array");
     assert_eq!(children.len(), 2);
     assert!(children.iter().all(|child| child["status"] == "queued"));
+    let waiting_status: String = client
+        .query_one(
+            "SELECT status FROM agent_loom.tasks WHERE tenant_id = $1 AND task_id = $2",
+            &[
+                &uuid::Uuid::from_bytes(application.tenant_id.into_bytes()),
+                &parent_task_id,
+            ],
+        )
+        .await
+        .expect("query waiting fan-in Task")
+        .get(0);
+    assert_eq!(waiting_status, "scheduled");
+
+    for (index, child) in children.iter().enumerate() {
+        let child_id = child["run_id"].as_str().expect("Child Run ID");
+        let response = application
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/runs/{child_id}/cancel"))
+                    .header("authorization", "Bearer mvp-e2e-api-key")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", format!("cancel-child-{index}-{nonce}"))
+                    .body(Body::from(r#"{"reason":"fan-in settled"}"#))
+                    .expect("build Child Run cancel request"),
+            )
+            .await
+            .expect("Child Run cancel response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let join_response = application
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/runs/{parent_run_id}/child-joins/{}",
+                    parent_task_id.simple()
+                ))
+                .header("authorization", "Bearer mvp-e2e-api-key")
+                .header("content-type", "application/json")
+                .header("idempotency-key", format!("join-children-{nonce}"))
+                .body(Body::from(r#"{"join_policy":"all"}"#))
+                .expect("build Child Run join request"),
+        )
+        .await
+        .expect("Child Run join response");
+    assert_eq!(join_response.status(), StatusCode::OK);
+    let ready_status: String = client
+        .query_one(
+            "SELECT status FROM agent_loom.tasks WHERE tenant_id = $1 AND task_id = $2",
+            &[
+                &uuid::Uuid::from_bytes(application.tenant_id.into_bytes()),
+                &parent_task_id,
+            ],
+        )
+        .await
+        .expect("query ready fan-in Task")
+        .get(0);
+    assert_eq!(ready_status, "queued");
+    drop(client);
+    connection_task
+        .await
+        .expect("join Child Run fixture connection")
+        .expect("Child Run fixture connection remains healthy");
 }
 
 async fn get_context_snapshots(

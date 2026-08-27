@@ -9,12 +9,12 @@ use agent_loom_durable_store::{
     AgentStatusQuery, AgentStopPage, AgentStopQuery, AppendAgentEvents, ApplyContextPatch,
     ApplyDueWork, ApplyEvent, ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt,
     ClaimOutbox, ClaimTask, ClaimedTask, CommandContext, Committed, CompleteTask, ControlRun,
-    CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery, DurableStore, EventCursor, EventPage,
-    FailTask, LeaseReclaimOutcome, MaintenanceOutcome, MaintenancePage, MaintenanceQuery,
-    PrepareAgentExecution, PrepareToolExecution, QueryContext, ReclaimExpiredLease,
-    RecordAgentOutcome, RecordAgentSubmission, RecordOutboxDelivery, RecordToolOutcome,
-    RenewTaskLease, RetryClass, RevisePlan, StoreCapabilities, StoreError, StoreErrorCode,
-    StoreFuture, StoreResult, ToolInvocation,
+    CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery, DurableStore, EvaluateChildRunJoin,
+    EventCursor, EventPage, FailTask, LeaseReclaimOutcome, MaintenanceOutcome, MaintenancePage,
+    MaintenanceQuery, PrepareAgentExecution, PrepareToolExecution, QueryContext,
+    ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission, RecordOutboxDelivery,
+    RecordToolOutcome, RenewTaskLease, RetryClass, RevisePlan, StoreCapabilities, StoreError,
+    StoreErrorCode, StoreFuture, StoreResult, ToolInvocation,
 };
 use deadpool_postgres::{Object, Pool};
 
@@ -108,6 +108,19 @@ impl DurableStore for PostgresStore {
             let client = self.connection().await?;
             self.executor
                 .list_child_runs(&client, context, parent_run_id)
+                .await
+        })
+    }
+
+    fn evaluate_child_run_join<'a>(
+        &'a self,
+        context: &'a CommandContext,
+        command: EvaluateChildRunJoin,
+    ) -> StoreFuture<'a, Committed<RunSnapshot>> {
+        Box::pin(async move {
+            let mut client = self.connection().await?;
+            self.executor
+                .evaluate_child_run_join(&mut client, context, command)
                 .await
         })
     }

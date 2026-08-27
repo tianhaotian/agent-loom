@@ -218,6 +218,7 @@ status, health_checked_at, created_at, updated_at
 - `terminal_event_id` 为空或只指向本 Run Event。
 - 终态必须有 `terminal_event_id` 和 `terminal_at`；非终态不得设置 `terminal_at`。
 - `parent_run_id` 不得等于 `run_id`；更深层循环由创建子 Run 的领域操作检查。
+- Child Run 关联 `parent_task_id` 时，该父 Task 是 Fan-in 恢复 Task：创建子 Run时切换为 `scheduled`；Child Join 按 `all`/`any` 终态策略评估同一父 Task 的直接子 Run，满足后至多一次切换为 `queued`。
 
 推荐索引：
 

@@ -8,13 +8,13 @@ use std::{
 
 use agent_loom_domain::{
     AgentVersionId, CheckpointId, ContextMergeStrategy, ContextPatchId, ContextSnapshotId, EventId,
-    JsonPayload, LogicalKey, PlanRevisionId, RunId, RunSnapshot, RunStatus, StageStatus, TaskId,
-    TenantId, UnixMicros, WaitStatus, WorkflowId,
+    JoinPolicy, JsonPayload, LogicalKey, PlanRevisionId, RunId, RunSnapshot, RunStatus,
+    StageStatus, TaskId, TenantId, UnixMicros, WaitStatus, WorkflowId,
 };
 use agent_loom_durable_store::{
     ApplyContextPatch, ApplyEvent, CommandDisposition, ControlRun, CreateRun, DurableStore,
-    EventCursor, ExpectedRun, NewCheckpoint, NewContextSnapshot, NewPlanRevision, QueryContext,
-    RevisePlan, SignatureVerification, StoreError, StoreErrorCode,
+    EvaluateChildRunJoin, EventCursor, ExpectedRun, NewCheckpoint, NewContextSnapshot,
+    NewPlanRevision, QueryContext, RevisePlan, SignatureVerification, StoreError, StoreErrorCode,
 };
 use axum::{
     Json, Router,
@@ -66,6 +66,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs", post(create_run))
         .route("/v1/runs/{run_id}", get(get_run))
         .route("/v1/runs/{run_id}/children", get(list_child_runs))
+        .route(
+            "/v1/runs/{run_id}/child-joins/{task_id}",
+            post(evaluate_child_run_join),
+        )
         .route(
             "/v1/runs/{run_id}/plan-revisions",
             get(list_plan_revisions).post(revise_plan),
@@ -281,6 +285,8 @@ async fn create_run(
         run_id,
         parent_run_id,
         parent_task_id,
+        parent_event_id: parent_run_id
+            .map(|_| EventId::from_bytes(crate::identity::derived_id("parent-event", &identity))),
         workflow_version_id: Some(workflow.workflow_version_id),
         coordinator_agent_version_id: Some(state.coordinator_agent_version_id),
         input: payload(&request.input)?,
@@ -358,6 +364,67 @@ async fn list_child_runs(
         .map(RunResponse::from)
         .collect();
     Ok(Json(children))
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ChildJoinPolicyRequest {
+    All,
+    Any,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct EvaluateChildRunJoinRequest {
+    join_policy: ChildJoinPolicyRequest,
+}
+
+#[derive(Debug, Serialize)]
+struct EvaluateChildRunJoinResponse {
+    run: RunResponse,
+    disposition: &'static str,
+}
+
+async fn evaluate_child_run_join(
+    State(state): State<AppState>,
+    Path((run_id, task_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<EvaluateChildRunJoinRequest>,
+) -> ApiResult<Json<EvaluateChildRunJoinResponse>> {
+    let run_id = parse_run_id(&run_id)?;
+    let task_id = parse_task_id(&task_id)?;
+    let run = load_run(&state, run_id).await?;
+    let key = required_idempotency(&headers)?;
+    let request_bytes = serde_json::to_vec(&request)
+        .map_err(|_| ApiError::bad_request("Child Run join request cannot be encoded"))?;
+    let identity = format!("api-child-join/{run_id}/{task_id}/{key}");
+    let context = command_context(
+        state.tenant_id,
+        run_id,
+        API_ACTOR,
+        "evaluate_child_run_join",
+        &identity,
+        &request_bytes,
+    )
+    .map_err(ApiError::bad_request)?;
+    let committed = state
+        .store
+        .evaluate_child_run_join(
+            &context,
+            EvaluateChildRunJoin {
+                expected_run: expected(&run),
+                task_id,
+                join_policy: match request.join_policy {
+                    ChildJoinPolicyRequest::All => JoinPolicy::All,
+                    ChildJoinPolicyRequest::Any => JoinPolicy::Any,
+                },
+                event_id: EventId::from_bytes(crate::identity::derived_id("event", &identity)),
+            },
+        )
+        .await?;
+    Ok(Json(EvaluateChildRunJoinResponse {
+        run: committed.value.into(),
+        disposition: disposition(committed.disposition),
+    }))
 }
 
 #[derive(Debug, Deserialize, Serialize)]

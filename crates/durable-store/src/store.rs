@@ -12,11 +12,11 @@ use crate::{
     AgentStatusQuery, AgentStopPage, AgentStopQuery, AppendAgentEvents, ApplyContextPatch,
     ApplyDueWork, ApplyEvent, ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt,
     ClaimOutbox, ClaimTask, ClaimedTask, CommandContext, Committed, CompleteTask, ControlRun,
-    CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery, EventCursor, EventPage, FailTask,
-    LeaseReclaimOutcome, MaintenanceOutcome, MaintenancePage, MaintenanceQuery,
-    PrepareAgentExecution, PrepareToolExecution, QueryContext, ReclaimExpiredLease,
-    RecordAgentOutcome, RecordAgentSubmission, RecordOutboxDelivery, RecordToolOutcome,
-    RenewTaskLease, RevisePlan, StoreResult, ToolInvocation,
+    CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery, EvaluateChildRunJoin, EventCursor,
+    EventPage, FailTask, LeaseReclaimOutcome, MaintenanceOutcome, MaintenancePage,
+    MaintenanceQuery, PrepareAgentExecution, PrepareToolExecution, QueryContext,
+    ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission, RecordOutboxDelivery,
+    RecordToolOutcome, RenewTaskLease, RevisePlan, StoreResult, ToolInvocation,
 };
 
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = StoreResult<T>> + Send + 'a>>;
@@ -67,6 +67,12 @@ pub trait DurableStore: Send + Sync {
         context: &'a QueryContext,
         parent_run_id: RunId,
     ) -> StoreFuture<'a, Vec<RunSnapshot>>;
+
+    fn evaluate_child_run_join<'a>(
+        &'a self,
+        context: &'a CommandContext,
+        command: EvaluateChildRunJoin,
+    ) -> StoreFuture<'a, Committed<RunSnapshot>>;
 
     fn revise_plan<'a>(
         &'a self,

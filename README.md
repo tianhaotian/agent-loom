@@ -44,7 +44,7 @@ ExecutionPlan 的初始 Task 可以声明有向无环依赖、`all`/`any` JoinPo
 
 每个 ExecutionPlan Task 还会固定引用创建时的 ContextSnapshot，并可用 JSON Pointer 列表声明 ContextProjection。空投影返回完整 Snapshot，非空投影返回稳定的 Pointer→值视图；Task 不会因后续 Context revision 漂移。
 
-创建 Run 时可指定 `parent_run_id` 与可选 `parent_task_id`。Store 在子 Run 创建事务内锁定并校验父 Run 非终态、父 Task 归属，随后依靠既有复合外键持久化父子关系；直接 Child Run 可通过父 Run API 稳定分页前的创建顺序查询，为 Fan-out 提供可恢复身份和审计基础。
+创建 Run 时可指定 `parent_run_id` 与可选 `parent_task_id`。Store 在子 Run 创建事务内锁定并校验父 Run 非终态、父 Task 归属，将关联父 Task 切换为 `scheduled`，并在父 Run 写入 Child 创建 Event/Outbox；直接 Child Run 可按稳定创建顺序查询。显式 Child Join 命令以 `all`/`any` 策略计算关联子 Run的终态计数，未满足时保持等待，满足时以父 Run/Task fencing 原子激活父 Task并写入审计 Event/Outbox，形成可恢复的 Fan-out/Fan-in 闭环。
 
 ## MVP 快速开始
 

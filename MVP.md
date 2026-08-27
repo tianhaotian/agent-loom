@@ -22,7 +22,7 @@
 
 创建 Run 的生产路径会读取默认 `published` Workflow Version 3 中的 `agent-loom.execution-plan/v1`，验证 Task/Stage/Handler 引用后，在现有 PostgreSQL `CreateRun` 事务中原子实例化初始 PlanRevision、Checkpoint、Stage、Task 和 Dependency。初始、动态后继和 Wait 恢复 Task 都携带 `agent-loom.task-input/v1` 信封。通用 Workflow Worker从已验证注册表汇总可领取 kind，并根据稳定 Handler key 分发 Lease、输入和 Run fence；delivery 是当前首个真实 Handler，固定八阶段逻辑不再参与通用领取/路由。该 Plan Profile 能表达多个初始 Task、不使用业务 Stage 的 Agent Run，以及 `all`/`any` JoinPolicy 与成功状态或结果 JSON Pointer 条件；有依赖的 Task 在条件满足前保持 `scheduled`，完成前置 Task 的同一事务只会激活一次。当前 MVP 仍只开放默认 delivery Workflow，数据库领取暂不能按 Handler key 分区，更多 Handler 和动态修订后的 Task 实例化尚未接入。升级时仍兼容已在途的旧版无信封 delivery Task。
 
-MVP 暂不包含 MySQL 事务 Provider、生产 SSO/RBAC、真实外部 Agent/DevOps 服务、自动 Fan-in 推进和生产可观测平台。这些属于 Phase 2B/3 或生产化扩展，不影响当前 PostgreSQL MVP 的权威执行闭环。
+MVP 暂不包含 MySQL 事务 Provider、生产 SSO/RBAC、真实外部 Agent/DevOps 服务、Child Join 的后台自动轮询和生产可观测平台。这些属于 Phase 2B/3 或生产化扩展，不影响当前 PostgreSQL MVP 的权威执行闭环。
 
 ## 配置
 
@@ -70,7 +70,7 @@ curl -sS -X POST http://127.0.0.1:8080/v1/runs \
 
 相同 `Idempotency-Key` 和相同请求会返回首次创建的 Run；同一个 Key 对应不同请求会被拒绝。
 
-请求可选携带 `parent_run_id` 和 `parent_task_id` 创建 Child Run；`parent_task_id` 必须属于指定父 Run，且父 Run 必须存在、同租户并且未终止。`GET /v1/runs/PARENT_RUN_ID/children` 按稳定创建顺序返回直接子 Run，可用于通用 Fan-out 的持久化查询。
+请求可选携带 `parent_run_id` 和 `parent_task_id` 创建 Child Run；`parent_task_id` 必须属于指定父 Run，且父 Run 必须存在、同租户并且未终止。创建首个关联 Child Run 会把父 Task 切换为 `scheduled`，并在父 Run 原子追加 `run.child_created` Event/Outbox。`GET /v1/runs/PARENT_RUN_ID/children` 按稳定创建顺序返回直接子 Run。子 Run 终止后，`POST /v1/runs/PARENT_RUN_ID/child-joins/TASK_ID` 以 `all` 或 `any` 策略评估终态子 Run；条件满足时原子激活父 Task 并追加 `run.child_join_satisfied` Event/Outbox，未满足时幂等返回 `no_op`。
 
 ### 查询 Run 与 Event
 

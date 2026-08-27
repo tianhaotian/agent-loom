@@ -400,6 +400,7 @@ async fn create_task_run(
                 run_id,
                 parent_run_id: None,
                 parent_task_id: None,
+                parent_event_id: None,
                 workflow_version_id: None,
                 coordinator_agent_version_id: None,
                 input: empty_payload(),

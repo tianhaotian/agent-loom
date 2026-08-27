@@ -65,6 +65,7 @@ pub struct CreateRun {
     pub run_id: RunId,
     pub parent_run_id: Option<RunId>,
     pub parent_task_id: Option<TaskId>,
+    pub parent_event_id: Option<EventId>,
     pub workflow_version_id: Option<WorkflowVersionId>,
     pub coordinator_agent_version_id: Option<AgentVersionId>,
     pub input: JsonPayload,
@@ -75,6 +76,14 @@ pub struct CreateRun {
     pub initial_checkpoint: NewCheckpoint,
     pub initial_stages: Vec<InitialStage>,
     pub initial_tasks: Vec<InitialTask>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvaluateChildRunJoin {
+    pub expected_run: ExpectedRun,
+    pub task_id: TaskId,
+    pub join_policy: JoinPolicy,
+    pub event_id: EventId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

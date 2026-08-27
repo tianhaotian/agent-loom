@@ -11,14 +11,14 @@ use agent_loom_durable_store::{
     AgentWorkflowAction, AppendAgentEvents, ApplyContextPatch, ApplyDueWork, ApplyEvent,
     ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt, ClaimOutbox, ClaimTask,
     ClaimedTask, CommandContext, CommandDisposition, Committed, CompleteTask, CompletionShapeError,
-    ControlRun, CreateRun, DueWorkOutcome, DueWorkTarget, DurableFollowUp, ExecutionRetryClass,
-    ExpectedRun, FailTask, InitialStage, InitialTask, LeaseExpiryAction, LeaseProof,
-    LeaseReclaimOutcome, MaintenanceOutcome, MaintenanceTarget, NewArtifactRef, NewPlanRevision,
-    NewTask, NewWaitSubscription, NextActions, NormalizedAgentEventInput, OutboxDeliveryOutcome,
-    PostCommitHint, PrepareAgentExecution, PrepareToolExecution, QueryContext, ReclaimExpiredLease,
-    RecordAgentOutcome, RecordAgentSubmission, RecordOutboxDelivery, RecordToolOutcome,
-    RenewTaskLease, RevisePlan, SignatureVerification, StoreError, StoreErrorCode, StoreResult,
-    ToolRecordedOutcome,
+    ControlRun, CreateRun, DueWorkOutcome, DueWorkTarget, DurableFollowUp, EvaluateChildRunJoin,
+    ExecutionRetryClass, ExpectedRun, FailTask, InitialStage, InitialTask, LeaseExpiryAction,
+    LeaseProof, LeaseReclaimOutcome, MaintenanceOutcome, MaintenanceTarget, NewArtifactRef,
+    NewPlanRevision, NewTask, NewWaitSubscription, NextActions, NormalizedAgentEventInput,
+    OutboxDeliveryOutcome, PostCommitHint, PrepareAgentExecution, PrepareToolExecution,
+    QueryContext, ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission,
+    RecordOutboxDelivery, RecordToolOutcome, RenewTaskLease, RevisePlan, SignatureVerification,
+    StoreError, StoreErrorCode, StoreResult, ToolRecordedOutcome,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -274,16 +274,16 @@ impl PostgresTransactionExecutor {
         )?;
 
         if let Some(parent_run_id) = parent_run_id {
-            let parent_status = transaction
+            let parent = transaction
                 .query_opt(
-                    "SELECT status FROM agent_loom.runs \
-                     WHERE tenant_id = $1 AND run_id = $2 FOR SHARE",
+                    "SELECT status, next_event_sequence FROM agent_loom.runs \
+                     WHERE tenant_id = $1 AND run_id = $2 FOR UPDATE",
                     &[&tenant_id, &parent_run_id],
                 )
                 .await
                 .map_err(map_database_error)?
-                .map(|row| row.get::<_, String>(0))
                 .ok_or_else(|| store_error(StoreErrorCode::NotFound, "parent Run was not found"))?;
+            let parent_status: String = parent.get(0);
             if matches!(
                 parent_status.as_str(),
                 "completed" | "failed" | "cancelled" | "timed_out"
@@ -294,22 +294,79 @@ impl PostgresTransactionExecutor {
                 ));
             }
             if let Some(parent_task_id) = parent_task_id {
-                let exists = transaction
+                let task = transaction
                     .query_opt(
-                        "SELECT 1 FROM agent_loom.tasks \
-                         WHERE tenant_id = $1 AND run_id = $2 AND task_id = $3",
+                        "SELECT status FROM agent_loom.tasks \
+                         WHERE tenant_id = $1 AND run_id = $2 AND task_id = $3 FOR UPDATE",
                         &[&tenant_id, &parent_run_id, &parent_task_id],
                     )
                     .await
                     .map_err(map_database_error)?
-                    .is_some();
-                if !exists {
+                    .ok_or_else(|| {
+                        store_error(
+                            StoreErrorCode::NotFound,
+                            "parent Task was not found in parent Run",
+                        )
+                    })?;
+                let task_status: String = task.get(0);
+                if !matches!(
+                    task_status.as_str(),
+                    "queued" | "retry_scheduled" | "scheduled"
+                ) {
                     return Err(store_error(
-                        StoreErrorCode::NotFound,
-                        "parent Task was not found in parent Run",
+                        StoreErrorCode::InvalidTransition,
+                        "parent fan-in Task is not schedulable",
                     ));
                 }
+                transaction
+                    .execute(
+                        "UPDATE agent_loom.tasks SET status = 'scheduled', \
+                            lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, \
+                            updated_at = to_timestamp(($4::bigint)::double precision / 1000000.0) \
+                         WHERE tenant_id = $1 AND run_id = $2 AND task_id = $3",
+                        &[&tenant_id, &parent_run_id, &parent_task_id, &db_now],
+                    )
+                    .await
+                    .map_err(map_database_error)?;
             }
+            let parent_event_id = uuid(
+                command
+                    .parent_event_id
+                    .ok_or_else(|| invalid_command("Child Run has no parent Event"))?
+                    .into_bytes(),
+            );
+            let parent_sequence: i64 = parent.get(1);
+            insert_event(
+                &transaction,
+                EventInsert {
+                    event_id: parent_event_id,
+                    tenant_id,
+                    run_id: parent_run_id,
+                    sequence: parent_sequence,
+                    event_type: "run.child_created",
+                    payload: &json!({
+                        "child_run_id": command.run_id.to_string(),
+                        "parent_task_id": command.parent_task_id.map(|id| id.to_string()),
+                    }),
+                    payload_schema_version: 1,
+                    producer: "control-plane",
+                    context,
+                    correlation_id,
+                    occurred_at: None,
+                    recorded_at: db_now,
+                },
+            )
+            .await?;
+            transaction
+                .execute(
+                    "UPDATE agent_loom.runs SET version = version + 1, \
+                        next_event_sequence = next_event_sequence + 1, \
+                        updated_at = to_timestamp(($3::bigint)::double precision / 1000000.0) \
+                     WHERE tenant_id = $1 AND run_id = $2",
+                    &[&tenant_id, &parent_run_id, &db_now],
+                )
+                .await
+                .map_err(map_database_error)?;
         }
 
         transaction
@@ -3862,6 +3919,227 @@ impl PostgresTransactionExecutor {
         command: ControlRun,
     ) -> StoreResult<Committed<RunSnapshot>> {
         execute_control(self.config, client, context, command, ControlKind::Cancel).await
+    }
+
+    /// Evaluates a Child Run fan-in and activates its parent Task when ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for stale fences, invalid ownership,
+    /// terminal parent Runs, idempotency misuse, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn evaluate_child_run_join(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: EvaluateChildRunJoin,
+    ) -> StoreResult<Committed<RunSnapshot>> {
+        if command.task_id.is_nil() || command.event_id.is_nil() {
+            return Err(invalid_command("Child Run join shape is invalid"));
+        }
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        match acquire_receipt(
+            &transaction,
+            context,
+            db_now,
+            self.config.receipt_ttl_micros,
+        )
+        .await?
+        {
+            ReceiptGuard::Existing(receipt) => {
+                let snapshot = decode_run_receipt(context.tenant_id, &receipt.outcome)?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(committed_run(
+                    CommandDisposition::Duplicate,
+                    snapshot,
+                    receipt.event_id.map(event_id_from_uuid),
+                    Vec::new(),
+                ));
+            }
+            ReceiptGuard::Acquired => {}
+        }
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_id = uuid(command.expected_run.run_id.into_bytes());
+        let row = transaction
+            .query_opt(
+                "SELECT workflow_version_id, status, suspended_from_status, version, \
+                        execution_generation, next_event_sequence, current_checkpoint_id, \
+                        terminal_event_id, \
+                        CASE WHEN deadline IS NULL THEN NULL \
+                             ELSE (extract(epoch FROM deadline) * 1000000)::bigint END, \
+                        (extract(epoch FROM updated_at) * 1000000)::bigint \
+                 FROM agent_loom.runs WHERE tenant_id = $1 AND run_id = $2 FOR UPDATE",
+                &[&tenant_id, &run_id],
+            )
+            .await
+            .map_err(map_database_error)?
+            .ok_or_else(|| store_error(StoreErrorCode::NotFound, "parent Run was not found"))?;
+        let locked =
+            LockedControlRun::decode(context.tenant_id, command.expected_run.run_id, &row)?;
+        if locked.snapshot.status.is_terminal() {
+            return Err(store_error(
+                StoreErrorCode::TerminalRun,
+                "parent Run is terminal",
+            ));
+        }
+        if command
+            .expected_run
+            .version
+            .is_some_and(|expected| expected != locked.snapshot.version)
+            || command
+                .expected_run
+                .execution_generation
+                .is_some_and(|expected| expected != locked.snapshot.execution_generation)
+        {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "parent Run expectation changed",
+            ));
+        }
+        let task_id = uuid(command.task_id.into_bytes());
+        let task = transaction
+            .query_opt(
+                "SELECT status, generation FROM agent_loom.tasks \
+                 WHERE tenant_id = $1 AND run_id = $2 AND task_id = $3 FOR UPDATE",
+                &[&tenant_id, &run_id, &task_id],
+            )
+            .await
+            .map_err(map_database_error)?
+            .ok_or_else(|| store_error(StoreErrorCode::NotFound, "fan-in Task was not found"))?;
+        let task_status: String = task.get(0);
+        let task_generation: i64 = task.get(1);
+        if task_generation != locked.generation_i64 {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "fan-in Task generation changed",
+            ));
+        }
+        let counts = transaction
+            .query_one(
+                "SELECT count(*)::bigint, \
+                        count(*) FILTER (WHERE status IN ('completed', 'failed', 'cancelled', 'timed_out'))::bigint \
+                 FROM agent_loom.runs \
+                 WHERE tenant_id = $1 AND parent_run_id = $2 AND parent_task_id = $3",
+                &[&tenant_id, &run_id, &task_id],
+            )
+            .await
+            .map_err(map_database_error)?;
+        let total: i64 = counts.get(0);
+        let terminal: i64 = counts.get(1);
+        if total == 0 {
+            return Err(store_error(
+                StoreErrorCode::InvalidTransition,
+                "fan-in Task has no Child Runs",
+            ));
+        }
+        let ready = match command.join_policy {
+            JoinPolicy::All => terminal == total,
+            JoinPolicy::Any => terminal > 0,
+        };
+        if !ready || task_status == "queued" {
+            let outcome = encode_run_receipt(&locked.snapshot)?;
+            finish_receipt(&transaction, context, "no_op", &outcome, None, None).await?;
+            transaction.commit().await.map_err(map_database_error)?;
+            return Ok(committed_run(
+                CommandDisposition::NoOp,
+                locked.snapshot,
+                None,
+                Vec::new(),
+            ));
+        }
+        if task_status != "scheduled" {
+            return Err(store_error(
+                StoreErrorCode::InvalidTransition,
+                "fan-in Task is not waiting for Child Runs",
+            ));
+        }
+        transaction
+            .execute(
+                "UPDATE agent_loom.tasks SET status = 'queued', \
+                    available_at = to_timestamp(($4::bigint)::double precision / 1000000.0), \
+                    updated_at = to_timestamp(($4::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND run_id = $2 AND task_id = $3 AND status = 'scheduled'",
+                &[&tenant_id, &run_id, &task_id, &db_now],
+            )
+            .await
+            .map_err(map_database_error)?;
+        let event_id = uuid(command.event_id.into_bytes());
+        let policy = match command.join_policy {
+            JoinPolicy::All => "all",
+            JoinPolicy::Any => "any",
+        };
+        insert_event(
+            &transaction,
+            EventInsert {
+                event_id,
+                tenant_id,
+                run_id,
+                sequence: locked.next_event_sequence_i64,
+                event_type: "run.child_join_satisfied",
+                payload: &json!({
+                    "task_id": command.task_id.to_string(),
+                    "join_policy": policy,
+                    "child_count": total,
+                    "terminal_child_count": terminal,
+                }),
+                payload_schema_version: 1,
+                producer: "control-plane",
+                context,
+                correlation_id: uuid(context.correlation_id.into_bytes()),
+                occurred_at: None,
+                recorded_at: db_now,
+            },
+        )
+        .await?;
+        let next_version_i64 = locked
+            .version_i64
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("run version overflow"))?;
+        let next_event_sequence_i64 = locked
+            .next_event_sequence_i64
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("run event sequence overflow"))?;
+        transaction
+            .execute(
+                "UPDATE agent_loom.runs SET version = $3, next_event_sequence = $4, \
+                    updated_at = to_timestamp(($5::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND run_id = $2",
+                &[
+                    &tenant_id,
+                    &run_id,
+                    &next_version_i64,
+                    &next_event_sequence_i64,
+                    &db_now,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        let snapshot = RunSnapshot {
+            version: nonnegative_u64(next_version_i64, "run version")?,
+            next_event_sequence: nonnegative_u64(next_event_sequence_i64, "event sequence")?,
+            updated_at: UnixMicros::new(db_now),
+            ..locked.snapshot
+        };
+        let outcome = encode_run_receipt(&snapshot)?;
+        finish_receipt(
+            &transaction,
+            context,
+            "applied",
+            &outcome,
+            Some(event_id),
+            Some(("task", task_id, next_version_i64)),
+        )
+        .await?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(committed_run(
+            CommandDisposition::Applied,
+            snapshot,
+            Some(command.event_id),
+            vec![DurableFollowUp::Task {
+                task_id: command.task_id,
+            }],
+        ))
     }
 
     /// Appends one immutable Plan revision and advances the Run projection.
@@ -8455,6 +8733,7 @@ fn validate_create_run(command: &CreateRun) -> StoreResult<()> {
     if plan_revision.created_event_id != command.initial_event_id
         || command.parent_run_id == Some(command.run_id)
         || (command.parent_task_id.is_some() && command.parent_run_id.is_none())
+        || (command.parent_event_id.is_some() != command.parent_run_id.is_some())
         || plan_revision.plan_revision_id.is_nil()
         || plan_revision.schema_version == 0
         || computed_plan_digest != *plan_revision.plan_digest.as_bytes()
@@ -10089,6 +10368,7 @@ mod tests {
             run_id,
             parent_run_id: None,
             parent_task_id: None,
+            parent_event_id: None,
             workflow_version_id: None,
             coordinator_agent_version_id: None,
             input: payload(&json!({"request": "smoke"})),
@@ -10677,6 +10957,7 @@ mod tests {
                     run_id: control_run_id,
                     parent_run_id: None,
                     parent_task_id: None,
+                    parent_event_id: None,
                     workflow_version_id: None,
                     coordinator_agent_version_id: None,
                     input: payload(&json!({"request": "control-smoke"})),
@@ -10975,6 +11256,7 @@ mod tests {
             run_id,
             parent_run_id: None,
             parent_task_id: None,
+            parent_event_id: None,
             workflow_version_id: None,
             coordinator_agent_version_id: None,
             input: payload(&json!({"request": label})),
