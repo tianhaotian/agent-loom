@@ -4,14 +4,15 @@ use std::{
 };
 
 use agent_loom_domain::{
-    AgentExecutionId, AgentExecutionStatus, CommandId, CorrelationId, Digest, DurationMicros,
-    EventId, IdempotencyKey, JsonPayload, LeaseToken, RunId, ScopeKey, WorkerId,
+    AgentExecutionId, AgentExecutionStatus, CheckpointId, CommandId, CorrelationId, Digest,
+    DurationMicros, EventId, IdempotencyKey, JsonPayload, LeaseToken, RunId, ScopeKey, TaskKind,
+    WorkerId,
 };
 use agent_loom_durable_store::{
     AgentEventQuery, AgentSubmissionOutcome, ClaimOutbox, ClaimTask, CommandContext,
-    CommandDisposition, ControlRun, DurableStore as _, ExpectedRun, LeaseProof,
-    OutboxDeliveryOutcome, PrepareAgentExecution, QueryContext, RecordAgentSubmission,
-    RecordOutboxDelivery,
+    CommandDisposition, CompleteTask, ControlRun, DurableStore as _, ExpectedRun, LeaseProof,
+    NewCheckpoint, NextActions, OutboxDeliveryOutcome, PrepareAgentExecution, QueryContext,
+    RecordAgentSubmission, RecordOutboxDelivery, TaskResult,
 };
 use agent_loom_runtime::{
     AgentEventDispatcher as _, AgentEventPollOutcome, AgentEventWorker, AgentEventWorkerConfig,
@@ -904,6 +905,191 @@ async fn transactional_outbox_recovers_expired_publish_leases_without_losing_eve
             .expect("scan after publish")
             .is_none()
     );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn execution_plan_dependencies_gate_task_claims_until_conditions_match() {
+    let Ok(database_url) = std::env::var("AGENT_LOOM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos();
+    let config = ServerConfig {
+        database_url: database_url.clone(),
+        bind: "127.0.0.1:0".to_owned(),
+        tenant_key: format!("dependency-e2e-{nonce}"),
+        api_key: "mvp-e2e-api-key".to_owned(),
+        pool_size: 4,
+        http_adapters: None,
+    };
+    let application = bootstrap(&config)
+        .await
+        .expect("bootstrap dependency server");
+    let plan = json!({
+        "schema": "agent-loom.execution-plan/v1",
+        "plan_key": "dependency-e2e",
+        "initial_tasks": [
+            {"key": "root", "handler": "delivery-mvp", "kind": "model"},
+            {
+                "key": "joined",
+                "handler": "delivery-mvp",
+                "kind": "model",
+                "join_policy": "all",
+                "depends_on": [{
+                    "task": "root",
+                    "condition": {
+                        "result_equals": {"pointer": "/approved", "value": true}
+                    }
+                }]
+            }
+        ]
+    });
+    let plan_bytes = serde_json::to_vec(&plan).expect("encode dependency plan");
+    let plan_digest: [u8; 32] = Sha256::digest(&plan_bytes).into();
+    let (client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+        .await
+        .expect("connect dependency fixture database");
+    let connection_task = tokio::spawn(connection);
+    client
+        .execute(
+            "UPDATE agent_loom.workflow_definition_versions SET spec_json = $3, spec_digest = $4 \
+             WHERE tenant_id = $1 AND workflow_version_id = $2",
+            &[
+                &uuid::Uuid::from_bytes(application.tenant_id.into_bytes()),
+                &uuid::Uuid::from_bytes(application.workflow_version_id.into_bytes()),
+                &plan,
+                &plan_digest.as_slice(),
+            ],
+        )
+        .await
+        .expect("install dependency ExecutionPlan");
+    drop(client);
+    connection_task
+        .await
+        .expect("join dependency fixture connection")
+        .expect("dependency fixture connection remains healthy");
+
+    let response = application
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/runs")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer mvp-e2e-api-key")
+                .header("idempotency-key", format!("dependency-run-{nonce}"))
+                .body(Body::from(r#"{"input":{"goal":"join tasks"}}"#))
+                .expect("build dependency Run request"),
+        )
+        .await
+        .expect("create dependency Run response");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let run: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read dependency Run"),
+    )
+    .expect("decode dependency Run");
+    let run_id = RunId::from_bytes(
+        decode_test_id(run["run"]["run_id"].as_str().expect("Run ID")).expect("decode Run ID"),
+    );
+    let worker_id = WorkerId::from_bytes(test_id(nonce, "dependency-worker"));
+    let lease_token = LeaseToken::from_bytes([7; 32]);
+    let claim = application
+        .store
+        .claim_task(
+            &test_command_context(application.tenant_id, nonce, "dependency-claim-root"),
+            ClaimTask {
+                worker_id,
+                lease_token: lease_token.clone(),
+                lease_duration: DurationMicros::new(5_000_000),
+                candidate_window: 8,
+                kind: Some(TaskKind::Model),
+            },
+        )
+        .await
+        .expect("claim dependency root")
+        .expect("root Task is claimable");
+    assert_eq!(claim.value.task.logical_key.as_str(), "root");
+    let event_id = EventId::from_bytes(test_id(nonce, "dependency-root-completed"));
+    let checkpoint_state = JsonPayload::from_validated_bytes(b"{}".to_vec());
+    application
+        .store
+        .complete_task(
+            &test_command_context(application.tenant_id, nonce, "dependency-complete-root"),
+            CompleteTask {
+                expected_run: ExpectedRun {
+                    run_id,
+                    version: Some(claim.value.run_version),
+                    execution_generation: Some(claim.value.task.generation),
+                },
+                lease: LeaseProof {
+                    task_id: claim.value.task.task_id,
+                    worker_id,
+                    token: lease_token,
+                    execution_generation: claim.value.task.generation,
+                },
+                completion_event_id: event_id,
+                checkpoint: NewCheckpoint {
+                    checkpoint_id: CheckpointId::from_bytes(test_id(
+                        nonce,
+                        "dependency-checkpoint",
+                    )),
+                    sequence: 2,
+                    schema_version: 1,
+                    workflow_version_id: Some(application.workflow_version_id),
+                    coordinator_agent_version_id: Some(application.coordinator_agent_version_id),
+                    execution_generation: claim.value.task.generation,
+                    state: checkpoint_state.clone(),
+                    state_digest: Digest::from_bytes(
+                        Sha256::digest(checkpoint_state.as_bytes()).into(),
+                    ),
+                    created_event_id: event_id,
+                },
+                task_result: TaskResult {
+                    output: JsonPayload::from_validated_bytes(b"{\"approved\":true}".to_vec()),
+                },
+                stage_mutation: None,
+                additional_stage_mutations: Vec::new(),
+                new_stages: Vec::new(),
+                artifacts: Vec::new(),
+                next: NextActions::NoFurtherWork,
+            },
+        )
+        .await
+        .expect("complete dependency root");
+    let joined = application
+        .store
+        .claim_task(
+            &test_command_context(application.tenant_id, nonce, "dependency-claim-joined"),
+            ClaimTask {
+                worker_id,
+                lease_token: LeaseToken::from_bytes([8; 32]),
+                lease_duration: DurationMicros::new(5_000_000),
+                candidate_window: 8,
+                kind: Some(TaskKind::Model),
+            },
+        )
+        .await
+        .expect("claim joined Task")
+        .expect("joined Task becomes claimable");
+    assert_eq!(joined.value.task.logical_key.as_str(), "joined");
+}
+
+fn decode_test_id(value: &str) -> Result<[u8; 16], ()> {
+    if value.len() != 32 {
+        return Err(());
+    }
+    let mut bytes = [0; 16];
+    for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        let text = std::str::from_utf8(chunk).map_err(|_| ())?;
+        bytes[index] = u8::from_str_radix(text, 16).map_err(|_| ())?;
+    }
+    Ok(bytes)
 }
 
 #[tokio::test]

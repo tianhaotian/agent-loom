@@ -1,8 +1,8 @@
 use agent_loom_domain::{
     AgentVersionId, ArtifactId, ArtifactVersionRef, CheckpointId, CommandId, CorrelationId, Digest,
-    DurationMicros, EventId, IdempotencyKey, JsonPayload, LeaseToken, LogicalKey, PlanRevisionId,
-    RunId, RunStatus, ScopeKey, StageExecutionId, StageStatus, TaskId, TaskKind, TenantId,
-    UnixMicros, WaitId, WorkerId, WorkflowVersionId,
+    DurationMicros, EventId, IdempotencyKey, JoinPolicy, JsonPayload, LeaseToken, LogicalKey,
+    PlanRevisionId, RunId, RunStatus, ScopeKey, StageExecutionId, StageStatus, TaskId, TaskKind,
+    TenantId, UnixMicros, WaitId, WorkerId, WorkflowVersionId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,6 +48,14 @@ pub struct InitialTask {
     pub available_at: UnixMicros,
     pub max_attempts: u32,
     pub input: JsonPayload,
+    pub dependencies: Vec<InitialTaskDependency>,
+    pub join_policy: JoinPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitialTaskDependency {
+    pub prerequisite_task_id: TaskId,
+    pub condition: JsonPayload,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

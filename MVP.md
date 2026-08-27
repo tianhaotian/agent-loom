@@ -6,7 +6,7 @@
 
 已包含：
 
-- 启动时自动执行 `0000` 至 `0012` migration；
+- 启动时自动执行 `0000` 至 `0016` migration；
 - PostgreSQL 连接池与对象安全的 `DurableStore`；
 - API Key 认证边界和 tenant-scoped 查询/命令；
 - Workflow、Run、Stage、Artifact、Pending Action 和 Event HTTP 查询；
@@ -20,7 +20,7 @@
 - JSON 结构化请求/Worker 日志和响应关联 ID；
 - 从 HTTP 创建到 PostgreSQL 终态、返工、审批、Tool 部署和 deadline 的自动化 E2E 验收。
 
-创建 Run 的生产路径会读取默认 `published` Workflow Version 3 中的 `agent-loom.execution-plan/v1`，验证 Task/Stage/Handler 引用后，在现有 PostgreSQL `CreateRun` 事务中原子实例化初始 PlanRevision、Checkpoint、Stage 和 Task。初始、动态后继和 Wait 恢复 Task 都携带 `agent-loom.task-input/v1` 信封。通用 Workflow Worker 从已验证注册表汇总可领取 kind，并根据稳定 Handler key 分发 Lease、输入和 Run fence；delivery 是当前首个真实 Handler，固定八阶段逻辑不再参与通用领取/路由。该 Plan Profile 能表达多个初始 Task 以及不使用业务 Stage 的 Agent Run；当前 MVP 仍只开放默认 delivery Workflow，数据库领取暂不能按 Handler key 分区，通用 Dependency/Condition/JoinPolicy 和更多 Handler 尚未接入。升级时仍兼容已在途的旧版无信封 delivery Task。
+创建 Run 的生产路径会读取默认 `published` Workflow Version 3 中的 `agent-loom.execution-plan/v1`，验证 Task/Stage/Handler 引用后，在现有 PostgreSQL `CreateRun` 事务中原子实例化初始 PlanRevision、Checkpoint、Stage、Task 和 Dependency。初始、动态后继和 Wait 恢复 Task 都携带 `agent-loom.task-input/v1` 信封。通用 Workflow Worker从已验证注册表汇总可领取 kind，并根据稳定 Handler key 分发 Lease、输入和 Run fence；delivery 是当前首个真实 Handler，固定八阶段逻辑不再参与通用领取/路由。该 Plan Profile 能表达多个初始 Task、不使用业务 Stage 的 Agent Run，以及 `all`/`any` JoinPolicy 与成功状态或结果 JSON Pointer 条件；有依赖的 Task 在条件满足前保持 `scheduled`，完成前置 Task 的同一事务只会激活一次。当前 MVP 仍只开放默认 delivery Workflow，数据库领取暂不能按 Handler key 分区，更多 Handler 和动态修订后的 Task 实例化尚未接入。升级时仍兼容已在途的旧版无信封 delivery Task。
 
 MVP 暂不包含 MySQL 事务 Provider、生产 SSO/RBAC、真实外部 Agent/DevOps 服务、子 Run/Fan-out/Fan-in 和生产可观测平台。这些属于 Phase 2B/3 或生产化扩展，不影响当前 PostgreSQL MVP 的权威执行闭环。
 

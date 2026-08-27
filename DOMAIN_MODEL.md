@@ -53,7 +53,8 @@ Tenant
 ├── AgentEndpoint
 └── Run
     ├── StageExecution
-    │   ├── Task ── TaskAttempt
+    │   ├── Task ── TaskDependency ── Task
+    │   │   └── TaskAttempt
     │   │   ├── ToolExecution ── ToolExecutionAttempt
     │   │   └── AgentExecution ── AgentEventReceipt
     │   └── ArtifactRef
@@ -273,7 +274,8 @@ created_event_id, created_at
 | `task_id, tenant_id, run_id, stage_execution_id` | 身份与归属 |
 | `logical_key` | Run 内稳定任务键，用于防止重复生成后续 Task |
 | `kind` | model、tool、agent_server、artifact_check、timer_wakeup 等 |
-| `status` | Task 状态机状态 |
+| `status` | Task 状态机状态；依赖未满足时为 `scheduled` |
+| `join_policy` | 多个依赖采用 `all` 或 `any` 激活 |
 | `generation` | 必须等于 Run execution_generation 才可领取/完成 |
 | `based_on_checkpoint_sequence` | 生成 Task 时所依据的 Checkpoint |
 | `priority` | 同一调度域内的领取优先级 |
@@ -321,6 +323,8 @@ Handler key 把 Lease、不可变输入和领取后的 Run fence 交给对应 Ha
 注册它所领取 kind 对应的全部 Handler；若未来需要按 Handler 拆分专用 Worker pool，
 必须先把 Handler key 提升为数据库可过滤的领取维度。升级期间允许 delivery Handler
 读取旧版无信封的 delivery Task，但所有新写入都必须使用 V1 信封。
+
+`task_dependencies` 保存同一 Run 内 Task 到前置 Task 的边以及版本化条件 JSON。创建 Run 前必须拒绝未知节点、自依赖、重复边和环。空条件与 `{"status":"succeeded"}` 等价；`{"result_equals":{"pointer":"/path","value":...}}` 在前置 Task 成功后比较结果 JSON Pointer。完成前置 Task 的事务锁定仍为 `scheduled` 的后继任务，按后继的 JoinPolicy 评估全部边并以状态 CAS 至多激活一次。
 
 ### 7.2 `task_attempts`
 

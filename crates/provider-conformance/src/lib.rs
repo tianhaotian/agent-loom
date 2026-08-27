@@ -40,6 +40,7 @@ mod tests {
         "agent_event_receipts",
         "outbox_messages",
         "plan_revisions",
+        "task_dependencies",
     ];
 
     #[test]

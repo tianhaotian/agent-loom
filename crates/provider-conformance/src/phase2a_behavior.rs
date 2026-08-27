@@ -2,8 +2,8 @@ use std::{error::Error, fmt};
 
 use agent_loom_domain::{
     CheckpointId, CommandId, CorrelationId, Digest, DurationMicros, EventId, IdempotencyKey,
-    JsonPayload, LeaseToken, LogicalKey, PlanRevisionId, RunId, RunStatus, ScopeKey, TaskId,
-    TaskKind, TenantId, UnixMicros, WaitStatus, WorkerId,
+    JoinPolicy, JsonPayload, LeaseToken, LogicalKey, PlanRevisionId, RunId, RunStatus, ScopeKey,
+    TaskId, TaskKind, TenantId, UnixMicros, WaitStatus, WorkerId,
 };
 use agent_loom_durable_store::{
     ApplyEvent, ClaimTask, ClaimedTask, CommandContext, CompleteTask, ControlRun, CreateRun,
@@ -431,6 +431,8 @@ async fn create_task_run(
                     available_at: UnixMicros::new(0),
                     max_attempts: 2,
                     input: empty_payload(),
+                    dependencies: Vec::new(),
+                    join_policy: JoinPolicy::All,
                 }],
             },
         )

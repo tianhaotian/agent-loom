@@ -35,6 +35,20 @@ pub struct ExecutionTaskSpec {
     pub priority: i32,
     pub max_attempts: u32,
     pub input: JsonPayload,
+    pub dependencies: Vec<TaskDependencySpec>,
+    pub join_policy: JoinPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskDependencySpec {
+    pub task_key: LogicalKey,
+    pub condition: JsonPayload,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinPolicy {
+    All,
+    Any,
 }
 
 impl ExecutionPlan {
@@ -88,9 +102,56 @@ impl ExecutionPlan {
                     return Err(ExecutionPlanShapeError::TaskStageNotActive);
                 }
             }
+            for (dependency_index, dependency) in task.dependencies.iter().enumerate() {
+                if dependency.task_key == task.logical_key {
+                    return Err(ExecutionPlanShapeError::SelfDependency);
+                }
+                if !self
+                    .initial_tasks
+                    .iter()
+                    .any(|candidate| candidate.logical_key == dependency.task_key)
+                {
+                    return Err(ExecutionPlanShapeError::UnknownDependency);
+                }
+                if task.dependencies[dependency_index + 1..]
+                    .iter()
+                    .any(|other| other.task_key == dependency.task_key)
+                {
+                    return Err(ExecutionPlanShapeError::DuplicateDependency);
+                }
+            }
+        }
+        if self.initial_tasks.iter().any(|task| {
+            dependency_reaches(self, &task.logical_key, &task.logical_key, &mut Vec::new())
+        }) {
+            return Err(ExecutionPlanShapeError::DependencyCycle);
         }
         Ok(())
     }
+}
+
+fn dependency_reaches(
+    plan: &ExecutionPlan,
+    current: &LogicalKey,
+    target: &LogicalKey,
+    visited: &mut Vec<LogicalKey>,
+) -> bool {
+    if visited.contains(current) {
+        return false;
+    }
+    visited.push(current.clone());
+    let reaches = plan
+        .initial_tasks
+        .iter()
+        .find(|task| task.logical_key == *current)
+        .is_some_and(|task| {
+            task.dependencies.iter().any(|dependency| {
+                dependency.task_key == *target
+                    || dependency_reaches(plan, &dependency.task_key, target, visited)
+            })
+        });
+    visited.pop();
+    reaches
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +165,10 @@ pub enum ExecutionPlanShapeError {
     DuplicateTaskKey,
     UnknownTaskStage,
     TaskStageNotActive,
+    UnknownDependency,
+    SelfDependency,
+    DuplicateDependency,
+    DependencyCycle,
 }
 
 #[cfg(test)]
@@ -123,6 +188,8 @@ mod tests {
             priority: 0,
             max_attempts: 3,
             input: payload(),
+            dependencies: Vec::new(),
+            join_policy: JoinPolicy::All,
         }
     }
 
@@ -160,6 +227,34 @@ mod tests {
         assert_eq!(
             plan.validate_shape(),
             Err(ExecutionPlanShapeError::TaskStageNotActive)
+        );
+    }
+
+    #[test]
+    fn dependency_graph_rejects_cycles() {
+        let mut first = task(None);
+        first.logical_key = LogicalKey::parse("first").expect("key");
+        first.dependencies.push(TaskDependencySpec {
+            task_key: LogicalKey::parse("second").expect("key"),
+            condition: payload(),
+        });
+        let mut second = task(None);
+        second.logical_key = LogicalKey::parse("second").expect("key");
+        second.dependencies.push(TaskDependencySpec {
+            task_key: LogicalKey::parse("first").expect("key"),
+            condition: payload(),
+        });
+        let plan = ExecutionPlan {
+            schema_version: EXECUTION_PLAN_SCHEMA_VERSION,
+            plan_key: LogicalKey::parse("cyclic").expect("key"),
+            stages: Vec::new(),
+            initial_tasks: vec![first, second],
+            extension: payload(),
+        };
+
+        assert_eq!(
+            plan.validate_shape(),
+            Err(ExecutionPlanShapeError::DependencyCycle)
         );
     }
 }

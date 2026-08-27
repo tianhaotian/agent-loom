@@ -2,10 +2,10 @@ use std::{error::Error, fmt};
 
 use agent_loom_domain::{
     EXECUTION_PLAN_SCHEMA_VERSION, ExecutionPlan, ExecutionPlanShapeError, ExecutionStageSpec,
-    ExecutionTaskSpec, JsonPayload, LogicalKey, RunId, StageExecutionId, StageStatus, TaskId,
-    TaskKind, UnixMicros,
+    ExecutionTaskSpec, JoinPolicy, JsonPayload, LogicalKey, RunId, StageExecutionId, StageStatus,
+    TaskDependencySpec, TaskId, TaskKind, UnixMicros,
 };
-use agent_loom_durable_store::{InitialStage, InitialTask};
+use agent_loom_durable_store::{InitialStage, InitialTask, InitialTaskDependency};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -71,6 +71,26 @@ struct TaskProfile {
     max_attempts: u32,
     #[serde(default = "empty_object")]
     input: Value,
+    #[serde(default)]
+    depends_on: Vec<TaskDependencyProfile>,
+    #[serde(default)]
+    join_policy: JoinPolicyProfile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskDependencyProfile {
+    task: String,
+    #[serde(default = "empty_object")]
+    condition: Value,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum JoinPolicyProfile {
+    #[default]
+    All,
+    Any,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -135,6 +155,20 @@ pub(crate) fn parse_execution_plan(spec: &JsonPayload) -> Result<ExecutionPlan, 
                 priority: task.priority,
                 max_attempts: task.max_attempts,
                 input: payload(&task.input)?,
+                dependencies: task
+                    .depends_on
+                    .into_iter()
+                    .map(|dependency| {
+                        Ok(TaskDependencySpec {
+                            task_key: logical_key(dependency.task)?,
+                            condition: payload(&dependency.condition)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, PlanError>>()?,
+                join_policy: match task.join_policy {
+                    JoinPolicyProfile::All => JoinPolicy::All,
+                    JoinPolicyProfile::Any => JoinPolicy::Any,
+                },
             })
         })
         .collect::<Result<Vec<_>, PlanError>>()?;
@@ -211,6 +245,18 @@ pub(crate) fn materialize_execution_plan(
                     }),
                 )
                 .map_err(|_| PlanError::InvalidPayload)?,
+                dependencies: task
+                    .dependencies
+                    .iter()
+                    .map(|dependency| InitialTaskDependency {
+                        prerequisite_task_id: TaskId::from_bytes(derived_id(
+                            "task",
+                            &format!("{run_id}/{}", dependency.task_key),
+                        )),
+                        condition: dependency.condition.clone(),
+                    })
+                    .collect(),
+                join_policy: task.join_policy,
             })
         })
         .collect::<Result<Vec<_>, PlanError>>()?;

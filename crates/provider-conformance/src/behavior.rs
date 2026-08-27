@@ -2,8 +2,8 @@ use std::{error::Error, fmt, time::Duration};
 
 use agent_loom_domain::{
     CheckpointId, CommandId, CorrelationId, Digest, DurationMicros, EventId, IdempotencyKey,
-    JsonPayload, LeaseToken, LogicalKey, PlanRevisionId, RunId, RunStatus, ScopeKey, TaskId,
-    TaskKind, TenantId, UnixMicros, WorkerId,
+    JoinPolicy, JsonPayload, LeaseToken, LogicalKey, PlanRevisionId, RunId, RunStatus, ScopeKey,
+    TaskId, TaskKind, TenantId, UnixMicros, WorkerId,
 };
 use agent_loom_durable_store::{
     ClaimTask, CommandContext, CommandDisposition, ControlRun, CreateRun, DurableStore,
@@ -119,6 +119,8 @@ pub async fn exercise_lease_expiry_retry(
                     available_at: UnixMicros::new(0),
                     max_attempts: 2,
                     input: empty_payload(),
+                    dependencies: Vec::new(),
+                    join_policy: JoinPolicy::All,
                 }],
             },
         )

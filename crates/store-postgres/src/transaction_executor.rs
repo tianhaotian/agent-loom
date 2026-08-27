@@ -1,9 +1,9 @@
 use agent_loom_domain::{
     AgentEventReceiptId, AgentExecutionId, AgentExecutionSnapshot, AgentExecutionStatus,
-    AgentVersionId, CheckpointId, EndpointId, EventId, JsonPayload, LogicalKey, OutboxId,
-    OutboxMessage, PlanRevisionId, RunId, RunSnapshot, RunStatus, StageExecutionId, StageStatus,
-    TaskId, TaskKind, TaskSnapshot, TaskStatus, TenantId, ToolExecutionId, ToolExecutionSnapshot,
-    ToolExecutionStatus, UnixMicros, WorkflowVersionId,
+    AgentVersionId, CheckpointId, EndpointId, EventId, JoinPolicy, JsonPayload, LogicalKey,
+    OutboxId, OutboxMessage, PlanRevisionId, RunId, RunSnapshot, RunStatus, StageExecutionId,
+    StageStatus, TaskId, TaskKind, TaskSnapshot, TaskStatus, TenantId, ToolExecutionId,
+    ToolExecutionSnapshot, ToolExecutionStatus, UnixMicros, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
     AgentEventBatchOutcome, AgentEventExecutionOutcome, AgentSubmissionOutcome,
@@ -22,6 +22,7 @@ use agent_loom_durable_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+use std::collections::HashSet;
 use tokio_postgres::{Client, Row, Transaction};
 use uuid::Uuid;
 
@@ -391,6 +392,18 @@ impl PostgresTransactionExecutor {
                 run_id,
                 initial_event_id,
                 checkpoint_sequence,
+                0,
+                db_now,
+                task,
+            )
+            .await?;
+        }
+        for task in &command.initial_tasks {
+            insert_initial_task_dependencies(
+                &transaction,
+                tenant_id,
+                run_id,
+                initial_event_id,
                 db_now,
                 task,
             )
@@ -426,6 +439,7 @@ impl PostgresTransactionExecutor {
         let follow_ups = command
             .initial_tasks
             .iter()
+            .filter(|task| task.dependencies.is_empty())
             .map(|task| DurableFollowUp::Task {
                 task_id: task.task_id,
             })
@@ -3619,6 +3633,8 @@ impl PostgresTransactionExecutor {
             &command,
         )
         .await?;
+        let activated_tasks =
+            activate_dependent_tasks(&transaction, tenant_id, run_id, task_id, db_now).await?;
         apply_stage_mutation(
             &transaction,
             tenant_id,
@@ -3643,8 +3659,13 @@ impl PostgresTransactionExecutor {
         )
         .await?;
 
-        let transition =
+        let mut transition =
             apply_next_actions(&transaction, tenant_id, run_id, event_id, db_now, &command).await?;
+        transition.follow_ups.extend(
+            activated_tasks
+                .into_iter()
+                .map(|task_id| DurableFollowUp::Task { task_id }),
+        );
         let checkpoint_id = uuid(command.checkpoint.checkpoint_id.into_bytes());
         let next_event_sequence = locked
             .next_event_sequence
@@ -7058,12 +7079,14 @@ async fn insert_plan_revision(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn insert_initial_task(
     transaction: &Transaction<'_>,
     tenant_id: Uuid,
     run_id: Uuid,
     event_id: Uuid,
     checkpoint_sequence: i64,
+    generation: i64,
     db_now: i64,
     task: &InitialTask,
 ) -> StoreResult<()> {
@@ -7078,19 +7101,28 @@ async fn insert_initial_task(
     let available_at = task.available_at.get();
     let max_attempts = i64::from(task.max_attempts);
     let input = json_value(&task.input)?;
+    let status = if task.dependencies.is_empty() {
+        "queued"
+    } else {
+        "scheduled"
+    };
+    let join_policy = match task.join_policy {
+        JoinPolicy::All => "all",
+        JoinPolicy::Any => "any",
+    };
     transaction
         .execute(
             "INSERT INTO agent_loom.tasks (\
-                task_id, tenant_id, run_id, stage_execution_id, logical_key, kind, status, \
+                task_id, tenant_id, run_id, stage_execution_id, logical_key, kind, status, join_policy, \
                 generation, based_on_checkpoint_sequence, priority, available_at, attempt, \
                 max_attempts, lease_owner, lease_token, lease_expires_at, input_json, \
                 result_json, error_code, error_json, deadline, created_event_id, created_at, \
                 updated_at, completed_at\
-             ) VALUES ($1, $2, $3, $4, $5, $6, 'queued', 0, $7, $8, \
-                to_timestamp(($9::bigint)::double precision / 1000000.0), 0, $10, NULL, NULL, NULL, \
-                $11, NULL, NULL, NULL, NULL, $12, \
-                to_timestamp(($13::bigint)::double precision / 1000000.0), \
-                to_timestamp(($13::bigint)::double precision / 1000000.0), NULL)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                to_timestamp(($12::bigint)::double precision / 1000000.0), 0, $13, NULL, NULL, NULL, \
+                $14, NULL, NULL, NULL, NULL, $15, \
+                to_timestamp(($16::bigint)::double precision / 1000000.0), \
+                to_timestamp(($16::bigint)::double precision / 1000000.0), NULL)",
             &[
                 &task_id,
                 &tenant_id,
@@ -7098,6 +7130,9 @@ async fn insert_initial_task(
                 &stage_id,
                 &task.logical_key.as_str(),
                 &kind,
+                &status,
+                &join_policy,
+                &generation,
                 &checkpoint_sequence,
                 &task.priority,
                 &available_at,
@@ -7109,6 +7144,41 @@ async fn insert_initial_task(
         )
         .await
         .map_err(map_database_error)?;
+    Ok(())
+}
+
+async fn insert_initial_task_dependencies(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    event_id: Uuid,
+    db_now: i64,
+    task: &InitialTask,
+) -> StoreResult<()> {
+    let task_id = uuid(task.task_id.into_bytes());
+    for dependency in &task.dependencies {
+        let prerequisite_task_id = uuid(dependency.prerequisite_task_id.into_bytes());
+        let condition = json_value(&dependency.condition)?;
+        transaction
+            .execute(
+                "INSERT INTO agent_loom.task_dependencies (\
+                    tenant_id, run_id, task_id, prerequisite_task_id, condition_json, \
+                    created_event_id, created_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, \
+                    to_timestamp(($7::bigint)::double precision / 1000000.0))",
+                &[
+                    &tenant_id,
+                    &run_id,
+                    &task_id,
+                    &prerequisite_task_id,
+                    &condition,
+                    &event_id,
+                    &db_now,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+    }
     Ok(())
 }
 
@@ -7635,6 +7705,136 @@ async fn apply_next_actions(
     }
 }
 
+async fn activate_dependent_tasks(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    completed_task_id: Uuid,
+    db_now: i64,
+) -> StoreResult<Vec<TaskId>> {
+    let rows = transaction
+        .query(
+            "SELECT t.task_id, t.join_policy \
+             FROM agent_loom.task_dependencies d \
+             JOIN agent_loom.tasks t ON t.tenant_id = d.tenant_id \
+               AND t.run_id = d.run_id AND t.task_id = d.task_id \
+             WHERE d.tenant_id = $1 AND d.run_id = $2 \
+               AND d.prerequisite_task_id = $3 AND t.status = 'scheduled' \
+             ORDER BY t.task_id FOR UPDATE OF t",
+            &[&tenant_id, &run_id, &completed_task_id],
+        )
+        .await
+        .map_err(map_database_error)?;
+    let mut activated = Vec::new();
+    for row in rows {
+        let task_id: Uuid = row.get(0);
+        let join_policy: String = row.get(1);
+        let dependencies = transaction
+            .query(
+                "SELECT p.status, p.result_json, d.condition_json \
+                 FROM agent_loom.task_dependencies d \
+                 JOIN agent_loom.tasks p ON p.tenant_id = d.tenant_id \
+                   AND p.run_id = d.run_id AND p.task_id = d.prerequisite_task_id \
+                 WHERE d.tenant_id = $1 AND d.run_id = $2 AND d.task_id = $3 \
+                 ORDER BY d.prerequisite_task_id",
+                &[&tenant_id, &run_id, &task_id],
+            )
+            .await
+            .map_err(map_database_error)?;
+        let satisfied = dependencies
+            .iter()
+            .map(|dependency| {
+                let result: Option<Value> = dependency.get(1);
+                dependency_condition_satisfied(
+                    dependency.get(0),
+                    result.as_ref(),
+                    &dependency.get(2),
+                )
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+        let ready = match join_policy.as_str() {
+            "all" => !satisfied.is_empty() && satisfied.iter().all(|value| *value),
+            "any" => satisfied.iter().any(|value| *value),
+            _ => return Err(inconsistent("Task has an invalid JoinPolicy")),
+        };
+        if !ready {
+            continue;
+        }
+        let updated = transaction
+            .execute(
+                "UPDATE agent_loom.tasks SET status = 'queued', \
+                    available_at = to_timestamp(($4::bigint)::double precision / 1000000.0), \
+                    updated_at = to_timestamp(($4::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND run_id = $2 AND task_id = $3 \
+                   AND status = 'scheduled'",
+                &[&tenant_id, &run_id, &task_id, &db_now],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if updated == 1 {
+            activated.push(task_id_from_uuid(task_id));
+        }
+    }
+    Ok(activated)
+}
+
+fn dependency_condition_satisfied(
+    status: &str,
+    result: Option<&Value>,
+    condition: &Value,
+) -> StoreResult<bool> {
+    if !dependency_condition_shape_is_valid(condition) {
+        return Err(inconsistent("Task dependency Condition is invalid"));
+    }
+    let object = condition
+        .as_object()
+        .ok_or_else(|| inconsistent("Task dependency Condition is not an object"))?;
+    if object.is_empty() {
+        return Ok(status == "succeeded");
+    }
+    if object.get("status").is_some() {
+        return Ok(status == "succeeded");
+    }
+    if let Some(equals) = object.get("result_equals").and_then(Value::as_object) {
+        let pointer = equals
+            .get("pointer")
+            .and_then(Value::as_str)
+            .ok_or_else(|| inconsistent("result_equals Condition has no JSON pointer"))?;
+        let expected = equals
+            .get("value")
+            .ok_or_else(|| inconsistent("result_equals Condition has no expected value"))?;
+        return Ok(status == "succeeded"
+            && result.and_then(|value| value.pointer(pointer)) == Some(expected));
+    }
+    Err(inconsistent(
+        "Task dependency Condition kind is unsupported",
+    ))
+}
+
+fn dependency_condition_shape_is_valid(condition: &Value) -> bool {
+    let Some(object) = condition.as_object() else {
+        return false;
+    };
+    if object.is_empty() {
+        return true;
+    }
+    if object.len() == 1 && object.get("status").and_then(Value::as_str) == Some("succeeded") {
+        return true;
+    }
+    object.len() == 1
+        && object
+            .get("result_equals")
+            .and_then(Value::as_object)
+            .is_some_and(|equals| {
+                equals.len() == 2
+                    && equals
+                        .get("pointer")
+                        .and_then(Value::as_str)
+                        .is_some_and(|pointer| pointer.starts_with('/'))
+                    && equals.contains_key("value")
+            })
+}
+
 async fn insert_new_wait(
     transaction: &Transaction<'_>,
     tenant_id: Uuid,
@@ -7756,6 +7956,16 @@ fn validate_create_run(command: &CreateRun) -> StoreResult<()> {
     let checkpoint = &command.initial_checkpoint;
     let plan_revision = &command.initial_plan_revision;
     let computed_plan_digest: [u8; 32] = Sha256::digest(plan_revision.plan.as_bytes()).into();
+    for dependency in command
+        .initial_tasks
+        .iter()
+        .flat_map(|task| &task.dependencies)
+    {
+        let condition = json_value(&dependency.condition)?;
+        if !dependency_condition_shape_is_valid(&condition) {
+            return Err(invalid_command("Task dependency Condition is invalid"));
+        }
+    }
     if plan_revision.created_event_id != command.initial_event_id
         || plan_revision.plan_revision_id.is_nil()
         || plan_revision.schema_version == 0
@@ -7791,14 +8001,63 @@ fn validate_create_run(command: &CreateRun) -> StoreResult<()> {
                     .initial_stages
                     .iter()
                     .any(|stage| stage.stage_execution_id == stage_id)
-            })
+            }) || task
+                .dependencies
+                .iter()
+                .enumerate()
+                .any(|(index, dependency)| {
+                    dependency.prerequisite_task_id == task.task_id
+                        || !command
+                            .initial_tasks
+                            .iter()
+                            .any(|candidate| candidate.task_id == dependency.prerequisite_task_id)
+                        || task.dependencies[index + 1..].iter().any(|other| {
+                            other.prerequisite_task_id == dependency.prerequisite_task_id
+                        })
+                })
         })
+        || initial_task_dependencies_have_cycle(&command.initial_tasks)
     {
         return Err(invalid_command(
             "create_run initial event/checkpoint/stage/task shape is invalid",
         ));
     }
     Ok(())
+}
+
+fn initial_task_dependencies_have_cycle(tasks: &[InitialTask]) -> bool {
+    fn reaches(
+        tasks: &[InitialTask],
+        current: TaskId,
+        target: TaskId,
+        visited: &mut HashSet<TaskId>,
+    ) -> bool {
+        if current == target {
+            return true;
+        }
+        if !visited.insert(current) {
+            return false;
+        }
+        tasks
+            .iter()
+            .find(|task| task.task_id == current)
+            .is_some_and(|task| {
+                task.dependencies.iter().any(|dependency| {
+                    reaches(tasks, dependency.prerequisite_task_id, target, visited)
+                })
+            })
+    }
+
+    tasks.iter().any(|task| {
+        task.dependencies.iter().any(|dependency| {
+            reaches(
+                tasks,
+                dependency.prerequisite_task_id,
+                task.task_id,
+                &mut HashSet::new(),
+            )
+        })
+    })
 }
 
 fn validate_plan_revision(command: &RevisePlan) -> StoreResult<()> {
@@ -8903,6 +9162,35 @@ mod tests {
     }
 
     #[test]
+    fn dependency_conditions_support_success_and_result_projection() {
+        assert!(dependency_condition_satisfied("succeeded", None, &json!({})).expect("default"));
+        assert!(
+            dependency_condition_satisfied(
+                "succeeded",
+                Some(&json!({"approved": true})),
+                &json!({"result_equals": {"pointer": "/approved", "value": true}}),
+            )
+            .expect("result condition")
+        );
+        assert!(
+            !dependency_condition_satisfied(
+                "succeeded",
+                Some(&json!({"approved": false})),
+                &json!({"result_equals": {"pointer": "/approved", "value": true}}),
+            )
+            .expect("result mismatch")
+        );
+        assert!(
+            dependency_condition_satisfied("succeeded", None, &json!({"status": "succeeded"}),)
+                .expect("status condition")
+        );
+        assert!(
+            dependency_condition_satisfied("succeeded", None, &json!({"status": "failed"}),)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn tool_retry_projection_requires_a_durable_due_time() {
         let retry_at = UnixMicros::new(123);
         let projected = project_tool_outcome(&ToolRecordedOutcome::Failed {
@@ -9257,6 +9545,8 @@ mod tests {
                 available_at: UnixMicros::new(now_micros),
                 max_attempts: 3,
                 input: payload(&json!({"prompt": "smoke"})),
+                dependencies: Vec::new(),
+                join_policy: JoinPolicy::All,
             }],
         };
         let executor = PostgresTransactionExecutor::default();
@@ -9843,6 +10133,8 @@ mod tests {
                         available_at: UnixMicros::new(now_micros),
                         max_attempts: 3,
                         input: payload(&json!({"prompt": "control-smoke"})),
+                        dependencies: Vec::new(),
+                        join_policy: JoinPolicy::All,
                     }],
                 },
             )
@@ -10131,6 +10423,8 @@ mod tests {
                 available_at: UnixMicros::new(now_micros),
                 max_attempts: 3,
                 input: payload(&json!({"prompt": label})),
+                dependencies: Vec::new(),
+                join_policy: JoinPolicy::All,
             }],
         }
     }
