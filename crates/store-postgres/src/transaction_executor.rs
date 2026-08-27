@@ -1,21 +1,23 @@
 use agent_loom_domain::{
     AgentEventReceiptId, AgentExecutionId, AgentExecutionSnapshot, AgentExecutionStatus,
-    AgentVersionId, CheckpointId, EndpointId, EventId, JsonPayload, LogicalKey, RunId, RunSnapshot,
-    RunStatus, StageExecutionId, StageStatus, TaskId, TaskKind, TaskSnapshot, TaskStatus, TenantId,
-    ToolExecutionId, ToolExecutionSnapshot, ToolExecutionStatus, UnixMicros, WorkflowVersionId,
+    AgentVersionId, CheckpointId, EndpointId, EventId, JsonPayload, LogicalKey, OutboxId,
+    OutboxMessage, RunId, RunSnapshot, RunStatus, StageExecutionId, StageStatus, TaskId, TaskKind,
+    TaskSnapshot, TaskStatus, TenantId, ToolExecutionId, ToolExecutionSnapshot,
+    ToolExecutionStatus, UnixMicros, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
     AgentEventBatchOutcome, AgentEventExecutionOutcome, AgentSubmissionOutcome,
     AgentWorkflowAction, AppendAgentEvents, ApplyDueWork, ApplyEvent, ApplyMaintenance,
-    BeginAgentResubmission, BeginToolRetryAttempt, ClaimTask, ClaimedTask, CommandContext,
-    CommandDisposition, Committed, CompleteTask, CompletionShapeError, ControlRun, CreateRun,
-    DueWorkOutcome, DueWorkTarget, DurableFollowUp, ExecutionRetryClass, ExpectedRun, FailTask,
-    InitialStage, InitialTask, LeaseExpiryAction, LeaseProof, LeaseReclaimOutcome,
+    BeginAgentResubmission, BeginToolRetryAttempt, ClaimOutbox, ClaimTask, ClaimedTask,
+    CommandContext, CommandDisposition, Committed, CompleteTask, CompletionShapeError, ControlRun,
+    CreateRun, DueWorkOutcome, DueWorkTarget, DurableFollowUp, ExecutionRetryClass, ExpectedRun,
+    FailTask, InitialStage, InitialTask, LeaseExpiryAction, LeaseProof, LeaseReclaimOutcome,
     MaintenanceOutcome, MaintenanceTarget, NewArtifactRef, NewTask, NewWaitSubscription,
-    NextActions, NormalizedAgentEventInput, PostCommitHint, PrepareAgentExecution,
-    PrepareToolExecution, ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission,
-    RecordToolOutcome, RenewTaskLease, SignatureVerification, StoreError, StoreErrorCode,
-    StoreResult, ToolRecordedOutcome,
+    NextActions, NormalizedAgentEventInput, OutboxDeliveryOutcome, PostCommitHint,
+    PrepareAgentExecution, PrepareToolExecution, QueryContext, ReclaimExpiredLease,
+    RecordAgentOutcome, RecordAgentSubmission, RecordOutboxDelivery, RecordToolOutcome,
+    RenewTaskLease, SignatureVerification, StoreError, StoreErrorCode, StoreResult,
+    ToolRecordedOutcome,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -46,6 +48,167 @@ pub struct PostgresTransactionExecutor {
 impl PostgresTransactionExecutor {
     pub const fn new(config: PostgresTransactionConfig) -> Self {
         Self { config }
+    }
+
+    /// Claims one due Outbox message with a database-time lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for malformed lease input, timestamp
+    /// overflow, malformed persisted payload, or database failure.
+    pub async fn claim_outbox(
+        &self,
+        client: &mut Client,
+        context: &QueryContext,
+        command: ClaimOutbox,
+    ) -> StoreResult<Option<OutboxMessage>> {
+        if !command.shape_is_valid() {
+            return Err(invalid_command("invalid Outbox claim shape"));
+        }
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        let lease_duration = i64::try_from(command.lease_duration.get())
+            .map_err(|_| invalid_command("Outbox lease duration exceeds timestamp range"))?;
+        let lease_expires = db_now
+            .checked_add(lease_duration)
+            .ok_or_else(|| invalid_command("Outbox lease expiry overflow"))?;
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let row = transaction
+            .query_opt(
+                "SELECT outbox_id, event_id, run_id, topic, partition_key, payload_json, \
+                        attempt, (extract(epoch FROM created_at) * 1000000)::bigint \
+                 FROM agent_loom.outbox_messages \
+                 WHERE tenant_id = $1 AND (\
+                    (status = 'pending' AND available_at <= transaction_timestamp()) OR \
+                    (status = 'publishing' AND lease_expires_at <= transaction_timestamp())) \
+                 ORDER BY available_at, outbox_id FOR UPDATE SKIP LOCKED LIMIT 1",
+                &[&tenant_id],
+            )
+            .await
+            .map_err(map_database_error)?;
+        let Some(row) = row else {
+            transaction.commit().await.map_err(map_database_error)?;
+            return Ok(None);
+        };
+        let outbox_id: Uuid = row.get(0);
+        let current_attempt: i64 = row.get(6);
+        let next_attempt = current_attempt
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("Outbox attempt overflow"))?;
+        let publisher_id = uuid(command.publisher_id.into_bytes());
+        let updated = transaction
+            .execute(
+                "UPDATE agent_loom.outbox_messages SET status = 'publishing', attempt = $3, \
+                    lease_owner = $4, lease_token = $5, \
+                    lease_expires_at = to_timestamp(($6::bigint)::double precision / 1000000.0), \
+                    last_error_code = NULL \
+                 WHERE tenant_id = $1 AND outbox_id = $2 AND attempt = $7",
+                &[
+                    &tenant_id,
+                    &outbox_id,
+                    &next_attempt,
+                    &publisher_id,
+                    &command.lease_token.as_bytes().as_slice(),
+                    &lease_expires,
+                    &current_attempt,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if updated != 1 {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "Outbox message changed while claiming",
+            ));
+        }
+        let payload_value: Value = row.get(5);
+        let payload = JsonPayload::from_validated_bytes(
+            serde_json::to_vec(&payload_value)
+                .map_err(|_| inconsistent("Outbox payload could not be normalized"))?,
+        );
+        let message = OutboxMessage {
+            tenant_id: context.tenant_id,
+            outbox_id: OutboxId::from_bytes(outbox_id.into_bytes()),
+            event_id: EventId::from_bytes(row.get::<_, Uuid>(1).into_bytes()),
+            run_id: run_id_from_uuid(row.get(2)),
+            topic: row.get(3),
+            partition_key: row.get(4),
+            payload,
+            attempt: u32::try_from(next_attempt)
+                .map_err(|_| inconsistent("Outbox attempt exceeds u32 range"))?,
+            lease_expires_at: UnixMicros::new(lease_expires),
+            created_at: UnixMicros::new(row.get(7)),
+        };
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(Some(message))
+    }
+
+    /// Records a fenced Outbox publish result.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error when the lease is stale, the attempt
+    /// changed, the retry shape is invalid, or PostgreSQL fails.
+    pub async fn record_outbox_delivery(
+        &self,
+        client: &mut Client,
+        context: &QueryContext,
+        command: RecordOutboxDelivery,
+    ) -> StoreResult<()> {
+        if !command.shape_is_valid() {
+            return Err(invalid_command("invalid Outbox delivery shape"));
+        }
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let outbox_id = uuid(command.outbox_id.into_bytes());
+        let publisher_id = uuid(command.publisher_id.into_bytes());
+        let expected_attempt = i64::from(command.expected_attempt);
+        let (status, available_at, error_code, published_at) = match &command.outcome {
+            OutboxDeliveryOutcome::Published => ("published", None, None, Some(db_now)),
+            OutboxDeliveryOutcome::Retry {
+                available_at,
+                error_code,
+            } => (
+                "pending",
+                Some(available_at.get()),
+                Some(error_code.as_str()),
+                None,
+            ),
+        };
+        let updated = transaction
+            .execute(
+                "UPDATE agent_loom.outbox_messages SET status = $3::text, \
+                    available_at = COALESCE(\
+                        to_timestamp(($4::bigint)::double precision / 1000000.0), available_at), \
+                    lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, \
+                    last_error_code = $5, \
+                    published_at = to_timestamp(($6::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND outbox_id = $2 AND status = 'publishing' \
+                   AND attempt = $7 AND lease_owner = $8 AND lease_token = $9 \
+                   AND lease_expires_at > transaction_timestamp()",
+                &[
+                    &tenant_id,
+                    &outbox_id,
+                    &status,
+                    &available_at,
+                    &error_code,
+                    &published_at,
+                    &expected_attempt,
+                    &publisher_id,
+                    &command.lease_token.as_bytes().as_slice(),
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if updated != 1 {
+            return Err(store_error(
+                StoreErrorCode::LeaseLost,
+                "Outbox delivery lease or attempt changed",
+            ));
+        }
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(())
     }
 
     /// Creates the Run, first Event, first Checkpoint, initial Tasks, and command
@@ -6609,6 +6772,38 @@ async fn insert_event(transaction: &Transaction<'_>, event: EventInsert<'_>) -> 
                 &event.correlation_id,
                 &event.context.idempotency_key.as_str(),
                 &event.occurred_at,
+                &event.recorded_at,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    let outbox_payload = json!({
+        "event_id": event.event_id,
+        "run_id": event.run_id,
+        "sequence": event.sequence,
+        "event_type": event.event_type,
+        "payload_schema_version": event.payload_schema_version,
+        "payload": event.payload,
+        "producer": event.producer,
+        "correlation_id": event.correlation_id,
+        "recorded_at_micros": event.recorded_at,
+    });
+    let partition_key = event.run_id.to_string();
+    transaction
+        .execute(
+            "INSERT INTO agent_loom.outbox_messages (\
+                outbox_id, tenant_id, event_id, run_id, topic, partition_key, payload_json, \
+                status, attempt, available_at, lease_owner, lease_token, lease_expires_at, \
+                last_error_code, created_at, published_at\
+             ) VALUES ($1, $2, $1, $3, 'run.events', $4, $5, 'pending', 0, \
+                to_timestamp(($6::bigint)::double precision / 1000000.0), NULL, NULL, NULL, NULL, \
+                to_timestamp(($6::bigint)::double precision / 1000000.0), NULL)",
+            &[
+                &event.event_id,
+                &event.tenant_id,
+                &event.run_id,
+                &partition_key,
+                &outbox_payload,
                 &event.recorded_at,
             ],
         )

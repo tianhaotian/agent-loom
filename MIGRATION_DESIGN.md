@@ -200,7 +200,7 @@ PostgreSQL 即使允许事务 DDL，也采用相同 step journal；`CREATE INDEX
 | `tool_execution_attempts` | immutable append | Tool 请求审计 | `0006` |
 | `agent_executions` | mutable projection | 远程 Agent 映射、重试时间与请求信封 | `0006` + `0009` + `0010` |
 | `agent_event_receipts` | immutable guard | 远程 Event 去重 | `0006` |
-| `outbox_messages` | mutable delivery | 可选消息投递 | `0010` optional |
+| `outbox_messages` | mutable delivery | 权威 Event 可靠发布 | `0014` |
 
 `agent_event_receipts` 是 `append_agent_events` 的必要去重守卫。只把 vendor event ID 放进 JSON 无法建立跨 Provider 的可靠唯一约束。
 
@@ -579,9 +579,9 @@ CHECK source_sequence IS NULL OR source_sequence >= 0
 - `(tenant_id, agent_execution_id, source_sequence, agent_event_receipt_id)`；
 - `(tenant_id, run_id, recorded_at, agent_event_receipt_id)`。
 
-## 12. 可选 Outbox
+## 12. Transactional Outbox
 
-`outbox_messages` 只在启用消息分发能力时创建：
+`outbox_messages` 与权威 Event 一同创建；外部 Broker 和具体 Publisher 可以按部署需要启用：
 
 ```text
 PK (outbox_id)
@@ -597,7 +597,7 @@ CHECK attempt >= 0
 - `(status, lease_expires_at, outbox_id)` Lease 回收；
 - `(tenant_id, partition_key, created_at, outbox_id)` 诊断查询。
 
-Outbox 的领取复用 Task 的短事务和 Lease 语义，但不修改 Run 状态。没有 Outbox 时，DurableFollowUp 仍由权威任务表和周期扫描保证。
+Outbox 的领取复用 Task 的短事务和 Lease 语义，但不修改 Run 状态。DurableFollowUp 仍由权威任务表和周期扫描保证，不依赖消息系统完成正确性推进。
 
 ## 13. 外键策略与循环引用
 

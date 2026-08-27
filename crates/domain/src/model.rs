@@ -221,6 +221,20 @@ pub struct AgentEventReceiptRecord {
     pub recorded_at: UnixMicros,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboxMessage {
+    pub tenant_id: TenantId,
+    pub outbox_id: crate::OutboxId,
+    pub event_id: EventId,
+    pub run_id: RunId,
+    pub topic: String,
+    pub partition_key: String,
+    pub payload: JsonPayload,
+    pub attempt: u32,
+    pub lease_expires_at: UnixMicros,
+    pub created_at: UnixMicros,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

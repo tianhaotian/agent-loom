@@ -38,6 +38,7 @@ mod tests {
         "tool_execution_attempts",
         "agent_executions",
         "agent_event_receipts",
+        "outbox_messages",
     ];
 
     #[test]

@@ -61,7 +61,7 @@ Tenant
     ├── Checkpoint
     ├── WaitSubscription
     ├── CommandReceipt
-    └── OutboxMessage（可选）
+    └── OutboxMessage
 ```
 
 Run 是主要事务聚合根。涉及 Run 状态推进的 Stage、Task、Wait、Checkpoint、Artifact 和 Event 写入必须通过 DurableStore 领域操作完成，不能由 Adapter 直接 CRUD。
@@ -483,9 +483,9 @@ event_kind, raw_digest, local_event_id, recorded_at
 - 只有新接收的权威事件可以携带投影；投影对象的 `created_event_id` 必须等于该事件的本地 Event ID；
 - transient/ignored 远程事件可以没有 `local_event_id`，但影响状态的事件必须关联本地 Event。
 
-## 11. 可选 Outbox
+## 11. Transactional Outbox
 
-`outbox_messages` 仅在引入消息分发层后启用：
+`outbox_messages` 为每个权威 Event 保存可靠发布意图；外部 Broker 可以按部署需要替换当前 Publisher：
 
 ```text
 outbox_id, tenant_id, event_id, topic, partition_key,
@@ -497,7 +497,7 @@ created_at, published_at
 - Event 与 OutboxMessage 在同一业务事务创建。
 - 唯一：`(tenant_id, event_id, topic)`，防止重复产生同一投递意图。
 - 发布语义仍为 at-least-once；消费者必须以 event_id 或领域幂等键去重。
-- Outbox 失败不得回滚已经提交的 Run 状态。
+- 发布失败只推进 Outbox 的重试状态，不得回滚已经提交的 Run 状态。
 
 ## 12. 跨表不变量
 

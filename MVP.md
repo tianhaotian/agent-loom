@@ -15,7 +15,7 @@
 - 部署审批 Wait、重复事件幂等消费和持久化恢复 Task；
 - 通过正式 Adapter/Execution 契约执行的 Mock Agent Server 与 Mock DevOps Tool；
 - 可通过配置切换的真实 HTTP Agent Server 与 DevOps Tool profile；
-- Scheduler、Recovery Worker、Agent Event/Stop/Status Worker、过期 Lease 回收和 deadline/Wait/stale execution 维护服务；
+- Scheduler、Recovery Worker、Agent Event/Stop/Status Worker、Transactional Outbox Publisher、过期 Lease 回收和 deadline/Wait/stale execution 维护服务；
 - 幂等命令、Run version 和 execution generation fencing；
 - JSON 结构化请求/Worker 日志和响应关联 ID；
 - 从 HTTP 创建到 PostgreSQL 终态、返工、审批、Tool 部署和 deadline 的自动化 E2E 验收。
@@ -100,6 +100,8 @@ Pause/Cancel 会把已经提交或正在提交的远端 Agent 执行持久化为
 提交成功的远端 Agent 会立即获得持久化轮询时间。Agent Event Worker 调用 Adapter 的 `read_events` 并传入已提交 cursor；事件 receipt、原始 digest、本地 Event、cursor CAS 和下一次轮询时间在一个 PostgreSQL 事务内提交。相同 cursor 上的重复 Worker 调用复用 Command Receipt，重复远端事件复用确定性 receipt，因此重启和 at-least-once 读取不会重复推进。终态批次会把执行切换为 `reconciling`，Status Worker 核验最终状态后停止事件轮询。
 
 当 `submit` 响应丢失或明确返回不确定时，执行保持为 `outcome_unknown`。持久化恢复 Task 提交 reconciliation intent 后，Dispatcher 先使用原始提交幂等键调用 `reconcile_submission`；查到远端执行就补录 Run/Session/协议版本，明确不存在才安全重提。可恢复查询错误不会被误判为“远端不存在”，配置或能力缺失则进入 `manual_review`。
+
+所有 Event 写入都会在同一事务创建 `run.events` Outbox 消息。生产进程中的 Outbox Publisher 以短 Lease 发布结构化 JSON 日志；失败或进程崩溃不会丢失消息，Lease 到期后可由另一进程接管，旧 attempt 会被 fencing。该通道是 at-least-once，后续 Broker Publisher 和消费者必须以 `event_id` 幂等。
 
 ### 注入等待事件
 

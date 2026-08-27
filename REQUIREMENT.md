@@ -322,7 +322,7 @@ agent_event_receipts 远程 Agent Event 去重与本地 Event 映射
 wait_subscriptions 外部事件、审批、Timer 与子 Run 等待条件
 artifact_refs     交付物元数据、版本与外部引用
 command_receipts  命令/事件幂等请求摘要与确定结果
-outbox            可选：后续异步分发的可靠投递记录
+outbox            权威 Event 的可靠异步发布记录
 ```
 
 字段、关系、索引和跨 Provider 类型映射以 [DOMAIN_MODEL.md](./DOMAIN_MODEL.md) 为准。
@@ -361,7 +361,7 @@ PostgreSQL/MySQL 的物理类型、复合外键、去重守卫、锁/CAS 模板�
 
 Redis 可用于限流、配置缓存、热点只读缓存和 SSE/WebSocket 在线广播，但缓存失效不能影响任务执行的正确性。Run、Task、Lease、Checkpoint、Event 和 Tool Execution 的唯一真相必须在 DurableStore。
 
-消息系统可后续用于高吞吐分发；引入后必须使用 Transactional Outbox，并保证消费者幂等。消息系统不可替代 Event Store 的审计与恢复职责。
+消息系统可后续用于高吞吐分发；权威 Event 必须通过 Transactional Outbox 发布，消费者以 event_id 或领域幂等键去重。消息系统不可替代 Event Store 的审计与恢复职责。
 
 ## 8. 非功能需求
 

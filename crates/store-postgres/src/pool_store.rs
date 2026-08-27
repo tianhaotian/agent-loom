@@ -1,18 +1,18 @@
 use agent_loom_domain::{AgentExecutionId, ToolExecutionId};
 use agent_loom_domain::{
-    AgentExecutionSnapshot, ArtifactRefSnapshot, RunId, RunSnapshot, StageExecutionSnapshot,
-    ToolExecutionSnapshot, WaitSnapshot, WorkflowId, WorkflowSnapshot,
+    AgentExecutionSnapshot, ArtifactRefSnapshot, OutboxMessage, RunId, RunSnapshot,
+    StageExecutionSnapshot, ToolExecutionSnapshot, WaitSnapshot, WorkflowId, WorkflowSnapshot,
 };
 use agent_loom_durable_store::{
     AgentEventBatchOutcome, AgentEventPage, AgentEventQuery, AgentInvocation, AgentStatusPage,
     AgentStatusQuery, AgentStopPage, AgentStopQuery, AppendAgentEvents, ApplyDueWork, ApplyEvent,
-    ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt, ClaimTask, ClaimedTask,
-    CommandContext, Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome, DueWorkPage,
-    DueWorkQuery, DurableStore, EventCursor, EventPage, FailTask, LeaseReclaimOutcome,
+    ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt, ClaimOutbox, ClaimTask,
+    ClaimedTask, CommandContext, Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome,
+    DueWorkPage, DueWorkQuery, DurableStore, EventCursor, EventPage, FailTask, LeaseReclaimOutcome,
     MaintenanceOutcome, MaintenancePage, MaintenanceQuery, PrepareAgentExecution,
     PrepareToolExecution, QueryContext, ReclaimExpiredLease, RecordAgentOutcome,
-    RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, RetryClass, StoreCapabilities,
-    StoreError, StoreErrorCode, StoreFuture, StoreResult, ToolInvocation,
+    RecordAgentSubmission, RecordOutboxDelivery, RecordToolOutcome, RenewTaskLease, RetryClass,
+    StoreCapabilities, StoreError, StoreErrorCode, StoreFuture, StoreResult, ToolInvocation,
 };
 use deadpool_postgres::{Object, Pool};
 
@@ -202,6 +202,32 @@ impl DurableStore for PostgresStore {
             let client = self.connection().await?;
             self.executor
                 .scan_agent_events(&client, context, query)
+                .await
+        })
+    }
+
+    fn claim_outbox<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        command: ClaimOutbox,
+    ) -> StoreFuture<'a, Option<OutboxMessage>> {
+        Box::pin(async move {
+            let mut client = self.connection().await?;
+            self.executor
+                .claim_outbox(&mut client, context, command)
+                .await
+        })
+    }
+
+    fn record_outbox_delivery<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        command: RecordOutboxDelivery,
+    ) -> StoreFuture<'a, ()> {
+        Box::pin(async move {
+            let mut client = self.connection().await?;
+            self.executor
+                .record_outbox_delivery(&mut client, context, command)
                 .await
         })
     }

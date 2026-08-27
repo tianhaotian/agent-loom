@@ -8,9 +8,10 @@ use agent_loom_domain::{
     EventId, IdempotencyKey, JsonPayload, LeaseToken, RunId, ScopeKey, WorkerId,
 };
 use agent_loom_durable_store::{
-    AgentEventQuery, AgentSubmissionOutcome, ClaimTask, CommandContext, CommandDisposition,
-    ControlRun, DurableStore as _, ExpectedRun, LeaseProof, PrepareAgentExecution, QueryContext,
-    RecordAgentSubmission,
+    AgentEventQuery, AgentSubmissionOutcome, ClaimOutbox, ClaimTask, CommandContext,
+    CommandDisposition, ControlRun, DurableStore as _, ExpectedRun, LeaseProof,
+    OutboxDeliveryOutcome, PrepareAgentExecution, QueryContext, RecordAgentSubmission,
+    RecordOutboxDelivery,
 };
 use agent_loom_runtime::{
     AgentEventDispatcher as _, AgentEventPollOutcome, AgentEventWorker, AgentEventWorkerConfig,
@@ -804,6 +805,138 @@ async fn running_agent_events_are_cursor_fenced_deduplicated_and_terminally_reco
         event_worker.poll_once().await.expect("poll after terminal"),
         AgentEventPollOutcome::Idle
     ));
+}
+
+#[tokio::test]
+async fn transactional_outbox_recovers_expired_publish_leases_without_losing_events() {
+    let Ok(database_url) = std::env::var("AGENT_LOOM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos();
+    let application = bootstrap_outbox_test(&database_url, nonce).await;
+    let query = QueryContext {
+        tenant_id: application.tenant_id,
+        actor_ref: "outbox-e2e".to_owned(),
+        authoritative: true,
+    };
+    let first_publisher = WorkerId::from_bytes(test_id(nonce, "outbox-publisher-1"));
+    let first_token = LeaseToken::from_bytes(Sha256::digest(b"outbox-token-1").into());
+    let first = application
+        .store
+        .claim_outbox(
+            &query,
+            ClaimOutbox {
+                publisher_id: first_publisher,
+                lease_token: first_token.clone(),
+                lease_duration: DurationMicros::new(10_000),
+            },
+        )
+        .await
+        .expect("claim first Outbox lease")
+        .expect("Run creation atomically produced an Outbox message");
+    assert_eq!(first.attempt, 1);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let second_publisher = WorkerId::from_bytes(test_id(nonce, "outbox-publisher-2"));
+    let second_token = LeaseToken::from_bytes(Sha256::digest(b"outbox-token-2").into());
+    let second = application
+        .store
+        .claim_outbox(
+            &query,
+            ClaimOutbox {
+                publisher_id: second_publisher,
+                lease_token: second_token.clone(),
+                lease_duration: DurationMicros::new(1_000_000),
+            },
+        )
+        .await
+        .expect("reclaim expired Outbox lease")
+        .expect("expired message is reclaimable after a publisher crash");
+    assert_eq!(second.outbox_id, first.outbox_id);
+    assert_eq!(second.event_id, first.event_id);
+    assert_eq!(second.attempt, 2);
+    assert!(
+        application
+            .store
+            .record_outbox_delivery(
+                &query,
+                RecordOutboxDelivery {
+                    outbox_id: first.outbox_id,
+                    expected_attempt: first.attempt,
+                    publisher_id: first_publisher,
+                    lease_token: first_token,
+                    outcome: OutboxDeliveryOutcome::Published,
+                },
+            )
+            .await
+            .is_err(),
+        "the expired first publisher must be fenced"
+    );
+    application
+        .store
+        .record_outbox_delivery(
+            &query,
+            RecordOutboxDelivery {
+                outbox_id: second.outbox_id,
+                expected_attempt: second.attempt,
+                publisher_id: second_publisher,
+                lease_token: second_token,
+                outcome: OutboxDeliveryOutcome::Published,
+            },
+        )
+        .await
+        .expect("acknowledge the active Outbox lease");
+    assert!(
+        application
+            .store
+            .claim_outbox(
+                &query,
+                ClaimOutbox {
+                    publisher_id: second_publisher,
+                    lease_token: LeaseToken::from_bytes([9; 32]),
+                    lease_duration: DurationMicros::new(1_000_000),
+                },
+            )
+            .await
+            .expect("scan after publish")
+            .is_none()
+    );
+}
+
+async fn bootstrap_outbox_test(
+    database_url: &str,
+    nonce: u128,
+) -> agent_loom_server::BootstrappedServer {
+    let application = bootstrap(&ServerConfig {
+        database_url: database_url.to_owned(),
+        bind: "127.0.0.1:0".to_owned(),
+        tenant_key: format!("outbox-e2e-{nonce}"),
+        api_key: "mvp-e2e-api-key".to_owned(),
+        pool_size: 4,
+        http_adapters: None,
+    })
+    .await
+    .expect("bootstrap MVP server");
+    let response = application
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/runs")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer mvp-e2e-api-key")
+                .header("idempotency-key", format!("outbox-run-{nonce}"))
+                .body(Body::from(r#"{"input":{"goal":"publish reliably"}}"#))
+                .expect("build create Run request"),
+        )
+        .await
+        .expect("create Run response");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    application
 }
 
 fn test_id(nonce: u128, label: &str) -> [u8; 16] {

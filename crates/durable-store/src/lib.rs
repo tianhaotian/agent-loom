@@ -12,6 +12,7 @@ mod maintenance;
 mod migration;
 mod migration_executor;
 mod migration_runner;
+mod outbox;
 mod outcome;
 mod store;
 
@@ -26,5 +27,6 @@ pub use maintenance::*;
 pub use migration::*;
 pub use migration_executor::*;
 pub use migration_runner::*;
+pub use outbox::*;
 pub use outcome::*;
 pub use store::*;

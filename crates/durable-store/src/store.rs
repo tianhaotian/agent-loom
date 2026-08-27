@@ -1,20 +1,20 @@
 use std::{future::Future, pin::Pin};
 
 use agent_loom_domain::{
-    AgentExecutionId, AgentExecutionSnapshot, ArtifactRefSnapshot, RunId, RunSnapshot,
-    StageExecutionSnapshot, ToolExecutionId, ToolExecutionSnapshot, WaitSnapshot, WorkflowId,
-    WorkflowSnapshot,
+    AgentExecutionId, AgentExecutionSnapshot, ArtifactRefSnapshot, OutboxMessage, RunId,
+    RunSnapshot, StageExecutionSnapshot, ToolExecutionId, ToolExecutionSnapshot, WaitSnapshot,
+    WorkflowId, WorkflowSnapshot,
 };
 
 use crate::{
     AgentEventBatchOutcome, AgentEventPage, AgentEventQuery, AgentInvocation, AgentStatusPage,
     AgentStatusQuery, AgentStopPage, AgentStopQuery, AppendAgentEvents, ApplyDueWork, ApplyEvent,
-    ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt, ClaimTask, ClaimedTask,
-    Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery,
-    EventCursor, EventPage, FailTask, LeaseReclaimOutcome, MaintenanceOutcome, MaintenancePage,
-    MaintenanceQuery, PrepareAgentExecution, PrepareToolExecution, QueryContext,
-    ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission, RecordToolOutcome,
-    RenewTaskLease, StoreResult, ToolInvocation,
+    ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt, ClaimOutbox, ClaimTask,
+    ClaimedTask, Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome, DueWorkPage,
+    DueWorkQuery, EventCursor, EventPage, FailTask, LeaseReclaimOutcome, MaintenanceOutcome,
+    MaintenancePage, MaintenanceQuery, PrepareAgentExecution, PrepareToolExecution, QueryContext,
+    ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission, RecordOutboxDelivery,
+    RecordToolOutcome, RenewTaskLease, StoreResult, ToolInvocation,
 };
 
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = StoreResult<T>> + Send + 'a>>;
@@ -113,6 +113,18 @@ pub trait DurableStore: Send + Sync {
         context: &'a QueryContext,
         query: AgentEventQuery,
     ) -> StoreFuture<'a, AgentEventPage>;
+
+    fn claim_outbox<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        command: ClaimOutbox,
+    ) -> StoreFuture<'a, Option<OutboxMessage>>;
+
+    fn record_outbox_delivery<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        command: RecordOutboxDelivery,
+    ) -> StoreFuture<'a, ()>;
 
     fn get_tool_invocation<'a>(
         &'a self,

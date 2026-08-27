@@ -6,12 +6,13 @@ use agent_loom_runtime::{
     AgentEventPollingJob, AgentEventWorker, AgentEventWorkerConfig, AgentStatusPollingJob,
     AgentStatusWorker, AgentStatusWorkerConfig, AgentStopPollingJob, AgentStopWorker,
     AgentStopWorkerConfig, DeterministicDueWorkPlanner, DueWorkPollingJob, DueWorkScheduler,
-    DueWorkSchedulerConfig, LeaseReclaimPollingJob, PollingService, PollingServiceConfig,
-    RecoveryPollingJob, RecoveryWorker, RecoveryWorkerConfig, SeededRecoveryIdentitySource,
+    DueWorkSchedulerConfig, LeaseReclaimPollingJob, OutboxPollingJob, OutboxWorker,
+    OutboxWorkerConfig, PollingService, PollingServiceConfig, RecoveryPollingJob, RecoveryWorker,
+    RecoveryWorkerConfig, SeededRecoveryIdentitySource,
 };
 use agent_loom_server::{
-    MaintenancePollingConfig, MaintenancePollingJob, ServerConfig, WorkflowWorker,
-    WorkflowWorkerConfig, bootstrap, http_dispatcher, mock_dispatcher,
+    JsonLogOutboxPublisher, MaintenancePollingConfig, MaintenancePollingJob, ServerConfig,
+    WorkflowWorker, WorkflowWorkerConfig, bootstrap, http_dispatcher, mock_dispatcher,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
@@ -174,6 +175,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
             error_delay: Duration::from_secs(2),
         },
     )?;
+    let outbox_service = PollingService::new(
+        OutboxPollingJob::new(OutboxWorker::new(
+            application.store.clone(),
+            JsonLogOutboxPublisher,
+            application.tenant_id,
+            process_worker_id(&config.tenant_key, "outbox", process_instance_id),
+            LeaseToken::from_bytes(random_seed(&config.tenant_key, "outbox")),
+            OutboxWorkerConfig::default(),
+        )?),
+        PollingServiceConfig {
+            concurrency: 1,
+            busy_delay: Duration::from_millis(10),
+            idle_delay: Duration::from_millis(250),
+            error_delay: Duration::from_secs(2),
+        },
+    )?;
 
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let worker_shutdown = shutdown_receiver.clone();
@@ -184,6 +201,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let agent_stop_shutdown = shutdown_receiver.clone();
     let agent_status_shutdown = shutdown_receiver.clone();
     let agent_event_shutdown = shutdown_receiver.clone();
+    let outbox_shutdown = shutdown_receiver.clone();
     let worker_task = tokio::spawn(async move { workflow_worker.run(worker_shutdown).await });
     let reclaim_task = tokio::spawn(async move { reclaim_service.run(reclaim_shutdown).await });
     let due_task = tokio::spawn(async move { due_service.run(due_shutdown).await });
@@ -196,6 +214,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::spawn(async move { agent_status_service.run(agent_status_shutdown).await });
     let agent_event_task =
         tokio::spawn(async move { agent_event_service.run(agent_event_shutdown).await });
+    let outbox_task = tokio::spawn(async move { outbox_service.run(outbox_shutdown).await });
 
     println!(
         "{}",
@@ -232,6 +251,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = agent_stop_task.await;
     let _ = agent_status_task.await;
     let _ = agent_event_task.await;
+    let _ = outbox_task.await;
     Ok(())
 }
 
