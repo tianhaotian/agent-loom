@@ -4,6 +4,7 @@
 pub enum ConformanceCase {
     TenantIsolation,
     CreateRunAtomicity,
+    TaskCompletionAtomicity,
     CommandIdempotency,
     ConcurrentTaskClaim,
     LeaseExpiryRetry,
@@ -26,6 +27,7 @@ impl ConformanceCase {
         match self {
             Self::TenantIsolation => "tenant_isolation",
             Self::CreateRunAtomicity => "create_run_atomicity",
+            Self::TaskCompletionAtomicity => "task_completion_atomicity",
             Self::CommandIdempotency => "command_idempotency",
             Self::ConcurrentTaskClaim => "concurrent_task_claim",
             Self::LeaseExpiryRetry => "lease_expiry_retry",
@@ -48,6 +50,7 @@ impl ConformanceCase {
 pub const CORE_CASES: &[ConformanceCase] = &[
     ConformanceCase::TenantIsolation,
     ConformanceCase::CreateRunAtomicity,
+    ConformanceCase::TaskCompletionAtomicity,
     ConformanceCase::CommandIdempotency,
     ConformanceCase::ConcurrentTaskClaim,
     ConformanceCase::LeaseExpiryRetry,

@@ -27,9 +27,14 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::{sync::watch, time::sleep};
 
-use crate::identity::{command_context, derived_id, hash_bytes, now_micros};
+use crate::{
+    execution_plan::stage_execution_id,
+    identity::{command_context, derived_id, hash_bytes, now_micros},
+    task_handler::{decode_task_input, encode_task_input},
+};
 
 const ACTOR: &str = "agent-loom-mock-worker";
+const DELIVERY_HANDLER_KEY: &str = "delivery-mvp";
 pub(crate) const DELIVERY_STAGES: &[&str] = &[
     "requirements",
     "product_design",
@@ -63,19 +68,57 @@ struct MockTaskInput {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum MockTaskEnvelope {
-    Direct(MockTaskInput),
-    WaitResume { resume_input: MockTaskInput },
+struct PlannedMockTaskInput {
+    workflow: String,
+    step: usize,
+    checkpoint_sequence: u64,
 }
 
-impl MockTaskEnvelope {
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DeliveryTaskPayload {
+    Direct(MockTaskInput),
+    Planned {
+        task_spec: PlannedMockTaskInput,
+        run_input: Value,
+    },
+}
+
+impl DeliveryTaskPayload {
     fn into_input(self) -> MockTaskInput {
         match self {
-            Self::Direct(input)
-            | Self::WaitResume {
-                resume_input: input,
-            } => input,
+            Self::Direct(input) => input,
+            Self::Planned {
+                task_spec,
+                run_input,
+            } => MockTaskInput {
+                workflow: task_spec.workflow,
+                step: task_spec.step,
+                checkpoint_sequence: task_spec.checkpoint_sequence,
+                request: run_input,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegisteredTaskHandler {
+    DeliveryMvp,
+}
+
+impl RegisteredTaskHandler {
+    fn resolve(handler_key: &LogicalKey) -> Result<Self, MockWorkerError> {
+        match handler_key.as_str() {
+            DELIVERY_HANDLER_KEY => Ok(Self::DeliveryMvp),
+            _ => Err(MockWorkerError::InvalidTask(
+                "Task input references an unregistered handler",
+            )),
+        }
+    }
+
+    const fn supports(self, kind: TaskKind) -> bool {
+        match self {
+            Self::DeliveryMvp => matches!(kind, TaskKind::AgentServer | TaskKind::Tool),
         }
     }
 }
@@ -157,42 +200,84 @@ impl MockWorkflowWorker {
     #[allow(clippy::too_many_lines)]
     pub async fn run_once(&self) -> Result<MockWorkerActivity, MockWorkerError> {
         let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
-        let claim_identity = format!("mock-claim/{}/{sequence}", self.worker_id);
         let synthetic_run = agent_loom_domain::RunId::from_bytes(derived_id(
             "claim-correlation",
             &self.worker_id.to_string(),
         ));
-        let claim_context = command_context(
-            self.tenant_id,
-            synthetic_run,
-            ACTOR,
-            "claim_task",
-            &claim_identity,
-            claim_identity.as_bytes(),
-        )
-        .map_err(MockWorkerError::InvalidTask)?;
-        let token: [u8; 32] = Sha256::digest(claim_identity.as_bytes()).into();
-        let Some(claimed) = self
-            .store
-            .claim_task(
-                &claim_context,
-                ClaimTask {
-                    worker_id: self.worker_id,
-                    lease_token: LeaseToken::from_bytes(token),
-                    lease_duration: self.config.lease_duration,
-                    candidate_window: self.config.candidate_window,
-                    kind: None,
-                },
+        let mut supported_kinds = [TaskKind::AgentServer, TaskKind::Tool];
+        if sequence % 2 == 1 {
+            supported_kinds.rotate_left(1);
+        }
+        let mut claimed_task = None;
+        for kind in supported_kinds {
+            let kind_key = match kind {
+                TaskKind::AgentServer => "agent-server",
+                TaskKind::Tool => "tool",
+                _ => unreachable!("worker claim list contains only supported kinds"),
+            };
+            let claim_identity = format!("mock-claim/{}/{sequence}/{kind_key}", self.worker_id);
+            let claim_context = command_context(
+                self.tenant_id,
+                synthetic_run,
+                ACTOR,
+                "claim_task",
+                &claim_identity,
+                claim_identity.as_bytes(),
             )
-            .await?
-        else {
+            .map_err(MockWorkerError::InvalidTask)?;
+            let token: [u8; 32] = Sha256::digest(claim_identity.as_bytes()).into();
+            if let Some(claimed) = self
+                .store
+                .claim_task(
+                    &claim_context,
+                    ClaimTask {
+                        worker_id: self.worker_id,
+                        lease_token: LeaseToken::from_bytes(token),
+                        lease_duration: self.config.lease_duration,
+                        candidate_window: self.config.candidate_window,
+                        kind: Some(kind),
+                    },
+                )
+                .await?
+            {
+                claimed_task = Some((claimed.value, token, claim_context));
+                break;
+            }
+        }
+        let Some((claimed, token, claim_context)) = claimed_task else {
             return Ok(MockWorkerActivity::Idle);
         };
 
-        let claimed = claimed.value;
-        let input = serde_json::from_slice::<MockTaskEnvelope>(claimed.task.input.as_bytes())
-            .map(MockTaskEnvelope::into_input)
-            .map_err(|_| MockWorkerError::InvalidTask("mock Task input is malformed"))?;
+        let routed = decode_task_input(&claimed.task.input)
+            .or_else(|_| legacy_delivery_task_input(&claimed.task.input))
+            .map_err(|_| {
+                MockWorkerError::InvalidTask("Task input routing envelope is malformed")
+            })?;
+        let handler = RegisteredTaskHandler::resolve(&routed.handler_key)?;
+        if !handler.supports(claimed.task.kind) {
+            return Err(MockWorkerError::InvalidTask(
+                "Task kind is unsupported by its registered handler",
+            ));
+        }
+        match handler {
+            RegisteredTaskHandler::DeliveryMvp => {
+                self.run_delivery_handler(&claimed, routed.payload, token, &claim_context)
+                    .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_delivery_handler(
+        &self,
+        claimed: &agent_loom_durable_store::ClaimedTask,
+        routed_payload: Value,
+        token: [u8; 32],
+        claim_context: &agent_loom_durable_store::CommandContext,
+    ) -> Result<MockWorkerActivity, MockWorkerError> {
+        let input = serde_json::from_value::<DeliveryTaskPayload>(routed_payload)
+            .map(DeliveryTaskPayload::into_input)
+            .map_err(|_| MockWorkerError::InvalidTask("delivery Task payload is malformed"))?;
         if input.workflow != "delivery-mvp" || input.step >= DELIVERY_EXECUTION_STAGES.len() {
             return Err(MockWorkerError::InvalidTask(
                 "mock Task workflow or step is unsupported",
@@ -200,11 +285,11 @@ impl MockWorkflowWorker {
         }
         match claimed.task.kind {
             TaskKind::AgentServer => {
-                self.prepare_and_dispatch(&claimed, &input, token, &claim_context)
+                self.prepare_and_dispatch(claimed, &input, token, claim_context)
                     .await?;
             }
             TaskKind::Tool => {
-                self.prepare_tool_and_dispatch(&claimed, &input, token, &claim_context)
+                self.prepare_tool_and_dispatch(claimed, &input, token, claim_context)
                     .await?;
             }
             _ => {
@@ -277,7 +362,7 @@ impl MockWorkflowWorker {
                 }))?,
             })
         } else if input.step == 8 {
-            let next_input = payload(&json!({
+            let next_input = delivery_task_input(json!({
                 "workflow": "delivery-mvp",
                 "step": next_step,
                 "checkpoint_sequence": completed_sequence,
@@ -321,7 +406,7 @@ impl MockWorkflowWorker {
                 created_event_id: event_id,
             })
         } else {
-            let next_input = payload(&json!({
+            let next_input = delivery_task_input(json!({
                 "workflow": "delivery-mvp",
                 "step": next_step,
                 "checkpoint_sequence": completed_sequence,
@@ -764,21 +849,36 @@ fn payload(value: &Value) -> Result<JsonPayload, MockWorkerError> {
         .map_err(|_| MockWorkerError::InvalidTask("mock payload cannot be encoded"))
 }
 
-pub(crate) fn initial_task_input(request: Value) -> Result<JsonPayload, serde_json::Error> {
-    serde_json::to_vec(&MockTaskInput {
-        workflow: "delivery-mvp".to_owned(),
-        step: 0,
-        checkpoint_sequence: 1,
-        request,
+fn delivery_task_input(value: Value) -> Result<JsonPayload, MockWorkerError> {
+    let handler_key = LogicalKey::parse(DELIVERY_HANDLER_KEY)
+        .map_err(|_| MockWorkerError::InvalidTask("delivery handler key is invalid"))?;
+    encode_task_input(&handler_key, value)
+        .map_err(|_| MockWorkerError::InvalidTask("delivery Task input cannot be encoded"))
+}
+
+fn legacy_delivery_task_input(
+    input: &JsonPayload,
+) -> Result<crate::task_handler::RoutedTaskInput, crate::task_handler::TaskInputError> {
+    let mut payload: Value = serde_json::from_slice(input.as_bytes())
+        .map_err(|_| crate::task_handler::TaskInputError::InvalidEnvelope)?;
+    if let Some(resume_input) = payload
+        .as_object_mut()
+        .and_then(|object| object.remove("resume_input"))
+    {
+        payload = resume_input;
+    }
+    serde_json::from_value::<DeliveryTaskPayload>(payload.clone())
+        .map_err(|_| crate::task_handler::TaskInputError::InvalidEnvelope)?;
+    Ok(crate::task_handler::RoutedTaskInput {
+        handler_key: LogicalKey::parse(DELIVERY_HANDLER_KEY)
+            .map_err(|_| crate::task_handler::TaskInputError::InvalidHandlerKey)?,
+        payload,
     })
-    .map(JsonPayload::from_validated_bytes)
 }
 
 pub(crate) fn stage_id(run_id: agent_loom_domain::RunId, step: usize) -> StageExecutionId {
-    StageExecutionId::from_bytes(derived_id(
-        "stage",
-        &format!("{run_id}/{}", DELIVERY_STAGES[step]),
-    ))
+    let key = LogicalKey::parse(DELIVERY_STAGES[step]).expect("delivery Stage key is valid");
+    stage_execution_id(run_id, &key)
 }
 
 fn execution_stage_id(run_id: agent_loom_domain::RunId, execution_step: usize) -> StageExecutionId {
@@ -852,11 +952,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initial_task_starts_the_delivery_workflow() {
-        let payload = initial_task_input(json!({"goal": "ship"})).expect("payload");
-        let input: MockTaskInput = serde_json::from_slice(payload.as_bytes()).expect("input");
+    fn planned_task_envelope_starts_the_delivery_workflow() {
+        let payload = delivery_task_input(json!({
+            "task_spec": {
+                "workflow": "delivery-mvp",
+                "step": 0,
+                "checkpoint_sequence": 1
+            },
+            "run_input": {"goal": "ship"}
+        }))
+        .expect("payload");
+        let routed = decode_task_input(&payload).expect("route");
+        assert_eq!(routed.handler_key.as_str(), DELIVERY_HANDLER_KEY);
+        let input = serde_json::from_value::<DeliveryTaskPayload>(routed.payload)
+            .expect("delivery payload")
+            .into_input();
         assert_eq!(input.workflow, "delivery-mvp");
         assert_eq!(input.step, 0);
+        assert_eq!(input.request["goal"], "ship");
         assert_eq!(DELIVERY_STAGES.len(), 8);
+    }
+
+    #[test]
+    fn legacy_delivery_payload_is_routed_for_in_flight_run_compatibility() {
+        let legacy = payload(&json!({
+            "workflow": "delivery-mvp",
+            "step": 4,
+            "checkpoint_sequence": 5,
+            "request": {"goal": "ship"}
+        }))
+        .expect("legacy payload");
+        let routed = legacy_delivery_task_input(&legacy).expect("legacy route");
+
+        assert_eq!(routed.handler_key.as_str(), DELIVERY_HANDLER_KEY);
+        let input = serde_json::from_value::<DeliveryTaskPayload>(routed.payload)
+            .expect("delivery payload")
+            .into_input();
+        assert_eq!(input.step, 4);
     }
 }

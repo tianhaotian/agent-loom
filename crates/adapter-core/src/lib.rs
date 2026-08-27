@@ -1,5 +1,7 @@
 //! Service-mode Agent Server and Tool adapter contracts.
 
+pub mod conformance;
+
 use std::{error::Error, fmt, future::Future, pin::Pin};
 
 use agent_loom_domain::{

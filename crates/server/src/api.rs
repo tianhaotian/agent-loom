@@ -8,12 +8,11 @@ use std::{
 
 use agent_loom_domain::{
     AgentVersionId, CheckpointId, EventId, JsonPayload, LogicalKey, RunId, RunSnapshot, RunStatus,
-    StageStatus, TaskId, TaskKind, TenantId, UnixMicros, WaitStatus, WorkflowId, WorkflowVersionId,
+    StageStatus, TenantId, UnixMicros, WaitStatus, WorkflowId,
 };
 use agent_loom_durable_store::{
     ApplyEvent, CommandDisposition, ControlRun, CreateRun, DurableStore, EventCursor, ExpectedRun,
-    InitialStage, InitialTask, NewCheckpoint, QueryContext, SignatureVerification, StoreError,
-    StoreErrorCode,
+    NewCheckpoint, QueryContext, SignatureVerification, StoreError, StoreErrorCode,
 };
 use axum::{
     Json, Router,
@@ -32,8 +31,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
+    execution_plan::{materialize_execution_plan, parse_execution_plan},
     identity::{command_context, decode_id, hash_bytes, now_micros, random_id},
-    worker::{DELIVERY_EXECUTION_STAGES, DELIVERY_STAGES, initial_task_input, stage_id},
 };
 
 const API_ACTOR: &str = "agent-loom-http-api";
@@ -43,7 +42,6 @@ pub struct AppState {
     pub store: Arc<dyn DurableStore>,
     pub tenant_id: TenantId,
     pub workflow_id: WorkflowId,
-    pub workflow_version_id: WorkflowVersionId,
     pub coordinator_agent_version_id: AgentVersionId,
     pub api_key: Arc<str>,
 }
@@ -229,17 +227,25 @@ async fn create_run(
         &request_bytes,
     )
     .map_err(ApiError::bad_request)?;
+    let workflow = state
+        .store
+        .get_workflow(&query_context(&state), state.workflow_id)
+        .await?
+        .ok_or_else(|| ApiError::internal("configured Workflow was not found"))?;
+    if workflow.status != "active" || workflow.lifecycle != "published" {
+        return Err(ApiError::internal(
+            "configured Workflow is not active and published",
+        ));
+    }
+    let plan = parse_execution_plan(&workflow.spec)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let materialized =
+        materialize_execution_plan(&plan, run_id, &request.input, UnixMicros::new(now_micros()))
+            .map_err(|error| ApiError::internal(error.to_string()))?;
     let initial_event_id = EventId::from_bytes(random_id());
-    let initial_state = json!({
-        "workflow": "delivery-mvp",
-        "completed_steps": 0,
-        "total_steps": DELIVERY_EXECUTION_STAGES.len(),
-        "request": request.input,
-    });
-    let initial_state_payload = payload(&initial_state)?;
     let command = CreateRun {
         run_id,
-        workflow_version_id: Some(state.workflow_version_id),
+        workflow_version_id: Some(workflow.workflow_version_id),
         coordinator_agent_version_id: Some(state.coordinator_agent_version_id),
         input: payload(&request.input)?,
         deadline: request.deadline_micros.map(UnixMicros::new),
@@ -247,53 +253,16 @@ async fn create_run(
         initial_checkpoint: NewCheckpoint {
             checkpoint_id: CheckpointId::from_bytes(random_id()),
             sequence: 1,
-            schema_version: 1,
-            workflow_version_id: Some(state.workflow_version_id),
+            schema_version: plan.schema_version,
+            workflow_version_id: Some(workflow.workflow_version_id),
             coordinator_agent_version_id: Some(state.coordinator_agent_version_id),
             execution_generation: 0,
-            state_digest: hash_bytes(initial_state_payload.as_bytes()),
-            state: initial_state_payload,
+            state_digest: hash_bytes(materialized.checkpoint_state.as_bytes()),
+            state: materialized.checkpoint_state,
             created_event_id: initial_event_id,
         },
-        initial_stages: DELIVERY_STAGES
-            .iter()
-            .enumerate()
-            .map(|(step, stage)| {
-                Ok(InitialStage {
-                    stage_execution_id: stage_id(run_id, step),
-                    stage_key: LogicalKey::parse(format!("delivery/{stage}"))
-                        .map_err(|_| ApiError::internal("generated Stage key is invalid"))?,
-                    definition_stage_key: LogicalKey::parse((*stage).to_owned())
-                        .map_err(|_| ApiError::internal("definition Stage key is invalid"))?,
-                    status: if step == 0 {
-                        StageStatus::Active
-                    } else {
-                        StageStatus::Planned
-                    },
-                    attempt: 1,
-                    assignee_kind: Some("agent".to_owned()),
-                    assignee_ref: Some("mock-delivery-agent".to_owned()),
-                    input_contract: payload(&json!({"type": "object"}))?,
-                    output_contract: payload(&json!({
-                        "type": "object",
-                        "required": ["stage", "status"]
-                    }))?,
-                    policy: payload(&json!({"max_attempts": 3}))?,
-                })
-            })
-            .collect::<ApiResult<Vec<_>>>()?,
-        initial_tasks: vec![InitialTask {
-            task_id: TaskId::from_bytes(random_id()),
-            stage_execution_id: Some(stage_id(run_id, 0)),
-            logical_key: LogicalKey::parse(format!("delivery/{run_id}/requirements"))
-                .map_err(|_| ApiError::internal("generated Task key is invalid"))?,
-            kind: TaskKind::AgentServer,
-            priority: 10,
-            available_at: UnixMicros::new(now_micros()),
-            max_attempts: 3,
-            input: initial_task_input(request.input)
-                .map_err(|_| ApiError::bad_request("input cannot be encoded as JSON"))?,
-        }],
+        initial_stages: materialized.initial_stages,
+        initial_tasks: materialized.initial_tasks,
     };
     let committed = state.store.create_run(&context, command).await?;
     Ok((

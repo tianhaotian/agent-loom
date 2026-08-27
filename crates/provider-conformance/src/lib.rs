@@ -1,8 +1,10 @@
 //! Provider-neutral migration and behavior contract tests.
 
 mod behavior;
+mod phase2a_behavior;
 
 pub use behavior::*;
+pub use phase2a_behavior::*;
 
 #[cfg(test)]
 mod postgres_behavior_tests;

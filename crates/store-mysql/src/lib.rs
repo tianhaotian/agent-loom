@@ -1,4 +1,10 @@
-//! MySQL/InnoDB provider bootstrap and embedded migration manifest.
+//! MySQL/InnoDB provider bootstrap, migrations, and transactional execution paths.
+
+mod migration_executor;
+mod pool_store;
+
+pub use migration_executor::*;
+pub use pool_store::*;
 
 use agent_loom_durable_store::{EmbeddedMigration, StoreCapabilities};
 

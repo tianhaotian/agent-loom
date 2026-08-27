@@ -9,7 +9,7 @@ use agent_loom_runtime::{
 };
 use agent_loom_server::{
     MaintenancePollingConfig, MaintenancePollingJob, MockWorkerConfig, MockWorkflowWorker,
-    ServerConfig, bootstrap, mock_dispatcher,
+    ServerConfig, bootstrap, http_dispatcher, mock_dispatcher,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
@@ -21,12 +21,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config = ServerConfig::from_env()?;
     let application = bootstrap(&config).await?;
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
-    let worker_id = WorkerId::from_bytes(derived_id("mock-worker", &config.tenant_key));
-    let dispatcher = mock_dispatcher(
-        application.store.clone(),
-        application.endpoint_id,
-        application.coordinator_agent_version_id,
-    )?;
+    let process_instance_id = Uuid::new_v4();
+    let worker_id = process_worker_id(&config.tenant_key, "workflow", process_instance_id);
+    let dispatcher = match &config.http_adapters {
+        Some(settings) => http_dispatcher(
+            application.store.clone(),
+            application.endpoint_id,
+            application.coordinator_agent_version_id,
+            settings,
+        )?,
+        None => mock_dispatcher(
+            application.store.clone(),
+            application.endpoint_id,
+            application.coordinator_agent_version_id,
+        )?,
+    };
     let mock_worker = Arc::new(MockWorkflowWorker::new(
         Arc::new(application.store.clone()),
         application.tenant_id,
@@ -37,11 +46,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         MockWorkerConfig::default(),
     ));
 
-    let reclaim_worker_id = WorkerId::from_bytes(derived_id("lease-reclaimer", &config.tenant_key));
-    let seed: [u8; 32] =
-        Sha256::digest(format!("{}-{}", config.tenant_key, Uuid::new_v4()).as_bytes()).into();
-    let identities =
-        SeededRecoveryIdentitySource::new(reclaim_worker_id, LeaseToken::from_bytes(seed))?;
+    let reclaim_worker_id =
+        process_worker_id(&config.tenant_key, "lease-reclaimer", process_instance_id);
+    let identities = SeededRecoveryIdentitySource::new(
+        reclaim_worker_id,
+        LeaseToken::from_bytes(random_seed(&config.tenant_key, "lease-reclaimer")),
+    )?;
     let reclaim_template = CommandContext {
         tenant_id: application.tenant_id,
         command_id: agent_loom_domain::CommandId::from_bytes([1; 16]),
@@ -84,8 +94,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         },
     )?;
 
+    let recovery_worker_id = process_worker_id(&config.tenant_key, "recovery", process_instance_id);
     let recovery_identities = SeededRecoveryIdentitySource::new(
-        WorkerId::from_bytes(derived_id("recovery-worker", &config.tenant_key)),
+        recovery_worker_id,
         LeaseToken::from_bytes(random_seed(&config.tenant_key, "recovery")),
     )?;
     let recovery_worker = RecoveryWorker::new(
@@ -140,6 +151,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "kind": "server.started",
             "bind": config.bind,
             "tenant_id": application.tenant_id.to_string(),
+            "process_instance_id": process_instance_id.to_string(),
+            "workflow_worker_id": worker_id.to_string(),
+            "lease_reclaimer_worker_id": reclaim_worker_id.to_string(),
+            "recovery_worker_id": recovery_worker_id.to_string(),
+            "external_adapter_mode": if config.http_adapters.is_some() { "http" } else { "mock" },
         })
     );
     let mut server_shutdown = shutdown_receiver;
@@ -183,9 +199,42 @@ fn random_seed(tenant_key: &str, purpose: &str) -> [u8; 32] {
     Sha256::digest(format!("{tenant_key}-{purpose}-{}", Uuid::new_v4()).as_bytes()).into()
 }
 
+fn process_worker_id(tenant_key: &str, purpose: &str, process_instance_id: Uuid) -> WorkerId {
+    WorkerId::from_bytes(derived_id(
+        "process-worker",
+        &format!("{tenant_key}/{purpose}/{process_instance_id}"),
+    ))
+}
+
 fn derived_id(namespace: &str, value: &str) -> [u8; 16] {
     let digest: [u8; 32] = Sha256::digest(format!("{namespace}/{value}").as_bytes()).into();
     let mut id = [0; 16];
     id.copy_from_slice(&digest[..16]);
     id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_identity_is_stable_only_within_one_process_role() {
+        let process = Uuid::from_bytes([1; 16]);
+        let first = process_worker_id("tenant-a", "workflow", process);
+        let replay = process_worker_id("tenant-a", "workflow", process);
+        let other_role = process_worker_id("tenant-a", "recovery", process);
+
+        assert_eq!(first, replay);
+        assert_ne!(first, other_role);
+        assert!(!first.is_nil());
+        assert!(!other_role.is_nil());
+    }
+
+    #[test]
+    fn restarted_process_never_reuses_worker_identity() {
+        let before_restart = process_worker_id("tenant-a", "workflow", Uuid::from_bytes([1; 16]));
+        let after_restart = process_worker_id("tenant-a", "workflow", Uuid::from_bytes([2; 16]));
+
+        assert_ne!(before_restart, after_restart);
+    }
 }

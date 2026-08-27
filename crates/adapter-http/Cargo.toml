@@ -1,5 +1,5 @@
 [package]
-name = "agent-loom-store-mysql"
+name = "agent-loom-adapter-http"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,15 +7,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+agent-loom-adapter-core = { path = "../adapter-core" }
 agent-loom-domain = { path = "../domain" }
-agent-loom-durable-store = { path = "../durable-store" }
-mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+axum = "0.8"
+tokio = { version = "1", features = ["net"] }
 
 [lints]
 workspace = true

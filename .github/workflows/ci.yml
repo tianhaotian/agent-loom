@@ -77,3 +77,40 @@ jobs:
           -p agent-loom-store-postgres
           -p agent-loom-provider-conformance
           --all-targets -- --test-threads=1
+
+  mysql:
+    name: MySQL 8.4 migration and session policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: agent_loom_test
+          MYSQL_USER: agent_loom
+          MYSQL_PASSWORD: agent_loom
+          MYSQL_ROOT_PASSWORD: agent_loom_root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uagent_loom -pagent_loom"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      AGENT_LOOM_TEST_MYSQL_URL: mysql://agent_loom:agent_loom@127.0.0.1:3306/agent_loom_test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.98
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+
+      - name: Run MySQL migration and session tests
+        run: >-
+          cargo test
+          -p agent-loom-store-mysql
+          -p agent-loom-provider-conformance
+          --all-targets -- --test-threads=1

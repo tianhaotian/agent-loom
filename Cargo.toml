@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/adapter-core",
+    "crates/adapter-http",
     "crates/domain",
     "crates/durable-store",
     "crates/server",

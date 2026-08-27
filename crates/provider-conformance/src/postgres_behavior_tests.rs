@@ -6,10 +6,13 @@ use deadpool_postgres::{Manager, Pool};
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 
-use crate::{LeaseExpiryRetryFixture, exercise_lease_expiry_retry};
+use crate::{
+    LeaseExpiryRetryFixture, Phase2aReliabilityFixture, exercise_lease_expiry_retry,
+    exercise_phase2a_reliability,
+};
 
 #[tokio::test]
-async fn postgres_satisfies_lease_expiry_retry_behavior_when_configured() {
+async fn postgres_satisfies_behavior_suite_when_configured() {
     let Ok(url) = std::env::var("AGENT_LOOM_TEST_POSTGRES_URL") else {
         return;
     };
@@ -63,6 +66,24 @@ async fn postgres_satisfies_lease_expiry_retry_behavior_when_configured() {
     assert_eq!(report.first_attempt, 1);
     assert_eq!(report.retry_attempt, 2);
     assert_eq!(report.final_status, RunStatus::Cancelled);
+
+    let phase2a = exercise_phase2a_reliability(
+        &store,
+        Phase2aReliabilityFixture {
+            tenant_id,
+            identity_seed,
+            actor_ref: "provider-conformance-phase2a".to_owned(),
+        },
+    )
+    .await
+    .expect("PostgreSQL satisfies Phase 2A reliability behavior");
+    assert_eq!(phase2a.concurrent_claim_winners, 1);
+    assert!(matches!(
+        phase2a.terminal_race_status,
+        RunStatus::Completed | RunStatus::Cancelled
+    ));
+    assert_eq!(phase2a.consumed_wait_events, 1);
+    assert!(phase2a.atomic_rollback_preserved_version);
 
     pool.close();
     drop(store);

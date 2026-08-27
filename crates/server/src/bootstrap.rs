@@ -9,7 +9,7 @@ use tokio_postgres::NoTls;
 use uuid::Uuid;
 
 use crate::{
-    AppState,
+    AppState, HttpAdapterSettings,
     identity::{derived_id, tenant_id},
     router,
     worker::DELIVERY_STAGES,
@@ -22,6 +22,7 @@ pub struct ServerConfig {
     pub tenant_key: String,
     pub api_key: String,
     pub pool_size: usize,
+    pub http_adapters: Option<HttpAdapterSettings>,
 }
 
 impl ServerConfig {
@@ -66,12 +67,14 @@ impl ServerConfig {
                 "AGENT_LOOM_POOL_SIZE must be positive".to_owned(),
             ));
         }
+        let http_adapters = load_http_adapter_settings()?;
         Ok(Self {
             database_url,
             bind,
             tenant_key,
             api_key,
             pool_size,
+            http_adapters,
         })
     }
 }
@@ -118,7 +121,7 @@ pub async fn bootstrap(config: &ServerConfig) -> Result<BootstrappedServer, Boot
         )
         .await
         .map_err(|_| BootstrapError::Database("cannot provision the MVP tenant".to_owned()))?;
-    let catalog = provision_catalog(&client, tenant_id, &config.tenant_key).await?;
+    let catalog = provision_catalog(&client, tenant_id, config).await?;
     drop(client);
     connection_task
         .await
@@ -140,7 +143,6 @@ pub async fn bootstrap(config: &ServerConfig) -> Result<BootstrappedServer, Boot
         store: Arc::new(store.clone()),
         tenant_id,
         workflow_id: catalog.workflow_id,
-        workflow_version_id: catalog.workflow_version_id,
         coordinator_agent_version_id: catalog.agent_version_id,
         api_key: Arc::<str>::from(config.api_key.clone()),
     };
@@ -168,17 +170,24 @@ struct CatalogIds {
 async fn provision_catalog(
     client: &tokio_postgres::Client,
     tenant_id: TenantId,
-    tenant_key: &str,
+    config: &ServerConfig,
 ) -> Result<CatalogIds, BootstrapError> {
     use sha2::{Digest as _, Sha256};
 
+    let tenant_key = &config.tenant_key;
     let tenant_uuid = Uuid::from_bytes(tenant_id.into_bytes());
     let workflow_id = WorkflowId::from_bytes(derived_id("workflow", tenant_key));
-    let workflow_version_id =
+    let legacy_workflow_version_id =
         WorkflowVersionId::from_bytes(derived_id("workflow-version", &workflow_id.to_string()));
+    let plan_workflow_version_id =
+        WorkflowVersionId::from_bytes(derived_id("workflow-version", &format!("{workflow_id}/2")));
+    let workflow_version_id =
+        WorkflowVersionId::from_bytes(derived_id("workflow-version", &format!("{workflow_id}/3")));
     let workflow_uuid = Uuid::from_bytes(workflow_id.into_bytes());
+    let legacy_workflow_version_uuid = Uuid::from_bytes(legacy_workflow_version_id.into_bytes());
+    let plan_workflow_version_uuid = Uuid::from_bytes(plan_workflow_version_id.into_bytes());
     let workflow_version_uuid = Uuid::from_bytes(workflow_version_id.into_bytes());
-    let spec = serde_json::json!({
+    let legacy_spec = serde_json::json!({
         "key": "delivery-mvp",
         "version": 1,
         "stages": DELIVERY_STAGES,
@@ -187,6 +196,57 @@ async fn provision_catalog(
             "required_per_stage": true
         }
     });
+    let stages = DELIVERY_STAGES
+        .iter()
+        .enumerate()
+        .map(|(index, stage)| {
+            serde_json::json!({
+                "key": stage,
+                "activation": if index == 0 { "active" } else { "planned" },
+                "assignee": {
+                    "kind": "agent",
+                    "reference": "mock-delivery-agent"
+                },
+                "input_contract": {"type": "object"},
+                "output_contract": {
+                    "type": "object",
+                    "required": ["stage", "status"]
+                },
+                "policy": {"max_attempts": 3}
+            })
+        })
+        .collect::<Vec<_>>();
+    let plan_spec = serde_json::json!({
+        "schema": "agent-loom.execution-plan/v1",
+        "plan_key": "delivery-mvp",
+        "stages": stages,
+        "initial_tasks": [{
+            "key": "requirements-entry",
+            "stage_key": "requirements",
+            "kind": "agent_server",
+            "priority": 10,
+            "max_attempts": 3,
+            "input": {
+                "workflow": "delivery-mvp",
+                "step": 0,
+                "checkpoint_sequence": 1
+            }
+        }],
+        "extension": {
+            "artifact_contract": {
+                "media_type": "application/json",
+                "required_per_stage": true
+            }
+        }
+    });
+    let mut spec = plan_spec.clone();
+    spec["initial_tasks"][0]["handler"] = serde_json::json!("delivery-mvp");
+    let legacy_spec_bytes = serde_json::to_vec(&legacy_spec)
+        .map_err(|_| BootstrapError::Configuration("Workflow spec is invalid".to_owned()))?;
+    let legacy_spec_digest: [u8; 32] = Sha256::digest(&legacy_spec_bytes).into();
+    let plan_spec_bytes = serde_json::to_vec(&plan_spec)
+        .map_err(|_| BootstrapError::Configuration("Workflow spec is invalid".to_owned()))?;
+    let plan_spec_digest: [u8; 32] = Sha256::digest(&plan_spec_bytes).into();
     let spec_bytes = serde_json::to_vec(&spec)
         .map_err(|_| BootstrapError::Configuration("Workflow spec is invalid".to_owned()))?;
     let spec_digest: [u8; 32] = Sha256::digest(&spec_bytes).into();
@@ -198,7 +258,7 @@ async fn provision_catalog(
              ) VALUES ($1, $2, 'delivery-mvp', 'Delivery MVP', 'active', 1, \
                 clock_timestamp(), clock_timestamp()) \
              ON CONFLICT (tenant_id, workflow_key) DO UPDATE SET \
-                name = EXCLUDED.name, status = 'active', latest_version = 1, \
+                name = EXCLUDED.name, status = 'active', \
                 updated_at = clock_timestamp()",
             &[&workflow_uuid, &tenant_uuid],
         )
@@ -213,6 +273,42 @@ async fn provision_catalog(
                 clock_timestamp(), clock_timestamp()) \
              ON CONFLICT (tenant_id, workflow_id, version) DO NOTHING",
             &[
+                &legacy_workflow_version_uuid,
+                &tenant_uuid,
+                &workflow_uuid,
+                &legacy_spec,
+                &legacy_spec_digest.as_slice(),
+            ],
+        )
+        .await
+        .map_err(|_| BootstrapError::Database("cannot provision Workflow version 1".to_owned()))?;
+    client
+        .execute(
+            "INSERT INTO agent_loom.workflow_definition_versions (\
+                workflow_version_id, tenant_id, workflow_id, version, lifecycle, spec_json, \
+                spec_digest, created_by, created_at, published_at\
+             ) VALUES ($1, $2, $3, 2, 'published', $4, $5, 'agent-loom-bootstrap', \
+                clock_timestamp(), clock_timestamp()) \
+             ON CONFLICT (tenant_id, workflow_id, version) DO NOTHING",
+            &[
+                &plan_workflow_version_uuid,
+                &tenant_uuid,
+                &workflow_uuid,
+                &plan_spec,
+                &plan_spec_digest.as_slice(),
+            ],
+        )
+        .await
+        .map_err(|_| BootstrapError::Database("cannot provision Workflow version 2".to_owned()))?;
+    client
+        .execute(
+            "INSERT INTO agent_loom.workflow_definition_versions (\
+                workflow_version_id, tenant_id, workflow_id, version, lifecycle, spec_json, \
+                spec_digest, created_by, created_at, published_at\
+             ) VALUES ($1, $2, $3, 3, 'published', $4, $5, 'agent-loom-bootstrap', \
+                clock_timestamp(), clock_timestamp()) \
+             ON CONFLICT (tenant_id, workflow_id, version) DO NOTHING",
+            &[
                 &workflow_version_uuid,
                 &tenant_uuid,
                 &workflow_uuid,
@@ -221,7 +317,16 @@ async fn provision_catalog(
             ],
         )
         .await
-        .map_err(|_| BootstrapError::Database("cannot provision Workflow version".to_owned()))?;
+        .map_err(|_| BootstrapError::Database("cannot provision Workflow version 3".to_owned()))?;
+    client
+        .execute(
+            "UPDATE agent_loom.workflow_definitions \
+             SET latest_version = GREATEST(latest_version, 3), updated_at = clock_timestamp() \
+             WHERE tenant_id = $1 AND workflow_id = $2",
+            &[&tenant_uuid, &workflow_uuid],
+        )
+        .await
+        .map_err(|_| BootstrapError::Database("cannot publish Workflow version 3".to_owned()))?;
 
     let agent_id = Uuid::from_bytes(derived_id("agent", tenant_key));
     let agent_version_id =
@@ -263,19 +368,57 @@ async fn provision_catalog(
 
     let endpoint_id = EndpointId::from_bytes(derived_id("endpoint", tenant_key));
     let endpoint_uuid = Uuid::from_bytes(endpoint_id.into_bytes());
+    let (adapter_kind, base_uri, protocol_version, capabilities, credential_ref) =
+        config.http_adapters.as_ref().map_or_else(
+            || {
+                (
+                    "mock",
+                    "mock://delivery",
+                    "1",
+                    serde_json::json!({"idempotent_submit": true, "events": true}),
+                    "env://AGENT_LOOM_MOCK_CREDENTIAL",
+                )
+            },
+            |settings| {
+                (
+                    "agent-loom-http-v1",
+                    settings.agent_base_url.as_str(),
+                    "agent-loom-http-v1",
+                    serde_json::json!({
+                        "idempotent_submit": true,
+                        "submission_reconciliation": true,
+                        "status_query": true,
+                        "resumable_events": true,
+                        "cooperative_stop": true,
+                        "artifact_output": true
+                    }),
+                    "env://AGENT_LOOM_AGENT_TOKEN",
+                )
+            },
+        );
     client
         .execute(
             "INSERT INTO agent_loom.agent_endpoints (\
                 endpoint_id, tenant_id, endpoint_key, adapter_kind, base_uri, protocol_version, \
                 capabilities_json, credential_ref, status, health_checked_at, created_at, updated_at\
-             ) VALUES ($1, $2, 'mock-delivery', 'mock', 'mock://delivery', '1', \
-                '{\"idempotent_submit\":true,\"events\":true}'::jsonb, \
-                'env://AGENT_LOOM_MOCK_CREDENTIAL', 'active', NULL, \
+             ) VALUES ($1, $2, 'delivery-primary', $3, $4, $5, \
+                $6, $7, 'active', NULL, \
                 clock_timestamp(), clock_timestamp()) \
-             ON CONFLICT (tenant_id, endpoint_key) DO UPDATE SET \
-                status = 'active', capabilities_json = EXCLUDED.capabilities_json, \
+             ON CONFLICT (endpoint_id) DO UPDATE SET \
+                endpoint_key = EXCLUDED.endpoint_key, adapter_kind = EXCLUDED.adapter_kind, \
+                base_uri = EXCLUDED.base_uri, protocol_version = EXCLUDED.protocol_version, \
+                credential_ref = EXCLUDED.credential_ref, status = 'active', \
+                capabilities_json = EXCLUDED.capabilities_json, \
                 updated_at = clock_timestamp()",
-            &[&endpoint_uuid, &tenant_uuid],
+            &[
+                &endpoint_uuid,
+                &tenant_uuid,
+                &adapter_kind,
+                &base_uri,
+                &protocol_version,
+                &capabilities,
+                &credential_ref,
+            ],
         )
         .await
         .map_err(|_| BootstrapError::Database("cannot provision Agent endpoint".to_owned()))?;
@@ -286,6 +429,39 @@ async fn provision_catalog(
         agent_version_id,
         endpoint_id,
     })
+}
+
+fn load_http_adapter_settings() -> Result<Option<HttpAdapterSettings>, BootstrapError> {
+    let agent_base_url = env::var("AGENT_LOOM_AGENT_BASE_URL").ok();
+    let agent_token = env::var("AGENT_LOOM_AGENT_TOKEN").ok();
+    let devops_base_url = env::var("AGENT_LOOM_DEVOPS_BASE_URL").ok();
+    let devops_token = env::var("AGENT_LOOM_DEVOPS_TOKEN").ok();
+    if agent_base_url.is_none()
+        && agent_token.is_none()
+        && devops_base_url.is_none()
+        && devops_token.is_none()
+    {
+        return Ok(None);
+    }
+    let (Some(agent_base_url), Some(agent_token), Some(devops_base_url), Some(devops_token)) =
+        (agent_base_url, agent_token, devops_base_url, devops_token)
+    else {
+        return Err(BootstrapError::Configuration(
+            "AGENT_LOOM_AGENT_BASE_URL, AGENT_LOOM_AGENT_TOKEN, AGENT_LOOM_DEVOPS_BASE_URL and AGENT_LOOM_DEVOPS_TOKEN must be configured together"
+                .to_owned(),
+        ));
+    };
+    if agent_token.is_empty() || devops_token.is_empty() {
+        return Err(BootstrapError::Configuration(
+            "External Adapter tokens must not be empty".to_owned(),
+        ));
+    }
+    Ok(Some(HttpAdapterSettings {
+        agent_base_url,
+        agent_token,
+        devops_base_url,
+        devops_token,
+    }))
 }
 
 #[derive(Debug)]
@@ -331,6 +507,7 @@ mod tests {
             tenant_key: "mvp-local".to_owned(),
             api_key: "local-development-key".to_owned(),
             pool_size: 8,
+            http_adapters: None,
         };
         assert_eq!(config.bind, "127.0.0.1:8080");
         assert_eq!(config.pool_size, 8);

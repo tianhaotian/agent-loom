@@ -8,6 +8,7 @@ Agent Loom 是面向复杂 Agent 团队协作的持久化流程运行时。首�
 crates/domain          共享 ID、值对象、状态与只读投影
 crates/durable-store   DurableStore 接口、命令、结果、错误和 conformance 清单
 crates/adapter-core    Agent Server / Tool Adapter 通用接口
+crates/adapter-http    真实 HTTP Agent Server / DevOps Tool profile 与 conformance
 crates/runtime         Scheduler/Worker/Adapter 的数据库无关编排与服务生命周期
 crates/server          可运行的 PostgreSQL MVP、HTTP API 与 Mock 业产研 Worker
 crates/provider-conformance  PostgreSQL/MySQL 共享迁移与行为契约测试
@@ -24,9 +25,9 @@ runtime/src/scheduler/  due-work 扫描、确定性计划与原子应用
 runtime/src/service/    有界轮询、退避、关闭信号与 Job 接线
 ```
 
-`domain`、`durable-store` 与 `adapter-core` 继续保持零外部依赖；Provider crate 可以引入各自的数据库驱动和异步运行时，但驱动类型不得泄漏到共享领域契约。`server` 是 PostgreSQL 专用的产品装配层，不改变 Runtime 与 Store 共享契约的数据库无关性。
+`domain`、`durable-store` 与 `adapter-core` 继续保持零外部依赖；Provider crate 可以引入各自的数据库驱动和异步运行时，但驱动类型不得泄漏到共享领域契约。`adapter-http` 使用 HTTPS/loopback HTTP 执行真实远程 I/O，`server` 是 PostgreSQL 专用的产品装配层，不改变 Runtime 与 Store 共享契约的数据库无关性。
 
-已实现 `0000_migration_meta` 至 `0010_agent_invocation_envelope` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt、Checkpoint、Wait、Artifact、ToolExecution 与 AgentExecution。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、Wait 单次消费槽与恢复计划、Tool/Agent 重试时间、Agent 请求信封、Artifact 版本血缘、外部执行幂等与 Agent Event 去重；同时提供只依赖 `dyn DurableStore` 的黑盒行为场景，首个场景覆盖 Lease 续租与回收幂等、过期重试投影、attempt 递增与再次领取。
+已实现 `0000_migration_meta` 至 `0010_agent_invocation_envelope` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt、Checkpoint、Wait、Artifact、ToolExecution 与 AgentExecution。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、Wait 单次消费槽与恢复计划、Tool/Agent 重试时间、Agent 请求信封、Artifact 版本血缘、外部执行幂等与 Agent Event 去重；只依赖 `dyn DurableStore` 的黑盒行为现已覆盖 Lease 到期重试、多 Worker 同时领取、完成/取消终态竞争、Wait 单次消费，以及完成事务中途约束失败后的完整回滚。
 
 PostgreSQL 已接入真实驱动执行层：migration executor 使用 SHA-256 physical checksum、session advisory lock、step journal 和逐批 schema introspection；`PostgresStore` 通过连接池完整实现对象安全的 `DurableStore`，事务垂直切片已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 准备/结果记录、AgentExecution 提交/事件/结果记录，以及 Pause/Resume/Cancel。写路径包含 receipt 并发幂等闸门、显式层级锁序、`FOR UPDATE SKIP LOCKED`、Lease fencing、Run version/generation CAS，以及 Event、Checkpoint、Stage、Artifact 和后续动作的原子提交。
 
@@ -54,6 +55,25 @@ curl -sS -X POST http://127.0.0.1:8080/v1/runs \
 
 后台 Worker 会推进八个必需 Stage；fixture 会让第一次集成测试进入 `rework_required`，原子创建 implementation/self_test/integration_test attempt 2，审批通过后经正式 ToolExecution 执行部署，最后进入 `completed`。Run ID 可用于查询状态、Stage、Artifact、Pending Action 和 SSE Event。
 
+默认继续使用确定性的本地 Mock。配置四个外部变量后，服务会切换到真实 HTTP Agent Server 和 DevOps Tool profile：
+
+```bash
+export AGENT_LOOM_AGENT_BASE_URL='https://agent.example.com'
+export AGENT_LOOM_AGENT_TOKEN='short-lived-agent-token'
+export AGENT_LOOM_DEVOPS_BASE_URL='https://deploy.example.com'
+export AGENT_LOOM_DEVOPS_TOKEN='short-lived-devops-token'
+```
+
+四项必须同时设置；远程 HTTP 仅允许 loopback 开发地址，非 loopback Endpoint 必须使用 HTTPS。版本化端点、信封和安全约束见 [HTTP Adapter Profile](./HTTP_ADAPTER_PROFILE.md)。
+
+真实联调不要直接填写供应商原生 API URL。目标服务需要实现 `agent-loom-http-v1`，或通过 gateway 完成协议映射。可以先对已有远程资源运行不产生副作用的探针：
+
+```bash
+export AGENT_LOOM_LIVE_AGENT_RUN_ID='remote-run-123'
+export AGENT_LOOM_LIVE_DEPLOYMENT_REF='deployment-123'
+cargo run -p agent-loom-adapter-http --bin live_probe
+```
+
 ## 设计文档
 
 - [产品需求](./REQUIREMENT.md)
@@ -62,6 +82,7 @@ curl -sS -X POST http://127.0.0.1:8080/v1/runs \
 - [领域模型](./DOMAIN_MODEL.md)
 - [存储契约](./STORE_CONTRACT.md)
 - [Adapter 契约](./ADAPTER_CONTRACT.md)
+- [HTTP Adapter Profile](./HTTP_ADAPTER_PROFILE.md)
 - [业产研 E2E 场景](./E2E_SCENARIO.md)
 - [PostgreSQL/MySQL 迁移设计](./MIGRATION_DESIGN.md)
 
@@ -84,6 +105,14 @@ AGENT_LOOM_TEST_POSTGRES_URL='postgresql://...' cargo test \
   -- --test-threads=1
 ```
 
-数据库测试会在目标库创建唯一测试 Tenant/Run 作为审计记录；不要指向生产数据库。
+Phase 2B 的 MySQL 8.4 迁移、连接池与会话策略可使用独立测试库验证：
 
-GitHub Actions 会分别执行 workspace 质量门禁和 PostgreSQL 16 真实事务测试。数据库 Job 通过 `AGENT_LOOM_TEST_POSTGRES_URL` 启用 migration、事务垂直切片和 Provider 黑盒场景，并使用单线程测试避免同库迁移用例并发干扰。
+```bash
+AGENT_LOOM_TEST_MYSQL_URL='mysql://agent_loom:password@127.0.0.1:3306/agent_loom_test' \
+  cargo test -p agent-loom-store-mysql -p agent-loom-provider-conformance \
+  --all-targets -- --test-threads=1
+```
+
+数据库测试会执行 migration，并可能创建测试 Tenant/Run；不要指向生产数据库。
+
+GitHub Actions 会分别执行 workspace 质量门禁、PostgreSQL 16 真实事务测试和 MySQL 8.4 migration/session 测试。MySQL 的完整 `DurableStore` 黑盒场景会随 Phase 2B 事务命令落地逐项接入。

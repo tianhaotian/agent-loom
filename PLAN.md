@@ -273,6 +273,8 @@ Kafka、NATS 或 Redis Streams 可以在高吞吐事件分发时引入，但必�
 
 验收：重复 Webhook、重复 Task 执行、Lease 失效、取消/暂停竞争和审批事件乱序均不破坏 Run 状态机；完成一次正常交付、一次暂停恢复和一次测试失败返工。
 
+状态：已关闭。除原有 Pause/Resume/Cancel、Wait、审批、Tool/Agent 两阶段执行、SSE 续读、Scheduler/Recovery/Lease/Maintenance 服务外，现已加入可配置的真实 `agent-loom-http-v1` Agent Server 与 DevOps Tool profile。共享 Adapter conformance 会通过受控 HTTP Server 验证幂等提交、提交对账、状态、Event cursor 重放、stop/complete 竞争、异步部署健康确认和 rollback；Provider conformance 会在真实 PostgreSQL 上验证多 Worker 领取、终态竞争、Wait 单次消费和事务故障零部分提交。
+
 ### Phase 2B：MySQL Provider 对等实现
 
 - 实现 MySQL 8+ / InnoDB Provider 与版本化迁移。
@@ -280,6 +282,8 @@ Kafka、NATS 或 Redis Streams 可以在高吞吐事件分发时引入，但必�
 - 记录无法语义等价的数据库差异；不得通过 Runtime 分支改变领域行为。
 
 验收：同一业产研场景及全部一致性测试在 PostgreSQL 和 MySQL 上产生等价领域结果。
+
+状态：进行中。已实现 MySQL 8.4 迁移执行器、数据库级命名锁、物理 checksum/失败 journal、InnoDB schema 验证，以及统一 UTC、`READ COMMITTED`、lock timeout 的连接池入口；11 个迁移已在真实 MySQL 8.4 实例验证，可重复与并发启动 migration 测试已接入。尚未完成的关闭项是全部 `DurableStore` 事务命令、MySQL 共享行为 conformance，以及完整业产研 E2E 对等验证。
 
 ### Phase 3：编排与平台能力
 
@@ -325,12 +329,12 @@ Kafka、NATS 或 Redis Streams 可以在高吞吐事件分发时引入，但必�
 
 CI 已配置独立的 workspace 质量门禁和 PostgreSQL 16 服务 Job；后者通过 `AGENT_LOOM_TEST_POSTGRES_URL` 串行执行真实 migration、事务垂直切片与 Provider 黑盒场景。首个只依赖 `dyn DurableStore` 的场景已覆盖 Lease 续租幂等、过期回收幂等、Run 重试投影、attempt 递增和再次领取。后续按以下顺序推进：
 
-1. 继续将多 Worker 领取、续租/回收竞争与事务故障注入下沉为 Provider 黑盒 conformance 场景。
+1. 已完成：将多 Worker 领取、终态竞争、Wait 单次消费与事务故障注入下沉为 Provider 黑盒 conformance 场景；续租/回收的更多交错继续作为增量可靠性扩展。
 2. 实现 MySQL 对等事务路径；优先覆盖 Lease 续租/回收竞争。
 3. 将维护扫描、返工与审批竞争继续下沉为数据库无关的 Provider conformance 场景。
-4. 接入至少一个真实外部 Agent Server 和真实 DevOps Tool，并运行 Adapter conformance。
+4. 已完成：接入版本化 HTTP Agent Server 与 DevOps Tool profile，并运行共享 Adapter conformance。
 5. 按部署需求选择 `0011_optional_outbox`；将 `0012_runtime_grants` 作为数据库权限加固迁移或等价 IaC，而不是基础领域正确性的前置条件。
 
 ### MVP 交付状态
 
-`agent-loom-server` 已形成 PostgreSQL MVP：启动时自动 migration/fixture，使用 API Key 和 tenant-scoped Store 暴露 Workflow、Run、Event/SSE、Stage、Artifact、Pending Action 与控制 API。八个必需 Stage 会通过正式 AgentExecution 推进；fixture 固定触发一次集成测试失败，并在同一完成事务中创建 implementation/self_test/integration_test attempt 2。部署前进入可超时、单次消费的审批 Wait，审批后由正式 ToolExecution 调用 Mock DevOps Adapter。Due-work Scheduler、Recovery Worker、Lease Reclaimer 以及 Run deadline、Wait timeout、stale execution 维护服务均随进程启动。PostgreSQL 16 实测已覆盖 migration、完整事务套件、Provider conformance，以及 HTTP→返工→审批→Tool 部署→SSE/查询/终态和 deadline E2E。当前交付满足首个 PostgreSQL MVP；完整 Phase 2A/2B 仍需真实外部 Adapter、更多竞争/故障场景和 MySQL 对等事务实现。
+`agent-loom-server` 已形成 PostgreSQL MVP：启动时自动 migration/fixture，使用 API Key 和 tenant-scoped Store 暴露 Workflow、Run、Event/SSE、Stage、Artifact、Pending Action 与控制 API。ExecutionPlan V1 会原子实例化初始执行图；版本化 Task Handler 信封贯穿初始、动态后继和 Wait 恢复路径，Worker 按已注册 Handler 的 Task kind 领取并按稳定 Handler key 路由，当前 delivery 是第一个真实 Handler。八个必需 Stage 会通过正式 AgentExecution 推进；fixture 固定触发一次集成测试失败，并在同一完成事务中创建 implementation/self_test/integration_test attempt 2。部署前进入可超时、单次消费的审批 Wait，审批后由正式 ToolExecution 调用可配置的 Mock 或真实 HTTP DevOps Adapter。Due-work Scheduler、Recovery Worker、Lease Reclaimer 以及 Run deadline、Wait timeout、stale execution 维护服务均随进程启动。PostgreSQL 16 实测已覆盖 migration、完整事务套件、Provider conformance，以及 HTTP→返工→审批→Tool 部署→SSE/查询/终态和 deadline E2E。当前交付满足首个 PostgreSQL MVP，Phase 2A 已关闭；Phase 2B 仍需 MySQL 对等事务实现。后续可靠性扩展继续增加断流、限流和进程崩溃注入，但不再构成 Phase 2A 的关闭阻塞项。

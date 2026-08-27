@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 agent-loom-adapter-core = { path = "../adapter-core" }
+agent-loom-adapter-http = { path = "../adapter-http" }
 agent-loom-domain = { path = "../domain" }
 agent-loom-durable-store = { path = "../durable-store" }
 agent-loom-runtime = { path = "../runtime" }

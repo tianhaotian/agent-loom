@@ -32,6 +32,7 @@ async fn http_to_postgres_mock_delivery_completes_when_configured() {
         tenant_key: format!("mvp-e2e-{nonce}"),
         api_key: "mvp-e2e-api-key".to_owned(),
         pool_size: 4,
+        http_adapters: None,
     };
     let application = bootstrap(&config).await.expect("bootstrap MVP server");
     let unauthorized = application
@@ -259,6 +260,12 @@ async fn http_to_postgres_mock_delivery_completes_when_configured() {
     )
     .await;
     assert_eq!(workflow["workflow_key"], "delivery-mvp");
+    assert_eq!(workflow["version"], 3);
+    assert_eq!(workflow["spec"]["schema"], "agent-loom.execution-plan/v1");
+    assert_eq!(
+        workflow["spec"]["initial_tasks"][0]["handler"],
+        "delivery-mvp"
+    );
     assert_eq!(workflow["spec"]["stages"].as_array().map(Vec::len), Some(8));
 
     let deadline = i64::try_from(

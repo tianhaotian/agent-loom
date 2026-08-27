@@ -220,12 +220,14 @@ scheduled → queued → leased → succeeded
 ### 5.2 Task 不变量
 
 - Task 必须保存 `generation`、`based_on_checkpoint_sequence` 和 `attempt`。
+- `worker_id` 必须标识一次进程启动中的具体 Worker 角色；同一 tenant 的不同进程或不同 Worker 角色不得复用该身份。进程重启必须生成新身份，不能继承旧进程持有的 Lease。
 - 领取条件必须包含 Run 非 paused/terminal、Task generation 等于 Run generation、`available_at <= database_now`。
 - 专用 Worker 必须按其可处理的 Task kind 领取；领取结果包含不可变 Task 输入及领取事务推进后的 Run version，禁止使用领取前快照构造后续 CAS。
 - 完成和续租必须匹配 `task_id + lease_owner + lease_token + lease_expires_at > database_now`。
 - 一次成功完成只能产生一个 Task completion Event 和一组后续动作。
 - Pause 后旧 generation Task 的迟到结果只作为执行证据记录，不得更新 Run、StageExecution 或 Checkpoint。
 - Dead Letter 不是 Run 终态；Workflow 策略决定转人工、返工或将 Run 置为 failed。
+- 进程退出后，其未完成 Lease 只能等待数据库时间判定过期并由回收流程处理；新进程不得伪装成旧 `worker_id` 续租或提交结果。
 
 ### 5.3 Lease 回收
 

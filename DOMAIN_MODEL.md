@@ -119,6 +119,34 @@ tenant_id, tenant_key, status, policy_json, created_at, updated_at
 - 版本发布后 `spec_json` 与 `spec_digest` 不可修改；修订必须创建新版本。
 - 动态 Stage/Task 可以在 Run 内产生，但必须记录生成它的 Event 和基础 Workflow 版本。
 
+首个可执行 Profile 为 `agent-loom.execution-plan/v1`：
+
+```json
+{
+  "schema": "agent-loom.execution-plan/v1",
+  "plan_key": "research",
+  "stages": [
+    {"key": "discovery", "activation": "active"}
+  ],
+  "initial_tasks": [
+    {
+      "key": "collect-sources",
+      "stage_key": "discovery",
+      "kind": "agent_server",
+      "max_attempts": 3,
+      "input": {"capability": "research"}
+    }
+  ],
+  "extension": {}
+}
+```
+
+- V1 只描述创建 Run 时需要原子实例化的初始 Stage 和 Task，不把整个运行限制为固定 DAG。
+- `initial_tasks` 至少包含一个 Task；Task key 在计划内唯一，引用的初始 Stage 必须存在且为 `active`。
+- Task 的静态 `input` 与创建 Run 的 `run_input` 以独立字段组成持久化输入信封，避免 Core 解释业务字段或字符串模板。
+- `extension` 是不透明、版本化 JSON；其业务语义由 Integration/Adapter 解释。
+- 同一个已发布 Workflow Version 的计划不可修改；结构变化必须发布新版本，已有 Run 继续引用原版本。
+
 ### 4.4 `agent_definitions` 与 `agent_definition_versions`
 
 采用与 Workflow 相同的“稳定身份 + 不可变版本”模式。
@@ -249,7 +277,7 @@ created_event_id, created_at
 | `available_at` | 可领取时间 |
 | `attempt/max_attempts` | 尝试次数与上限 |
 | `lease_owner/lease_token/lease_expires_at` | 当前 Lease |
-| `input_json/result_json` | 有界输入与结果摘要 |
+| `input_json/result_json` | 有界输入与结果摘要；新 Task 的输入使用版本化 Handler 信封 |
 | `error_code/error_json` | 结构化错误，不含凭据 |
 | `deadline` | Task 截止时间 |
 | `created_event_id` | 创建 Task 的因果 Event |
@@ -279,6 +307,13 @@ AND run.deadline > database_now（如果存在）
 - Run 查询：`(tenant_id, run_id, status, created_at)`。
 
 Provider 可以调整 priority 的物理排序方向，但领取结果必须遵守统一排序与公平性策略。
+
+新建 Task 的 `input_json` 使用 `agent-loom.task-input/v1` 信封，至少包含稳定的
+`handler` logical key 和 Handler 自己解释的 `payload`。ExecutionPlan 只负责把静态
+TaskSpec 与 Run input 绑定到该信封；动态后继 Task 和 Wait 恢复 Task 必须继续保留同一
+Handler key。Worker 先按已注册 Handler 支持的 Task kind 领取，再按持久化 Handler key
+路由，不能用 `kind = NULL` 的全类型领取吞掉维护或恢复 Worker 的 Task。升级期间允许
+delivery Worker 读取旧版无信封的 delivery Task，但所有新写入都必须使用 V1 信封。
 
 ### 7.2 `task_attempts`
 

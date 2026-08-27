@@ -286,6 +286,12 @@ impl fmt::Debug for SharedExternalDispatcher {
     }
 }
 
+impl SharedExternalDispatcher {
+    pub(crate) fn new(dispatcher: Arc<dyn ExternalRecoveryDispatcher>) -> Self {
+        Self(dispatcher)
+    }
+}
+
 impl ExternalRecoveryDispatcher for SharedExternalDispatcher {
     fn dispatch(&self, started: StartedRecovery) -> DispatchFuture<'_> {
         self.0.dispatch(started)
