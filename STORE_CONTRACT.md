@@ -559,6 +559,8 @@ cursor 更新失败时整批回滚，客户端可以安全从旧 cursor 重读�
 
 ## 9. Scheduler 契约
 
+- Schedule 定义必须持久化 Cron、timezone、绑定 Workflow Version 和通用 Run 输入；一次 fire 的永久唯一身份是 `(tenant_id, schedule_id, scheduled_fire_at)`。
+- API、后台扫描器和故障恢复必须复用同一 fire 身份，重复触发只能返回既有 Run，不得创建第二个执行。
 - Scheduler 可以多实例并发运行，不拥有唯一业务状态。
 - `scan_due_work` 返回带游标的有限候选页，不锁定对象跨请求等待。
 - 每个候选通过 `apply_due_work` 单独、短事务处理。

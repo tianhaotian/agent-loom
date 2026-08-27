@@ -8,13 +8,15 @@ use std::{
 
 use agent_loom_domain::{
     AgentVersionId, CheckpointId, ContextMergeStrategy, ContextPatchId, ContextSnapshotId, EventId,
-    JoinPolicy, JsonPayload, LogicalKey, PlanRevisionId, RunId, RunSnapshot, RunStatus,
-    StageStatus, TaskId, TenantId, UnixMicros, WaitStatus, WorkflowId,
+    JoinPolicy, JsonPayload, LogicalKey, PlanRevisionId, RunId, RunSnapshot, RunStatus, ScheduleId,
+    ScheduleSnapshot, ScheduleStatus, StageStatus, TaskId, TenantId, UnixMicros, WaitStatus,
+    WorkflowId,
 };
 use agent_loom_durable_store::{
-    ApplyContextPatch, ApplyEvent, CommandDisposition, ControlRun, CreateRun, DurableStore,
-    EvaluateChildRunJoin, EventCursor, ExpectedRun, NewCheckpoint, NewContextSnapshot,
-    NewPlanRevision, QueryContext, RevisePlan, SignatureVerification, StoreError, StoreErrorCode,
+    ApplyContextPatch, ApplyEvent, CommandDisposition, ControlRun, CreateRun, CreateSchedule,
+    DurableStore, EvaluateChildRunJoin, EventCursor, ExpectedRun, NewCheckpoint,
+    NewContextSnapshot, NewPlanRevision, QueryContext, RevisePlan, SignatureVerification,
+    StoreError, StoreErrorCode,
 };
 use axum::{
     Json, Router,
@@ -63,6 +65,9 @@ impl fmt::Debug for AppState {
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/v1/workflows/{workflow_id}", get(get_workflow))
+        .route("/v1/schedules", get(list_schedules).post(create_schedule))
+        .route("/v1/schedules/{schedule_id}", get(get_schedule))
+        .route("/v1/schedules/{schedule_id}/fires", post(fire_schedule))
         .route("/v1/runs", post(create_run))
         .route("/v1/runs/{run_id}", get(get_run))
         .route("/v1/runs/{run_id}/children", get(list_child_runs))
@@ -202,6 +207,241 @@ async fn get_workflow(
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+struct CreateScheduleRequest {
+    cron_expression: String,
+    #[serde(default = "utc_timezone")]
+    timezone: String,
+    input: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct ScheduleResponse {
+    schedule_id: String,
+    workflow_version_id: String,
+    cron_expression: String,
+    timezone: String,
+    input: Value,
+    status: &'static str,
+    created_at_micros: i64,
+    updated_at_micros: i64,
+}
+
+impl From<ScheduleSnapshot> for ScheduleResponse {
+    fn from(schedule: ScheduleSnapshot) -> Self {
+        Self {
+            schedule_id: schedule.schedule_id.to_string(),
+            workflow_version_id: schedule.workflow_version_id.to_string(),
+            cron_expression: schedule.cron_expression,
+            timezone: schedule.timezone,
+            input: serde_json::from_slice(schedule.input.as_bytes()).unwrap_or(Value::Null),
+            status: match schedule.status {
+                ScheduleStatus::Active => "active",
+                ScheduleStatus::Paused => "paused",
+            },
+            created_at_micros: schedule.created_at.get(),
+            updated_at_micros: schedule.updated_at.get(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CreateScheduleResponse {
+    schedule: ScheduleResponse,
+    disposition: &'static str,
+}
+
+async fn create_schedule(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateScheduleRequest>,
+) -> ApiResult<(StatusCode, Json<CreateScheduleResponse>)> {
+    validate_cron_v1(&request.cron_expression)?;
+    if request.timezone != "UTC" {
+        return Err(ApiError::bad_request(
+            "Schedule V1 supports only the UTC timezone",
+        ));
+    }
+    let schedule_id = ScheduleId::from_bytes(random_id());
+    let idempotency = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map_or_else(|| schedule_id.to_string(), ToOwned::to_owned);
+    let request_bytes = serde_json::to_vec(&request)
+        .map_err(|_| ApiError::bad_request("Schedule request cannot be encoded"))?;
+    let context = command_context(
+        state.tenant_id,
+        RunId::from_bytes(schedule_id.into_bytes()),
+        API_ACTOR,
+        "create_schedule",
+        &format!("api-schedule/{idempotency}"),
+        &request_bytes,
+    )
+    .map_err(ApiError::bad_request)?;
+    let workflow = state
+        .store
+        .get_workflow(&query_context(&state), state.workflow_id)
+        .await?
+        .ok_or_else(|| ApiError::internal("configured Workflow was not found"))?;
+    if workflow.status != "active" || workflow.lifecycle != "published" {
+        return Err(ApiError::internal(
+            "configured Workflow is not active and published",
+        ));
+    }
+    let committed = state
+        .store
+        .create_schedule(
+            &context,
+            CreateSchedule {
+                schedule_id,
+                workflow_version_id: workflow.workflow_version_id,
+                cron_expression: request.cron_expression,
+                timezone: request.timezone,
+                input: payload(&request.input)?,
+            },
+        )
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateScheduleResponse {
+            schedule: committed.value.into(),
+            disposition: disposition(committed.disposition),
+        }),
+    ))
+}
+
+async fn get_schedule(
+    State(state): State<AppState>,
+    Path(schedule_id): Path<String>,
+) -> ApiResult<Json<ScheduleResponse>> {
+    let schedule_id = parse_schedule_id(&schedule_id)?;
+    state
+        .store
+        .get_schedule(&query_context(&state), schedule_id)
+        .await?
+        .map(ScheduleResponse::from)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("Schedule was not found"))
+}
+
+async fn list_schedules(State(state): State<AppState>) -> ApiResult<Json<Vec<ScheduleResponse>>> {
+    Ok(Json(
+        state
+            .store
+            .list_schedules(&query_context(&state))
+            .await?
+            .into_iter()
+            .map(ScheduleResponse::from)
+            .collect(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct FireScheduleRequest {
+    scheduled_fire_time_micros: i64,
+}
+
+async fn fire_schedule(
+    State(state): State<AppState>,
+    Path(schedule_id): Path<String>,
+    Json(request): Json<FireScheduleRequest>,
+) -> ApiResult<(StatusCode, Json<CreateRunResponse>)> {
+    let schedule_id = parse_schedule_id(&schedule_id)?;
+    if request.scheduled_fire_time_micros <= 0 || request.scheduled_fire_time_micros > now_micros()
+    {
+        return Err(ApiError::bad_request(
+            "scheduled_fire_time_micros must be positive and not in the future",
+        ));
+    }
+    let schedule = state
+        .store
+        .get_schedule(&query_context(&state), schedule_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Schedule was not found"))?;
+    if schedule.status != ScheduleStatus::Active {
+        return Err(ApiError::conflict("Schedule is not active"));
+    }
+    let workflow = state
+        .store
+        .get_workflow(&query_context(&state), state.workflow_id)
+        .await?
+        .ok_or_else(|| ApiError::internal("configured Workflow was not found"))?;
+    if workflow.workflow_version_id != schedule.workflow_version_id {
+        return Err(ApiError::conflict(
+            "Schedule Workflow version is no longer the configured version",
+        ));
+    }
+    let input = serde_json::from_slice(schedule.input.as_bytes())
+        .map_err(|_| ApiError::internal("Schedule input is not valid JSON"))?;
+    create_run_impl(
+        state,
+        HeaderMap::new(),
+        CreateRunRequest {
+            input,
+            deadline_micros: None,
+            parent_run_id: None,
+            parent_task_id: None,
+        },
+        Some((
+            schedule_id,
+            UnixMicros::new(request.scheduled_fire_time_micros),
+        )),
+    )
+    .await
+}
+
+fn utc_timezone() -> String {
+    "UTC".to_owned()
+}
+
+fn validate_cron_v1(expression: &str) -> ApiResult<()> {
+    let fields = expression.split_ascii_whitespace().collect::<Vec<_>>();
+    let bounds = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)];
+    if fields.len() != bounds.len()
+        || fields
+            .iter()
+            .zip(bounds)
+            .any(|(field, (minimum, maximum))| !cron_field_is_valid(field, minimum, maximum))
+    {
+        return Err(ApiError::bad_request(
+            "cron_expression must be a five-field Cron expression",
+        ));
+    }
+    Ok(())
+}
+
+fn cron_field_is_valid(field: &str, minimum: u16, maximum: u16) -> bool {
+    !field.is_empty()
+        && field.split(',').all(|item| {
+            let (base, step) = item
+                .split_once('/')
+                .map_or((item, None), |(base, step)| (base, Some(step)));
+            if step.is_some_and(|value| {
+                value
+                    .parse::<u16>()
+                    .map_or(true, |number| number == 0 || number > maximum - minimum + 1)
+            }) {
+                return false;
+            }
+            if base == "*" {
+                return true;
+            }
+            if let Some((start, end)) = base.split_once('-') {
+                return parse_cron_number(start, minimum, maximum).is_some_and(|start| {
+                    parse_cron_number(end, minimum, maximum).is_some_and(|end| start <= end)
+                });
+            }
+            parse_cron_number(base, minimum, maximum).is_some()
+        })
+}
+
+fn parse_cron_number(value: &str, minimum: u16, maximum: u16) -> Option<u16> {
+    value
+        .parse::<u16>()
+        .ok()
+        .filter(|number| (minimum..=maximum).contains(number))
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CreateRunRequest {
     pub input: Value,
     #[serde(default)]
@@ -224,6 +464,16 @@ async fn create_run(
     headers: HeaderMap,
     Json(request): Json<CreateRunRequest>,
 ) -> ApiResult<(StatusCode, Json<CreateRunResponse>)> {
+    create_run_impl(state, headers, request, None).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn create_run_impl(
+    state: AppState,
+    headers: HeaderMap,
+    request: CreateRunRequest,
+    schedule_fire: Option<(ScheduleId, UnixMicros)>,
+) -> ApiResult<(StatusCode, Json<CreateRunResponse>)> {
     if request
         .deadline_micros
         .is_some_and(|deadline| deadline <= now_micros())
@@ -232,7 +482,15 @@ async fn create_run(
             "deadline_micros must be in the future",
         ));
     }
-    let run_id = RunId::from_bytes(random_id());
+    let run_id = schedule_fire.map_or_else(
+        || RunId::from_bytes(random_id()),
+        |(schedule_id, fire_at)| {
+            RunId::from_bytes(crate::identity::derived_id(
+                "schedule-run",
+                &format!("{schedule_id}/{}", fire_at.get()),
+            ))
+        },
+    );
     let parent_run_id = request
         .parent_run_id
         .as_deref()
@@ -248,10 +506,15 @@ async fn create_run(
             "parent_task_id requires parent_run_id",
         ));
     }
-    let idempotency = headers
-        .get("idempotency-key")
-        .and_then(|value| value.to_str().ok())
-        .map_or_else(|| run_id.to_string(), ToOwned::to_owned);
+    let idempotency = schedule_fire.map_or_else(
+        || {
+            headers
+                .get("idempotency-key")
+                .and_then(|value| value.to_str().ok())
+                .map_or_else(|| run_id.to_string(), ToOwned::to_owned)
+        },
+        |(schedule_id, fire_at)| format!("schedule/{schedule_id}/{}", fire_at.get()),
+    );
     let identity = format!("api-create/{idempotency}");
     let request_bytes = serde_json::to_vec(&request)
         .map_err(|_| ApiError::bad_request("request cannot be encoded as JSON"))?;
@@ -287,6 +550,8 @@ async fn create_run(
         parent_task_id,
         parent_event_id: parent_run_id
             .map(|_| EventId::from_bytes(crate::identity::derived_id("parent-event", &identity))),
+        schedule_id: schedule_fire.map(|(schedule_id, _)| schedule_id),
+        scheduled_fire_at: schedule_fire.map(|(_, fire_at)| fire_at),
         workflow_version_id: Some(workflow.workflow_version_id),
         coordinator_agent_version_id: Some(state.coordinator_agent_version_id),
         input: payload(&request.input)?,
@@ -1269,6 +1534,12 @@ fn parse_task_id(value: &str) -> ApiResult<TaskId> {
         .map_err(ApiError::bad_request)
 }
 
+fn parse_schedule_id(value: &str) -> ApiResult<ScheduleId> {
+    decode_id(value)
+        .map(ScheduleId::from_bytes)
+        .map_err(ApiError::bad_request)
+}
+
 fn query_context(state: &AppState) -> QueryContext {
     QueryContext {
         tenant_id: state.tenant_id,
@@ -1415,5 +1686,15 @@ mod tests {
     fn run_identifier_parser_rejects_invalid_input() {
         assert!(parse_run_id("abc").is_err());
         assert!(parse_run_id("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
+    }
+
+    #[test]
+    fn schedule_v1_accepts_only_five_field_cron_shape() {
+        assert!(validate_cron_v1("*/5 * * * *").is_ok());
+        assert!(validate_cron_v1("0 9 * * 1-5").is_ok());
+        assert!(validate_cron_v1("*/5 * * *").is_err());
+        assert!(validate_cron_v1("@daily").is_err());
+        assert!(validate_cron_v1("60 * * * *").is_err());
+        assert!(validate_cron_v1("*/0 * * * *").is_err());
     }
 }

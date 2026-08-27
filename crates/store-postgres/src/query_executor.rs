@@ -2,9 +2,10 @@ use agent_loom_domain::{
     AgentExecutionId, AgentExecutionSnapshot, AgentVersionId, ArtifactId, ArtifactRefSnapshot,
     ArtifactVersionRef, CheckpointId, ContextSnapshot, ContextSnapshotId, Digest, EndpointId,
     EventId, EventRecord, IdempotencyKey, JsonPayload, LogicalKey, PlanRevisionId,
-    PlanRevisionSnapshot, RunId, RunSnapshot, ScopeKey, StageExecutionId, StageExecutionSnapshot,
-    StageStatus, TaskContextReference, TaskId, TenantId, ToolExecutionId, UnixMicros, WaitId,
-    WaitSnapshot, WaitStatus, WorkflowId, WorkflowSnapshot, WorkflowVersionId,
+    PlanRevisionSnapshot, RunId, RunSnapshot, ScheduleId, ScheduleSnapshot, ScheduleStatus,
+    ScopeKey, StageExecutionId, StageExecutionSnapshot, StageStatus, TaskContextReference, TaskId,
+    TenantId, ToolExecutionId, UnixMicros, WaitId, WaitSnapshot, WaitStatus, WorkflowId,
+    WorkflowSnapshot, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
     AgentEventCandidate, AgentEventPage, AgentEventQuery, AgentInvocation, AgentStatusCandidate,
@@ -30,6 +31,62 @@ const MAX_AGENT_STATUS_PAGE_SIZE: u32 = 1_000;
 const MAX_AGENT_EVENT_PAGE_SIZE: u32 = 1_000;
 
 impl crate::PostgresTransactionExecutor {
+    /// Reads one persisted Schedule for the tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error when PostgreSQL is unavailable or persisted data is invalid.
+    pub async fn get_schedule(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        schedule_id: ScheduleId,
+    ) -> StoreResult<Option<ScheduleSnapshot>> {
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let schedule_id = uuid(schedule_id.into_bytes());
+        client
+            .query_opt(
+                "SELECT schedule_id, workflow_version_id, cron_expression, timezone, \
+                        input_json, status, \
+                        (extract(epoch FROM created_at) * 1000000)::bigint, \
+                        (extract(epoch FROM updated_at) * 1000000)::bigint \
+                 FROM agent_loom.schedules WHERE tenant_id = $1 AND schedule_id = $2",
+                &[&tenant_id, &schedule_id],
+            )
+            .await
+            .map_err(map_database_error)?
+            .map(|row| decode_schedule(context.tenant_id, &row))
+            .transpose()
+    }
+
+    /// Lists tenant Schedules in stable creation order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error when PostgreSQL is unavailable or persisted data is invalid.
+    pub async fn list_schedules(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+    ) -> StoreResult<Vec<ScheduleSnapshot>> {
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        client
+            .query(
+                "SELECT schedule_id, workflow_version_id, cron_expression, timezone, \
+                        input_json, status, \
+                        (extract(epoch FROM created_at) * 1000000)::bigint, \
+                        (extract(epoch FROM updated_at) * 1000000)::bigint \
+                 FROM agent_loom.schedules WHERE tenant_id = $1 \
+                 ORDER BY created_at, schedule_id",
+                &[&tenant_id],
+            )
+            .await
+            .map_err(map_database_error)?
+            .iter()
+            .map(|row| decode_schedule(context.tenant_id, row))
+            .collect()
+    }
+
     /// Reads the authoritative Run projection for one tenant.
     ///
     /// # Errors
@@ -828,6 +885,25 @@ impl crate::PostgresTransactionExecutor {
     }
 }
 
+fn decode_schedule(tenant_id: TenantId, row: &Row) -> StoreResult<ScheduleSnapshot> {
+    let status = match row.get::<_, &str>(5) {
+        "active" => ScheduleStatus::Active,
+        "paused" => ScheduleStatus::Paused,
+        _ => return Err(inconsistent("database returned an unknown Schedule status")),
+    };
+    Ok(ScheduleSnapshot {
+        tenant_id,
+        schedule_id: ScheduleId::from_bytes(row.get::<_, Uuid>(0).into_bytes()),
+        workflow_version_id: WorkflowVersionId::from_bytes(row.get::<_, Uuid>(1).into_bytes()),
+        cron_expression: row.get(2),
+        timezone: row.get(3),
+        input: decode_json_payload(&row.get(4))?,
+        status,
+        created_at: UnixMicros::new(row.get(6)),
+        updated_at: UnixMicros::new(row.get(7)),
+    })
+}
+
 fn decode_digest(value: Vec<u8>, field: &str) -> StoreResult<Digest> {
     let bytes: [u8; 32] = value
         .try_into()
@@ -1246,7 +1322,7 @@ fn decode_maintenance(tenant_id: TenantId, row: &Row) -> StoreResult<Maintenance
     })
 }
 
-fn decode_run(tenant_id: TenantId, row: &Row) -> StoreResult<RunSnapshot> {
+pub(crate) fn decode_run(tenant_id: TenantId, row: &Row) -> StoreResult<RunSnapshot> {
     let suspended_from_status = row
         .get::<_, Option<&str>>(3)
         .map(parse_run_status)

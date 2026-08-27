@@ -95,6 +95,8 @@ pub async fn exercise_lease_expiry_retry(
                 parent_run_id: None,
                 parent_task_id: None,
                 parent_event_id: None,
+                schedule_id: None,
+                scheduled_fire_at: None,
                 workflow_version_id: None,
                 coordinator_agent_version_id: None,
                 input: empty_payload(),

@@ -325,7 +325,7 @@ Kafka、NATS 或 Redis Streams 可以在高吞吐事件分发时引入，但必�
 
 ## 11. 下一步
 
-已完成共享领域/Store/Adapter 契约骨架、`0000` 至 `0019` PostgreSQL/MySQL 对等迁移、migration runner/执行状态机，以及 PostgreSQL migration executor。PostgreSQL 事务垂直切片现已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 两阶段记录、AgentExecution 提交/事件/结果记录、Pause/Resume/Cancel、Transactional Outbox、PlanRevision、Dependency/Condition/JoinPolicy、Context、Child Run 与显式 Fan-in。连接池封装已完整实现对象安全的 `DurableStore`。Worker、事件、外部执行与控制命令统一使用显式层级锁序。失败路径已区分 retry、fatal 与 Dead Letter，Wait 持久化恢复计划，Tool/Agent backoff 持久化 due time，Agent event receipt、local Event、cursor 与 Run sequence 同事务提交。Tool/Agent due-work 扫描、确定性 Runtime Scheduler tick、原子应用与恢复 Worker 已贯通到实际 Adapter 调用与结果回写。Outbox 使用数据库 Lease、失败重试与 attempt fencing；PlanRevision 保存完整不可变历史并使用 Run/Plan 双重 CAS。P0/P1 核心能力已经闭环，后续进入 Phase 2B、P2 和生产化扩展：
+已完成共享领域/Store/Adapter 契约骨架、`0000` 至 `0020` PostgreSQL/MySQL 对等迁移、migration runner/执行状态机，以及 PostgreSQL migration executor。PostgreSQL 事务垂直切片现已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 两阶段记录、AgentExecution 提交/事件/结果记录、Pause/Resume/Cancel、Transactional Outbox、PlanRevision、Dependency/Condition/JoinPolicy、Context、Child Run、显式 Fan-in 与 Schedule/Cron 的持久化幂等 fire。连接池封装已完整实现对象安全的 `DurableStore`。Worker、事件、外部执行与控制命令统一使用显式层级锁序。失败路径已区分 retry、fatal 与 Dead Letter，Wait 持久化恢复计划，Tool/Agent backoff 持久化 due time，Agent event receipt、local Event、cursor 与 Run sequence 同事务提交。Tool/Agent due-work 扫描、确定性 Runtime Scheduler tick、原子应用与恢复 Worker 已贯通到实际 Adapter 调用与结果回写。Outbox 使用数据库 Lease、失败重试与 attempt fencing；PlanRevision 保存完整不可变历史并使用 Run/Plan 双重 CAS。P0/P1 核心能力已经闭环，P2 Schedule/Cron 第一段已完成，后续继续 timezone/DST 和调度策略：
 
 CI 已配置独立的 workspace 质量门禁和 PostgreSQL 16 服务 Job；后者通过 `AGENT_LOOM_TEST_POSTGRES_URL` 串行执行真实 migration、事务垂直切片与 Provider 黑盒场景。首个只依赖 `dyn DurableStore` 的场景已覆盖 Lease 续租幂等、过期回收幂等、Run 重试投影、attempt 递增和再次领取。后续按以下顺序推进：
 
@@ -334,6 +334,7 @@ CI 已配置独立的 workspace 质量门禁和 PostgreSQL 16 服务 Job；后�
 3. 将维护扫描、返工与审批竞争继续下沉为数据库无关的 Provider conformance 场景。
 4. 已完成：接入版本化 HTTP Agent Server 与 DevOps Tool profile，并运行共享 Adapter conformance。
 5. 已完成：`0014_transactional_outbox` 至 `0019_task_skipped_status`，包括 PlanRevision、动态图变更、Dependency/Condition/JoinPolicy、Context、Child Run/Fan-in 和不可达分支收敛。
+6. 已完成：`0020_schedules`、UTC 五段 Cron 校验、Schedule 查询 API 和基于稳定 fire 身份的幂等 Run 创建；下一步接入后台扫描及 timezone/DST。
 
 ### MVP 交付状态
 

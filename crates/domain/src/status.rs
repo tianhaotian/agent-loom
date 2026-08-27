@@ -12,6 +12,12 @@ pub enum RunStatus {
     TimedOut,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScheduleStatus {
+    Active,
+    Paused,
+}
+
 impl RunStatus {
     pub const fn is_terminal(self) -> bool {
         matches!(

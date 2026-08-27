@@ -1,8 +1,9 @@
 use crate::{
     AgentEventReceiptId, AgentExecutionId, AgentExecutionStatus, AgentVersionId, ArtifactId,
     CheckpointId, Digest, EndpointId, EventId, JsonPayload, LogicalKey, PlanRevisionId, RunId,
-    RunStatus, StageExecutionId, StageStatus, TaskId, TaskStatus, TenantId, ToolExecutionId,
-    ToolExecutionStatus, UnixMicros, WaitId, WaitStatus, WorkflowId, WorkflowVersionId,
+    RunStatus, ScheduleId, ScheduleStatus, StageExecutionId, StageStatus, TaskId, TaskStatus,
+    TenantId, ToolExecutionId, ToolExecutionStatus, UnixMicros, WaitId, WaitStatus, WorkflowId,
+    WorkflowVersionId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,6 +18,19 @@ pub struct WorkflowSnapshot {
     pub lifecycle: String,
     pub spec: JsonPayload,
     pub spec_digest: Digest,
+    pub created_at: UnixMicros,
+    pub updated_at: UnixMicros,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduleSnapshot {
+    pub tenant_id: TenantId,
+    pub schedule_id: ScheduleId,
+    pub workflow_version_id: WorkflowVersionId,
+    pub cron_expression: String,
+    pub timezone: String,
+    pub input: JsonPayload,
+    pub status: ScheduleStatus,
     pub created_at: UnixMicros,
     pub updated_at: UnixMicros,
 }

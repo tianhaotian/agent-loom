@@ -2,23 +2,23 @@ use agent_loom_domain::{
     AgentEventReceiptId, AgentExecutionId, AgentExecutionSnapshot, AgentExecutionStatus,
     AgentVersionId, CheckpointId, ContextMergeStrategy, ContextSnapshotId, EndpointId, EventId,
     JoinPolicy, JsonPayload, LogicalKey, OutboxId, OutboxMessage, PlanRevisionId, RunId,
-    RunSnapshot, RunStatus, StageExecutionId, StageStatus, TaskId, TaskKind, TaskSnapshot,
-    TaskStatus, TenantId, ToolExecutionId, ToolExecutionSnapshot, ToolExecutionStatus, UnixMicros,
-    WorkflowVersionId,
+    RunSnapshot, RunStatus, ScheduleId, ScheduleSnapshot, ScheduleStatus, StageExecutionId,
+    StageStatus, TaskId, TaskKind, TaskSnapshot, TaskStatus, TenantId, ToolExecutionId,
+    ToolExecutionSnapshot, ToolExecutionStatus, UnixMicros, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
     AgentEventBatchOutcome, AgentEventExecutionOutcome, AgentSubmissionOutcome,
     AgentWorkflowAction, AppendAgentEvents, ApplyContextPatch, ApplyDueWork, ApplyEvent,
     ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt, ClaimOutbox, ClaimTask,
     ClaimedTask, CommandContext, CommandDisposition, Committed, CompleteTask, CompletionShapeError,
-    ControlRun, CreateRun, DueWorkOutcome, DueWorkTarget, DurableFollowUp, EvaluateChildRunJoin,
-    ExecutionRetryClass, ExpectedRun, FailTask, InitialStage, InitialTask, LeaseExpiryAction,
-    LeaseProof, LeaseReclaimOutcome, MaintenanceOutcome, MaintenanceTarget, NewArtifactRef,
-    NewPlanRevision, NewTask, NewWaitSubscription, NextActions, NormalizedAgentEventInput,
-    OutboxDeliveryOutcome, PostCommitHint, PrepareAgentExecution, PrepareToolExecution,
-    QueryContext, ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission,
-    RecordOutboxDelivery, RecordToolOutcome, RenewTaskLease, RevisePlan, SignatureVerification,
-    StoreError, StoreErrorCode, StoreResult, ToolRecordedOutcome,
+    ControlRun, CreateRun, CreateSchedule, DueWorkOutcome, DueWorkTarget, DurableFollowUp,
+    EvaluateChildRunJoin, ExecutionRetryClass, ExpectedRun, FailTask, InitialStage, InitialTask,
+    LeaseExpiryAction, LeaseProof, LeaseReclaimOutcome, MaintenanceOutcome, MaintenanceTarget,
+    NewArtifactRef, NewPlanRevision, NewTask, NewWaitSubscription, NextActions,
+    NormalizedAgentEventInput, OutboxDeliveryOutcome, PostCommitHint, PrepareAgentExecution,
+    PrepareToolExecution, QueryContext, ReclaimExpiredLease, RecordAgentOutcome,
+    RecordAgentSubmission, RecordOutboxDelivery, RecordToolOutcome, RenewTaskLease, RevisePlan,
+    SignatureVerification, StoreError, StoreErrorCode, StoreResult, ToolRecordedOutcome,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -50,6 +50,105 @@ pub struct PostgresTransactionExecutor {
 impl PostgresTransactionExecutor {
     pub const fn new(config: PostgresTransactionConfig) -> Self {
         Self { config }
+    }
+
+    /// Persists an immutable UTC Cron Schedule under command-receipt idempotency.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for invalid metadata, idempotency misuse, or database failure.
+    pub async fn create_schedule(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: CreateSchedule,
+    ) -> StoreResult<Committed<ScheduleSnapshot>> {
+        if command.schedule_id.is_nil()
+            || command.cron_expression.is_empty()
+            || command.cron_expression.len() > 255
+            || command.timezone.is_empty()
+            || command.timezone.len() > 128
+        {
+            return Err(invalid_command("Schedule metadata is invalid"));
+        }
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        match acquire_receipt(
+            &transaction,
+            context,
+            db_now,
+            self.config.receipt_ttl_micros,
+        )
+        .await?
+        {
+            ReceiptGuard::Existing(receipt) => {
+                let snapshot = decode_schedule_receipt(context.tenant_id, &receipt.outcome)?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(Committed {
+                    disposition: CommandDisposition::Duplicate,
+                    value: snapshot,
+                    event_ids: Vec::new(),
+                    durable_follow_ups: Vec::new(),
+                    post_commit_hints: Vec::new(),
+                });
+            }
+            ReceiptGuard::Acquired => {}
+        }
+
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let schedule_id = uuid(command.schedule_id.into_bytes());
+        let workflow_version_id = uuid(command.workflow_version_id.into_bytes());
+        let input = json_value(&command.input)?;
+        transaction
+            .execute(
+                "INSERT INTO agent_loom.schedules (schedule_id, tenant_id, \
+                    workflow_version_id, cron_expression, timezone, input_json, status, \
+                    created_by, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, \
+                    to_timestamp(($8::bigint)::double precision / 1000000.0), \
+                    to_timestamp(($8::bigint)::double precision / 1000000.0))",
+                &[
+                    &schedule_id,
+                    &tenant_id,
+                    &workflow_version_id,
+                    &command.cron_expression,
+                    &command.timezone,
+                    &input,
+                    &context.actor_ref,
+                    &db_now,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        let snapshot = ScheduleSnapshot {
+            tenant_id: context.tenant_id,
+            schedule_id: command.schedule_id,
+            workflow_version_id: command.workflow_version_id,
+            cron_expression: command.cron_expression,
+            timezone: command.timezone,
+            input: command.input,
+            status: ScheduleStatus::Active,
+            created_at: UnixMicros::new(db_now),
+            updated_at: UnixMicros::new(db_now),
+        };
+        let outcome = encode_schedule_receipt(&snapshot)?;
+        finish_receipt(
+            &transaction,
+            context,
+            "applied",
+            &outcome,
+            None,
+            Some(("schedule", schedule_id, 0)),
+        )
+        .await?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(Committed {
+            disposition: CommandDisposition::Applied,
+            value: snapshot,
+            event_ids: Vec::new(),
+            durable_follow_ups: Vec::new(),
+            post_commit_hints: Vec::new(),
+        })
     }
 
     /// Claims one due Outbox message with a database-time lease.
@@ -255,6 +354,8 @@ impl PostgresTransactionExecutor {
         let run_id = uuid(command.run_id.into_bytes());
         let parent_run_id = command.parent_run_id.map(|id| uuid(id.into_bytes()));
         let parent_task_id = command.parent_task_id.map(|id| uuid(id.into_bytes()));
+        let schedule_id = command.schedule_id.map(|id| uuid(id.into_bytes()));
+        let scheduled_fire_at = command.scheduled_fire_at.map(UnixMicros::get);
         let workflow_version_id = command.workflow_version_id.map(|id| uuid(id.into_bytes()));
         let coordinator_agent_version_id = command
             .coordinator_agent_version_id
@@ -272,6 +373,76 @@ impl PostgresTransactionExecutor {
             command.initial_checkpoint.execution_generation,
             "execution generation",
         )?;
+
+        if let Some(schedule_id) = schedule_id {
+            let schedule = transaction
+                .query_opt(
+                    "SELECT workflow_version_id, status FROM agent_loom.schedules \
+                     WHERE tenant_id = $1 AND schedule_id = $2 FOR UPDATE",
+                    &[&tenant_id, &schedule_id],
+                )
+                .await
+                .map_err(map_database_error)?
+                .ok_or_else(|| store_error(StoreErrorCode::NotFound, "Schedule was not found"))?;
+            let scheduled_workflow_version_id: Uuid = schedule.get(0);
+            if Some(scheduled_workflow_version_id) != workflow_version_id {
+                return Err(invalid_command(
+                    "Schedule Workflow version does not match the Run",
+                ));
+            }
+            if schedule.get::<_, &str>(1) != "active" {
+                return Err(store_error(
+                    StoreErrorCode::InvalidTransition,
+                    "Schedule is not active",
+                ));
+            }
+            let existing = transaction
+                .query_opt(
+                    "SELECT run_id, workflow_version_id, status, suspended_from_status, version, \
+                            execution_generation, next_event_sequence, current_checkpoint_id, \
+                            terminal_event_id, \
+                            CASE WHEN deadline IS NULL THEN NULL ELSE \
+                                (extract(epoch FROM deadline) * 1000000)::bigint END, \
+                            (extract(epoch FROM updated_at) * 1000000)::bigint \
+                     FROM agent_loom.runs WHERE tenant_id = $1 AND schedule_id = $2 \
+                       AND scheduled_fire_at = \
+                           to_timestamp(($3::bigint)::double precision / 1000000.0) \
+                     FOR UPDATE",
+                    &[
+                        &tenant_id,
+                        &schedule_id,
+                        &scheduled_fire_at.ok_or_else(|| {
+                            invalid_command("Scheduled Run has no fire timestamp")
+                        })?,
+                    ],
+                )
+                .await
+                .map_err(map_database_error)?;
+            if let Some(existing) = existing {
+                let snapshot = crate::query_executor::decode_run(context.tenant_id, &existing)?;
+                let outcome = encode_run_receipt(&snapshot)?;
+                finish_receipt(
+                    &transaction,
+                    context,
+                    "no_op",
+                    &outcome,
+                    None,
+                    Some((
+                        "run",
+                        uuid(snapshot.run_id.into_bytes()),
+                        to_i64(snapshot.version, "Run version")?,
+                    )),
+                )
+                .await?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(committed_run(
+                    CommandDisposition::Duplicate,
+                    snapshot,
+                    None,
+                    Vec::new(),
+                ));
+            }
+        }
 
         if let Some(parent_run_id) = parent_run_id {
             let parent = transaction
@@ -373,14 +544,17 @@ impl PostgresTransactionExecutor {
             .execute(
                 "INSERT INTO agent_loom.runs (\
                     run_id, tenant_id, workflow_version_id, coordinator_agent_version_id, \
-                    parent_run_id, parent_task_id, status, suspended_from_status, version, \
+                    parent_run_id, parent_task_id, schedule_id, scheduled_fire_at, \
+                    status, suspended_from_status, version, \
                     execution_generation, next_event_sequence, current_checkpoint_id, \
                     terminal_event_id, input_json, state_summary_json, deadline, \
                     resume_blocked_reason, created_by, created_at, updated_at, terminal_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, 'queued', NULL, 0, 0, 2, NULL, \
-                    NULL, $7, '{}'::jsonb, to_timestamp(($8::bigint)::double precision / 1000000.0), \
-                    NULL, $9, to_timestamp(($10::bigint)::double precision / 1000000.0), \
-                    to_timestamp(($10::bigint)::double precision / 1000000.0), NULL)",
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                    to_timestamp(($8::bigint)::double precision / 1000000.0), \
+                    'queued', NULL, 0, 0, 2, NULL, NULL, $9, '{}'::jsonb, \
+                    to_timestamp(($10::bigint)::double precision / 1000000.0), NULL, $11, \
+                    to_timestamp(($12::bigint)::double precision / 1000000.0), \
+                    to_timestamp(($12::bigint)::double precision / 1000000.0), NULL)",
                 &[
                     &run_id,
                     &tenant_id,
@@ -388,6 +562,8 @@ impl PostgresTransactionExecutor {
                     &coordinator_agent_version_id,
                     &parent_run_id,
                     &parent_task_id,
+                    &schedule_id,
+                    &scheduled_fire_at,
                     &input,
                     &deadline,
                     &context.actor_ref,
@@ -8751,6 +8927,8 @@ fn validate_create_run(command: &CreateRun) -> StoreResult<()> {
         || command.parent_run_id == Some(command.run_id)
         || (command.parent_task_id.is_some() && command.parent_run_id.is_none())
         || (command.parent_event_id.is_some() != command.parent_run_id.is_some())
+        || (command.schedule_id.is_some() != command.scheduled_fire_at.is_some())
+        || (command.schedule_id.is_some() && command.parent_run_id.is_some())
         || plan_revision.plan_revision_id.is_nil()
         || plan_revision.schema_version == 0
         || computed_plan_digest != *plan_revision.plan_digest.as_bytes()
@@ -9366,6 +9544,70 @@ fn due_work_committed(
         durable_follow_ups,
         post_commit_hints,
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ScheduleReceipt {
+    #[serde(rename = "type")]
+    outcome_type: String,
+    schedule_id: Uuid,
+    workflow_version_id: Uuid,
+    cron_expression: String,
+    timezone: String,
+    input: Value,
+    status: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn encode_schedule_receipt(snapshot: &ScheduleSnapshot) -> StoreResult<Value> {
+    serde_json::to_value(ScheduleReceipt {
+        outcome_type: "schedule".to_owned(),
+        schedule_id: uuid(snapshot.schedule_id.into_bytes()),
+        workflow_version_id: uuid(snapshot.workflow_version_id.into_bytes()),
+        cron_expression: snapshot.cron_expression.clone(),
+        timezone: snapshot.timezone.clone(),
+        input: json_value(&snapshot.input)?,
+        status: match snapshot.status {
+            ScheduleStatus::Active => "active",
+            ScheduleStatus::Paused => "paused",
+        }
+        .to_owned(),
+        created_at: snapshot.created_at.get(),
+        updated_at: snapshot.updated_at.get(),
+    })
+    .map_err(|_| inconsistent("failed to encode Schedule command receipt"))
+}
+
+fn decode_schedule_receipt(tenant_id: TenantId, value: &Value) -> StoreResult<ScheduleSnapshot> {
+    let receipt: ScheduleReceipt = serde_json::from_value(value.clone())
+        .map_err(|_| inconsistent("stored command receipt is not a Schedule outcome"))?;
+    if receipt.outcome_type != "schedule" {
+        return Err(inconsistent(
+            "stored command receipt has the wrong outcome type",
+        ));
+    }
+    let status = match receipt.status.as_str() {
+        "active" => ScheduleStatus::Active,
+        "paused" => ScheduleStatus::Paused,
+        _ => return Err(inconsistent("stored Schedule status is invalid")),
+    };
+    Ok(ScheduleSnapshot {
+        tenant_id,
+        schedule_id: ScheduleId::from_bytes(receipt.schedule_id.into_bytes()),
+        workflow_version_id: WorkflowVersionId::from_bytes(
+            receipt.workflow_version_id.into_bytes(),
+        ),
+        cron_expression: receipt.cron_expression,
+        timezone: receipt.timezone,
+        input: JsonPayload::from_validated_bytes(
+            serde_json::to_vec(&receipt.input)
+                .map_err(|_| inconsistent("stored Schedule input cannot be encoded"))?,
+        ),
+        status,
+        created_at: UnixMicros::new(receipt.created_at),
+        updated_at: UnixMicros::new(receipt.updated_at),
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -10386,6 +10628,8 @@ mod tests {
             parent_run_id: None,
             parent_task_id: None,
             parent_event_id: None,
+            schedule_id: None,
+            scheduled_fire_at: None,
             workflow_version_id: None,
             coordinator_agent_version_id: None,
             input: payload(&json!({"request": "smoke"})),
@@ -10975,6 +11219,8 @@ mod tests {
                     parent_run_id: None,
                     parent_task_id: None,
                     parent_event_id: None,
+                    schedule_id: None,
+                    scheduled_fire_at: None,
                     workflow_version_id: None,
                     coordinator_agent_version_id: None,
                     input: payload(&json!({"request": "control-smoke"})),
@@ -11274,6 +11520,8 @@ mod tests {
             parent_run_id: None,
             parent_task_id: None,
             parent_event_id: None,
+            schedule_id: None,
+            scheduled_fire_at: None,
             workflow_version_id: None,
             coordinator_agent_version_id: None,
             input: payload(&json!({"request": label})),

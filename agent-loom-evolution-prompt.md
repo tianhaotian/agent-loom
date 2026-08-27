@@ -135,6 +135,7 @@ Agent Loom 不应该内置：
 - 通用 External Signal/Wait 已持久化并支持匹配/单次消费/恢复；当前 HTTP E2E 重点覆盖 approval，更多信号类型可继续扩展验收
 - Child Run、Fan-out 和显式 `all/any` Child Join Fan-in 核心语义已完成；后台自动触发 Child Join 属于生产调度增强，Handoff 属于 P2
 - Transactional Outbox 已对所有权威 Event 形成事务写入、Lease 发布、失败重试和崩溃接管闭环，当前真实 Publisher 为结构化 JSON 日志
+- P2 Schedule/Cron 第一段已完成：持久化五段 Cron、UTC timezone、Workflow Version/输入绑定和查询 API，并以 `(schedule_id, scheduled_fire_time)` 稳定身份与 Run 唯一约束实现幂等 fire；后台扫描、IANA timezone/DST、misfire、catch-up 和 concurrency policy 尚待后续切片
 - P0 与 P1 清单中的核心能力均已完成。PlanRevision 已覆盖初始 revision、完整快照历史、HTTP 幂等提交、Run/Plan 双重 fencing、Event/Outbox 审计，以及 append-only 动态 Task 的同事务实例化；ExecutionPlan 已支持无环 Dependency、`all`/`any` JoinPolicy、成功/结果投影 Condition、事务内唯一激活和不可达分支递归 `skipped`。Context 已覆盖初始 Snapshot、replace/merge-patch、Run/Context fencing、不可变 Patch/Snapshot、父级 lineage，以及 Task 创建时固定的 ContextReference/JSON Pointer Projection；Artifact 引用/版本血缘已持久化；Child Run/Fan-out 已覆盖父 Run/Task 校验、幂等创建和直接子 Run 查询，显式 Child Join 可按 `all`/`any` 终态策略唯一激活父 Task。append-only 是 V1 动态计划的有意约束；动态 Stage 删除/改写、后台 Child Join 自动触发、Cron、Handoff、外部 Broker、MySQL 事务 Provider、多租户和生产可观测性属于 Phase 2B、P2 或更后续范围
 
 首先检查当前代码和 git 状态，不要仅依赖上述描述。若描述已经过时，以当前代码和测试为准。

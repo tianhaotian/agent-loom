@@ -14,6 +14,7 @@ mod migration_executor;
 mod migration_runner;
 mod outbox;
 mod outcome;
+mod schedule;
 mod store;
 
 pub use agent_control::*;
@@ -29,4 +30,5 @@ pub use migration_executor::*;
 pub use migration_runner::*;
 pub use outbox::*;
 pub use outcome::*;
+pub use schedule::*;
 pub use store::*;

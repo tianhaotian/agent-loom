@@ -1122,6 +1122,162 @@ async fn execution_plan_dependencies_gate_task_claims_until_conditions_match() {
         .expect("dependency verification connection remains healthy");
 }
 
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn schedules_persist_cron_and_fire_runs_idempotently() {
+    let Ok(database_url) = std::env::var("AGENT_LOOM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos();
+    let config = ServerConfig {
+        database_url: database_url.clone(),
+        bind: "127.0.0.1:0".to_owned(),
+        tenant_key: format!("schedule-e2e-{nonce}"),
+        api_key: "mvp-e2e-api-key".to_owned(),
+        pool_size: 4,
+        http_adapters: None,
+    };
+    let application = bootstrap(&config).await.expect("bootstrap Schedule server");
+    let schedule_request = serde_json::to_vec(&json!({
+        "cron_expression": "*/5 * * * *",
+        "timezone": "UTC",
+        "input": {"goal": "scheduled delivery"}
+    }))
+    .expect("encode Schedule request");
+    let mut schedule_bodies = Vec::new();
+    for expected_disposition in ["applied", "duplicate"] {
+        let response = application
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/schedules")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer mvp-e2e-api-key")
+                    .header("idempotency-key", format!("schedule-{nonce}"))
+                    .body(Body::from(schedule_request.clone()))
+                    .expect("build create Schedule request"),
+            )
+            .await
+            .expect("create Schedule response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("read Schedule response"),
+        )
+        .expect("decode Schedule response");
+        assert_eq!(body["disposition"], expected_disposition);
+        schedule_bodies.push(body);
+    }
+    let schedule_id = schedule_bodies[0]["schedule"]["schedule_id"]
+        .as_str()
+        .expect("Schedule ID")
+        .to_owned();
+    assert_eq!(schedule_bodies[1]["schedule"]["schedule_id"], schedule_id);
+    let schedules = get_json(application.router.clone(), "/v1/schedules").await;
+    assert!(
+        schedules
+            .as_array()
+            .is_some_and(|items| { items.iter().any(|item| item["schedule_id"] == schedule_id) })
+    );
+
+    let scheduled_fire_time_micros = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_micros(),
+    )
+    .expect("test timestamp fits i64")
+    .saturating_sub(1_000_000);
+    let fire_body = serde_json::to_vec(&json!({
+        "scheduled_fire_time_micros": scheduled_fire_time_micros
+    }))
+    .expect("encode Schedule fire");
+    let mut run_bodies = Vec::new();
+    for expected_disposition in ["applied", "duplicate"] {
+        let response = application
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/schedules/{schedule_id}/fires"))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer mvp-e2e-api-key")
+                    .body(Body::from(fire_body.clone()))
+                    .expect("build Schedule fire request"),
+            )
+            .await
+            .expect("Schedule fire response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("read Schedule fire response"),
+        )
+        .expect("decode Schedule fire response");
+        assert_eq!(body["disposition"], expected_disposition);
+        run_bodies.push(body);
+        if expected_disposition == "applied" {
+            let (client, connection) =
+                tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+                    .await
+                    .expect("connect Schedule receipt cleanup database");
+            let connection_task = tokio::spawn(connection);
+            client
+                .execute(
+                    "DELETE FROM agent_loom.command_receipts \
+                     WHERE tenant_id = $1 AND scope = 'create_run' AND idempotency_key = $2",
+                    &[
+                        &uuid::Uuid::from_bytes(application.tenant_id.into_bytes()),
+                        &format!("api-create/schedule/{schedule_id}/{scheduled_fire_time_micros}"),
+                    ],
+                )
+                .await
+                .expect("remove transient Schedule fire receipt");
+            drop(client);
+            connection_task
+                .await
+                .expect("join Schedule receipt cleanup connection")
+                .expect("Schedule receipt cleanup connection remains healthy");
+        }
+    }
+    let run_id = run_bodies[0]["run"]["run_id"]
+        .as_str()
+        .expect("scheduled Run ID");
+    assert_eq!(run_bodies[1]["run"]["run_id"], run_id);
+
+    let (client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+        .await
+        .expect("connect Schedule verification database");
+    let connection_task = tokio::spawn(connection);
+    let fire_count: i64 = client
+        .query_one(
+            "SELECT count(*) FROM agent_loom.runs \
+             WHERE tenant_id = $1 AND schedule_id = $2 \
+               AND scheduled_fire_at = to_timestamp(($3::bigint)::double precision / 1000000.0)",
+            &[
+                &uuid::Uuid::from_bytes(application.tenant_id.into_bytes()),
+                &uuid::Uuid::from_bytes(decode_test_id(&schedule_id).expect("decode Schedule ID")),
+                &scheduled_fire_time_micros,
+            ],
+        )
+        .await
+        .expect("count persisted Schedule fires")
+        .get(0);
+    assert_eq!(fire_count, 1);
+    drop(client);
+    connection_task
+        .await
+        .expect("join Schedule verification connection")
+        .expect("Schedule verification connection remains healthy");
+}
+
 fn decode_test_id(value: &str) -> Result<[u8; 16], ()> {
     if value.len() != 32 {
         return Err(());

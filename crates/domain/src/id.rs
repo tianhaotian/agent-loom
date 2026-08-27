@@ -56,6 +56,7 @@ define_id!(
     AgentId,
     AgentVersionId,
     EndpointId,
+    ScheduleId,
     RunId,
     PlanRevisionId,
     ContextSnapshotId,

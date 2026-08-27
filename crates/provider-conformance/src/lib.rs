@@ -44,6 +44,7 @@ mod tests {
         "context_snapshots",
         "context_patches",
         "task_context_references",
+        "schedules",
     ];
 
     #[test]

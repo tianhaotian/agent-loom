@@ -2,9 +2,9 @@ use std::{future::Future, pin::Pin};
 
 use agent_loom_domain::{
     AgentExecutionId, AgentExecutionSnapshot, ArtifactRefSnapshot, ContextSnapshot, JsonPayload,
-    OutboxMessage, PlanRevisionSnapshot, RunId, RunSnapshot, StageExecutionSnapshot,
-    TaskContextReference, TaskId, ToolExecutionId, ToolExecutionSnapshot, WaitSnapshot, WorkflowId,
-    WorkflowSnapshot,
+    OutboxMessage, PlanRevisionSnapshot, RunId, RunSnapshot, ScheduleId, ScheduleSnapshot,
+    StageExecutionSnapshot, TaskContextReference, TaskId, ToolExecutionId, ToolExecutionSnapshot,
+    WaitSnapshot, WorkflowId, WorkflowSnapshot,
 };
 
 use crate::{
@@ -12,8 +12,8 @@ use crate::{
     AgentStatusQuery, AgentStopPage, AgentStopQuery, AppendAgentEvents, ApplyContextPatch,
     ApplyDueWork, ApplyEvent, ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt,
     ClaimOutbox, ClaimTask, ClaimedTask, CommandContext, Committed, CompleteTask, ControlRun,
-    CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery, EvaluateChildRunJoin, EventCursor,
-    EventPage, FailTask, LeaseReclaimOutcome, MaintenanceOutcome, MaintenancePage,
+    CreateRun, CreateSchedule, DueWorkOutcome, DueWorkPage, DueWorkQuery, EvaluateChildRunJoin,
+    EventCursor, EventPage, FailTask, LeaseReclaimOutcome, MaintenanceOutcome, MaintenancePage,
     MaintenanceQuery, PrepareAgentExecution, PrepareToolExecution, QueryContext,
     ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission, RecordOutboxDelivery,
     RecordToolOutcome, RenewTaskLease, RevisePlan, StoreResult, ToolInvocation,
@@ -43,6 +43,23 @@ impl StoreCapabilities {
 
 pub trait DurableStore: Send + Sync {
     fn capabilities(&self) -> StoreCapabilities;
+
+    fn create_schedule<'a>(
+        &'a self,
+        context: &'a CommandContext,
+        command: CreateSchedule,
+    ) -> StoreFuture<'a, Committed<ScheduleSnapshot>>;
+
+    fn get_schedule<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        schedule_id: ScheduleId,
+    ) -> StoreFuture<'a, Option<ScheduleSnapshot>>;
+
+    fn list_schedules<'a>(
+        &'a self,
+        context: &'a QueryContext,
+    ) -> StoreFuture<'a, Vec<ScheduleSnapshot>>;
 
     fn create_run<'a>(
         &'a self,

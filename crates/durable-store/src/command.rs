@@ -2,8 +2,8 @@ use agent_loom_domain::{
     AgentVersionId, ArtifactId, ArtifactVersionRef, CheckpointId, CommandId, ContextMergeStrategy,
     ContextPatchId, ContextSnapshotId, CorrelationId, Digest, DurationMicros, EventId,
     IdempotencyKey, JoinPolicy, JsonPayload, LeaseToken, LogicalKey, PlanRevisionId, RunId,
-    RunStatus, ScopeKey, StageExecutionId, StageStatus, TaskId, TaskKind, TenantId, UnixMicros,
-    WaitId, WorkerId, WorkflowVersionId,
+    RunStatus, ScheduleId, ScopeKey, StageExecutionId, StageStatus, TaskId, TaskKind, TenantId,
+    UnixMicros, WaitId, WorkerId, WorkflowVersionId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +66,8 @@ pub struct CreateRun {
     pub parent_run_id: Option<RunId>,
     pub parent_task_id: Option<TaskId>,
     pub parent_event_id: Option<EventId>,
+    pub schedule_id: Option<ScheduleId>,
+    pub scheduled_fire_at: Option<UnixMicros>,
     pub workflow_version_id: Option<WorkflowVersionId>,
     pub coordinator_agent_version_id: Option<AgentVersionId>,
     pub input: JsonPayload,

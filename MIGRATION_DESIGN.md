@@ -207,6 +207,7 @@ PostgreSQL 即使允许事务 DDL，也采用相同 step journal；`CREATE INDEX
 | `context_patches` | immutable append | Context 变更与合并策略审计 | `0017` |
 | `task_context_references` | immutable reference | Task 的 ContextSnapshot 与 Projection | `0018` |
 | `tasks` | state extension | 条件不可达分支的 `skipped` 终态 | `0019` |
+| `schedules` | root/definition | Cron、timezone、绑定 Workflow Version 与 Run 输入 | `0020` |
 
 `agent_event_receipts` 是 `append_agent_events` 的必要去重守卫。只把 vendor event ID 放进 JSON 无法建立跨 Provider 的可靠唯一约束。
 
@@ -951,7 +952,13 @@ Provider 不能把所有 unique violation 都返回同一模糊错误。迁移�
 - 扩展 Task 状态与终态完成时间约束，加入 `skipped`；
 - 当全部前置 Task 已终态而 Dependency Condition 仍不满足时，用于原子收敛不可达分支。
 
-每个批次结束运行 schema introspection 和最小插入/回滚 smoke test。基础 Provider 的 schema readiness 以所有必需 migration（当前为 `0000` 至 `0019`）成功且 Provider 黑盒测试通过为准。
+### `0020_schedules`
+
+- 创建 tenant-scoped Schedule，保存五段 Cron、timezone、Workflow Version、输入和状态；
+- Runs 增加成对的 `schedule_id`/`scheduled_fire_at`，并用 `(tenant_id, schedule_id, scheduled_fire_at)` 唯一约束形成永久 fire 幂等边界；
+- PostgreSQL/MySQL 保持表、外键、状态约束和查询索引的逻辑对等。
+
+每个批次结束运行 schema introspection 和最小插入/回滚 smoke test。基础 Provider 的 schema readiness 以所有必需 migration（当前为 `0000` 至 `0020`）成功且 Provider 黑盒测试通过为准。
 
 ## 19. Expand → Backfill → Switch → Contract
 
@@ -1109,7 +1116,7 @@ schema_constraint_violation_total{constraint_tag}
 
 1. 初始化 Rust workspace：`domain`、`durable-store`、`store-postgres`、`store-mysql`、`adapter-core`。
 2. 定义共享 ID、Instant、Digest、Status 和 canonical JSON codec。
-3. 为 `0000`—`0019` 维护两套 migration 文件和 schema snapshot 测试。
+3. 为 `0000`—`0020` 维护两套 migration 文件和 schema snapshot 测试。
 4. 建立 `durable-store` conformance harness 与数据库容器测试矩阵。
 5. 实现最小 `create_run → claim_task → complete_task → event query` 垂直链路。
 6. 接入 `workflow.delivery.v1` fixture 和 Mock Agent/DevOps Server，逐步跑通三条 E2E。

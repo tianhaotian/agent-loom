@@ -6,7 +6,7 @@
 
 已包含：
 
-- 启动时自动执行 `0000` 至 `0019` migration；
+- 启动时自动执行 `0000` 至 `0020` migration；
 - PostgreSQL 连接池与对象安全的 `DurableStore`；
 - API Key 认证边界和 tenant-scoped 查询/命令；
 - Workflow、Run、Stage、Artifact、Pending Action 和 Event HTTP 查询；
@@ -92,6 +92,10 @@ curl -sS -H 'authorization: Bearer replace-with-at-least-16-characters' \
 `GET /v1/runs/RUN_ID/context-snapshots` 返回从 revision 1 开始的不可变 ContextSnapshot 历史。`POST` 要求 `Idempotency-Key`、`base_revision`、`merge_strategy`（`replace` 或 RFC 7396 `merge_patch`）和通用 JSON `patch`。Store 同时 fence Run version、execution generation 与当前 Context revision，并在一个事务中写入 ContextPatch、新 Snapshot、父级 lineage、`run.context_patched` Event、Outbox 和 Run 当前 Context 投影。
 
 ExecutionPlan Task 可声明 `context_projection` JSON Pointer 列表。每个 Task 创建时固定引用当时的 ContextSnapshot；`GET /v1/tasks/TASK_ID/context` 返回该不可变引用和投影结果。空列表表示完整 Context，非空列表返回以 Pointer 为键的投影视图，因此后续 Context Patch 不会改变已创建 Task 的输入视图。
+
+### Schedule/Cron
+
+`POST /v1/schedules` 持久化五段 `cron_expression`、当前支持的 `UTC` timezone 和通用 JSON Run 输入；`GET /v1/schedules` 与 `GET /v1/schedules/SCHEDULE_ID` 查询稳定投影。`POST /v1/schedules/SCHEDULE_ID/fires` 接收非未来的 `scheduled_fire_time_micros`，以 `(schedule_id, scheduled_fire_time)` 生成稳定 Run/Command 身份；重复触发返回同一 Run，数据库唯一约束确保不会产生第二个 fire。后台 Cron 扫描、timezone/DST、misfire/catch-up/concurrency policy 属于后续 P2 切片。
 
 ### 暂停、恢复、取消
 

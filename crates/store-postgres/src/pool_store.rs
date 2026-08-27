@@ -1,20 +1,22 @@
 use agent_loom_domain::{AgentExecutionId, ToolExecutionId};
 use agent_loom_domain::{
     AgentExecutionSnapshot, ArtifactRefSnapshot, ContextSnapshot, JsonPayload, OutboxMessage,
-    PlanRevisionSnapshot, RunId, RunSnapshot, StageExecutionSnapshot, TaskContextReference, TaskId,
-    ToolExecutionSnapshot, WaitSnapshot, WorkflowId, WorkflowSnapshot,
+    PlanRevisionSnapshot, RunId, RunSnapshot, ScheduleId, ScheduleSnapshot, StageExecutionSnapshot,
+    TaskContextReference, TaskId, ToolExecutionSnapshot, WaitSnapshot, WorkflowId,
+    WorkflowSnapshot,
 };
 use agent_loom_durable_store::{
     AgentEventBatchOutcome, AgentEventPage, AgentEventQuery, AgentInvocation, AgentStatusPage,
     AgentStatusQuery, AgentStopPage, AgentStopQuery, AppendAgentEvents, ApplyContextPatch,
     ApplyDueWork, ApplyEvent, ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt,
     ClaimOutbox, ClaimTask, ClaimedTask, CommandContext, Committed, CompleteTask, ControlRun,
-    CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery, DurableStore, EvaluateChildRunJoin,
-    EventCursor, EventPage, FailTask, LeaseReclaimOutcome, MaintenanceOutcome, MaintenancePage,
-    MaintenanceQuery, PrepareAgentExecution, PrepareToolExecution, QueryContext,
-    ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission, RecordOutboxDelivery,
-    RecordToolOutcome, RenewTaskLease, RetryClass, RevisePlan, StoreCapabilities, StoreError,
-    StoreErrorCode, StoreFuture, StoreResult, ToolInvocation,
+    CreateRun, CreateSchedule, DueWorkOutcome, DueWorkPage, DueWorkQuery, DurableStore,
+    EvaluateChildRunJoin, EventCursor, EventPage, FailTask, LeaseReclaimOutcome,
+    MaintenanceOutcome, MaintenancePage, MaintenanceQuery, PrepareAgentExecution,
+    PrepareToolExecution, QueryContext, ReclaimExpiredLease, RecordAgentOutcome,
+    RecordAgentSubmission, RecordOutboxDelivery, RecordToolOutcome, RenewTaskLease, RetryClass,
+    RevisePlan, StoreCapabilities, StoreError, StoreErrorCode, StoreFuture, StoreResult,
+    ToolInvocation,
 };
 use deadpool_postgres::{Object, Pool};
 
@@ -62,6 +64,42 @@ impl PostgresStore {
 impl DurableStore for PostgresStore {
     fn capabilities(&self) -> StoreCapabilities {
         capabilities()
+    }
+
+    fn create_schedule<'a>(
+        &'a self,
+        context: &'a CommandContext,
+        command: CreateSchedule,
+    ) -> StoreFuture<'a, Committed<ScheduleSnapshot>> {
+        Box::pin(async move {
+            let mut client = self.connection().await?;
+            self.executor
+                .create_schedule(&mut client, context, command)
+                .await
+        })
+    }
+
+    fn get_schedule<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        schedule_id: ScheduleId,
+    ) -> StoreFuture<'a, Option<ScheduleSnapshot>> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor
+                .get_schedule(&client, context, schedule_id)
+                .await
+        })
+    }
+
+    fn list_schedules<'a>(
+        &'a self,
+        context: &'a QueryContext,
+    ) -> StoreFuture<'a, Vec<ScheduleSnapshot>> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor.list_schedules(&client, context).await
+        })
     }
 
     fn create_run<'a>(
