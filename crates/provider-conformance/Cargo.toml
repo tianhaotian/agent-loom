@@ -12,6 +12,7 @@ agent-loom-domain = { path = "../domain" }
 agent-loom-durable-store = { path = "../durable-store" }
 agent-loom-store-mysql = { path = "../store-mysql" }
 agent-loom-store-postgres = { path = "../store-postgres" }
+sha2 = "0.10"
 tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]

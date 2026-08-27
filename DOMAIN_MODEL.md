@@ -58,6 +58,7 @@ Tenant
     │   │   └── AgentExecution ── AgentEventReceipt
     │   └── ArtifactRef
     ├── Event
+    ├── PlanRevision
     ├── Checkpoint
     ├── WaitSubscription
     ├── CommandReceipt
@@ -65,6 +66,8 @@ Tenant
 ```
 
 Run 是主要事务聚合根。涉及 Run 状态推进的 Stage、Task、Wait、Checkpoint、Artifact 和 Event 写入必须通过 DurableStore 领域操作完成，不能由 Adapter 直接 CRUD。
+
+每个新 Run 都从不可变 `PlanRevision` 1 开始。后续 revision 保存完整 ExecutionPlan 快照、父 revision、摘要、变更说明和创建 Event；提交时同时校验 Run version、execution generation 与当前 Plan revision，避免并发 Replan 覆盖。
 
 ## 4. 定义与配置模型
 
@@ -554,7 +557,7 @@ crates/
 3. stage_executions、tasks、task_attempts、checkpoints；
 4. wait_subscriptions、artifact_refs；
 5. tool_executions/attempts、agent_endpoints、agent_executions、agent_event_receipts；
-6. outbox_messages（仅在实际引入消息系统时）。
+6. plan_revisions、outbox_messages。
 
 首批迁移不启用事件时间分区、数据库专属通知、全文搜索或复杂 JSON 索引。先通过状态、幂等、Lease、故障恢复和 PostgreSQL/MySQL 对等测试，再根据数据量增加物理优化。
 

@@ -1,7 +1,7 @@
 use crate::{
     AgentEventReceiptId, AgentExecutionId, AgentExecutionStatus, AgentVersionId, ArtifactId,
-    CheckpointId, Digest, EndpointId, EventId, JsonPayload, LogicalKey, RunId, RunStatus,
-    StageExecutionId, StageStatus, TaskId, TaskStatus, TenantId, ToolExecutionId,
+    CheckpointId, Digest, EndpointId, EventId, JsonPayload, LogicalKey, PlanRevisionId, RunId,
+    RunStatus, StageExecutionId, StageStatus, TaskId, TaskStatus, TenantId, ToolExecutionId,
     ToolExecutionStatus, UnixMicros, WaitId, WaitStatus, WorkflowId, WorkflowVersionId,
 };
 
@@ -61,6 +61,23 @@ impl RunSnapshot {
     pub fn terminal_invariant_holds(&self) -> bool {
         self.status.is_terminal() == self.terminal_event_id.is_some()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanRevisionSnapshot {
+    pub tenant_id: TenantId,
+    pub plan_revision_id: PlanRevisionId,
+    pub run_id: RunId,
+    pub revision: u64,
+    pub parent_plan_revision_id: Option<PlanRevisionId>,
+    pub schema_version: u32,
+    pub plan_key: LogicalKey,
+    pub plan: JsonPayload,
+    pub plan_digest: Digest,
+    pub change_summary: JsonPayload,
+    pub created_event_id: EventId,
+    pub created_by: String,
+    pub created_at: UnixMicros,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

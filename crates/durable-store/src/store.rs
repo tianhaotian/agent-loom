@@ -1,20 +1,21 @@
 use std::{future::Future, pin::Pin};
 
 use agent_loom_domain::{
-    AgentExecutionId, AgentExecutionSnapshot, ArtifactRefSnapshot, OutboxMessage, RunId,
-    RunSnapshot, StageExecutionSnapshot, ToolExecutionId, ToolExecutionSnapshot, WaitSnapshot,
-    WorkflowId, WorkflowSnapshot,
+    AgentExecutionId, AgentExecutionSnapshot, ArtifactRefSnapshot, OutboxMessage,
+    PlanRevisionSnapshot, RunId, RunSnapshot, StageExecutionSnapshot, ToolExecutionId,
+    ToolExecutionSnapshot, WaitSnapshot, WorkflowId, WorkflowSnapshot,
 };
 
 use crate::{
     AgentEventBatchOutcome, AgentEventPage, AgentEventQuery, AgentInvocation, AgentStatusPage,
     AgentStatusQuery, AgentStopPage, AgentStopQuery, AppendAgentEvents, ApplyDueWork, ApplyEvent,
     ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt, ClaimOutbox, ClaimTask,
-    ClaimedTask, Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome, DueWorkPage,
-    DueWorkQuery, EventCursor, EventPage, FailTask, LeaseReclaimOutcome, MaintenanceOutcome,
-    MaintenancePage, MaintenanceQuery, PrepareAgentExecution, PrepareToolExecution, QueryContext,
-    ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission, RecordOutboxDelivery,
-    RecordToolOutcome, RenewTaskLease, StoreResult, ToolInvocation,
+    ClaimedTask, CommandContext, Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome,
+    DueWorkPage, DueWorkQuery, EventCursor, EventPage, FailTask, LeaseReclaimOutcome,
+    MaintenanceOutcome, MaintenancePage, MaintenanceQuery, PrepareAgentExecution,
+    PrepareToolExecution, QueryContext, ReclaimExpiredLease, RecordAgentOutcome,
+    RecordAgentSubmission, RecordOutboxDelivery, RecordToolOutcome, RenewTaskLease, RevisePlan,
+    StoreResult, ToolInvocation,
 };
 
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = StoreResult<T>> + Send + 'a>>;
@@ -53,6 +54,18 @@ pub trait DurableStore: Send + Sync {
         context: &'a QueryContext,
         run_id: RunId,
     ) -> StoreFuture<'a, Option<RunSnapshot>>;
+
+    fn revise_plan<'a>(
+        &'a self,
+        context: &'a CommandContext,
+        command: RevisePlan,
+    ) -> StoreFuture<'a, Committed<RunSnapshot>>;
+
+    fn list_plan_revisions<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        run_id: RunId,
+    ) -> StoreFuture<'a, Vec<PlanRevisionSnapshot>>;
 
     fn get_workflow<'a>(
         &'a self,

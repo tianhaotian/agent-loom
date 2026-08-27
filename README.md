@@ -36,6 +36,8 @@ PostgreSQL 已接入真实驱动执行层：migration executor 使用 SHA-256 ph
 
 每个权威 Event 还会在同一 PostgreSQL 事务中创建唯一 `(tenant, event, topic)` 的 `run.events` Outbox 消息。Outbox Publisher 使用数据库时间领取短 Lease，发布成功后以 publisher/token/attempt fencing 确认；失败会持久化下一次可用时间，进程在外部发送后、确认前崩溃则在 Lease 到期后按 at-least-once 语义重放。旧 Publisher 无法确认被新 Worker 接管的消息。MVP 的真实 Publisher 输出结构化 JSON 日志；接入 Broker 时只需替换 Publisher，消费者仍须按 `event_id` 幂等。
 
+Run 创建事务同时保存不可变 PlanRevision 1。后续完整 ExecutionPlan 快照可通过 `/v1/runs/{run_id}/plan-revisions` 幂等提交和查询；Store 同时 fence Run version、execution generation 与当前 Plan revision，并原子追加 `run.plan_revised` Event/Outbox，因此并发或过期 Replan 不会覆盖已提交计划。
+
 ## MVP 快速开始
 
 MVP 会在启动时自动执行 PostgreSQL migration、创建一个由 `AGENT_LOOM_TENANT_KEY` 标识的开发 Tenant，并启动 HTTP API、交付 Worker、Scheduler、Recovery Worker、Agent Event/Stop/Status Worker、Outbox Publisher、Lease Reclaimer 和超时维护服务。详细边界与 API 示例见 [MVP 使用说明](./MVP.md)。

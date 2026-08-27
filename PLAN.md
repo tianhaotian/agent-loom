@@ -325,7 +325,7 @@ Kafka、NATS 或 Redis Streams 可以在高吞吐事件分发时引入，但必�
 
 ## 11. 下一步
 
-已完成共享领域/Store/Adapter 契约骨架、`0000` 至 `0010` PostgreSQL/MySQL 对等迁移、migration runner/执行状态机，以及 PostgreSQL migration executor。PostgreSQL 事务垂直切片现已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 两阶段记录、AgentExecution 提交/事件/结果记录和 Pause/Resume/Cancel；连接池封装已完整实现对象安全的 `DurableStore`。Worker、事件、外部执行与控制命令统一使用显式层级锁序。失败路径已区分 retry、fatal 与 Dead Letter，Wait 持久化恢复计划，Tool/Agent backoff 持久化 due time，Agent event receipt、local Event、cursor 与 Run sequence 同事务提交。Tool/Agent due-work 扫描、确定性 Runtime Scheduler tick、原子应用与恢复 Worker 已贯通到实际 Adapter 调用与结果回写：dispatcher 按 tenant 装载 invocation envelope，通过 Registry 解析服务端 Adapter，由可注入工厂解析短期凭据/trace/deadline，并在重放前校验 Tool 副作用等级与 Agent submission 幂等能力快照。外部结果使用提交后的 Run fence 和确定性 Command/Event 身份回写。Runtime 已按 adapter/recovery/scheduler/service 重组；通用 PollingService 提供有界并发、分级退避、进度报告和优雅停机，Scheduler、Recovery Worker 与 Lease Reclaimer 均通过数据库无关 Job 接入。恢复启动事务会原子完成一次性 reconcile Task；通用 Lease Reclaimer 使用数据库时间原子结束过期 TaskAttempt、清除 Lease、追加 Event 并推进 Run cursor，续租/回收由行锁与条件更新决定唯一获胜者。后续按以下顺序推进：
+已完成共享领域/Store/Adapter 契约骨架、`0000` 至 `0015` PostgreSQL/MySQL 对等迁移、migration runner/执行状态机，以及 PostgreSQL migration executor。PostgreSQL 事务垂直切片现已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 两阶段记录、AgentExecution 提交/事件/结果记录、Pause/Resume/Cancel、Transactional Outbox 与 PlanRevision。连接池封装已完整实现对象安全的 `DurableStore`。Worker、事件、外部执行与控制命令统一使用显式层级锁序。失败路径已区分 retry、fatal 与 Dead Letter，Wait 持久化恢复计划，Tool/Agent backoff 持久化 due time，Agent event receipt、local Event、cursor 与 Run sequence 同事务提交。Tool/Agent due-work 扫描、确定性 Runtime Scheduler tick、原子应用与恢复 Worker 已贯通到实际 Adapter 调用与结果回写。Outbox 使用数据库 Lease、失败重试与 attempt fencing；PlanRevision 保存完整不可变历史并使用 Run/Plan 双重 CAS。后续按以下顺序推进：
 
 CI 已配置独立的 workspace 质量门禁和 PostgreSQL 16 服务 Job；后者通过 `AGENT_LOOM_TEST_POSTGRES_URL` 串行执行真实 migration、事务垂直切片与 Provider 黑盒场景。首个只依赖 `dyn DurableStore` 的场景已覆盖 Lease 续租幂等、过期回收幂等、Run 重试投影、attempt 递增和再次领取。后续按以下顺序推进：
 
@@ -333,8 +333,8 @@ CI 已配置独立的 workspace 质量门禁和 PostgreSQL 16 服务 Job；后�
 2. 实现 MySQL 对等事务路径；优先覆盖 Lease 续租/回收竞争。
 3. 将维护扫描、返工与审批竞争继续下沉为数据库无关的 Provider conformance 场景。
 4. 已完成：接入版本化 HTTP Agent Server 与 DevOps Tool profile，并运行共享 Adapter conformance。
-5. 按部署需求选择 `0011_optional_outbox`；将 `0012_runtime_grants` 作为数据库权限加固迁移或等价 IaC，而不是基础领域正确性的前置条件。
+5. 已完成：`0014_transactional_outbox` 与 `0015_plan_revisions`；下一步实现 Dependency、Condition、JoinPolicy 和动态图变更。
 
 ### MVP 交付状态
 
-`agent-loom-server` 已形成 PostgreSQL MVP：启动时自动 migration/fixture，使用 API Key 和 tenant-scoped Store 暴露 Workflow、Run、Event/SSE、Stage、Artifact、Pending Action 与控制 API。ExecutionPlan V1 会原子实例化初始执行图；版本化 Task Handler 信封贯穿初始、动态后继和 Wait 恢复路径。通用 Workflow Worker 使用经过冲突和能力验证的 Handler 注册表汇总领取 kind，再按稳定 Handler key 分发 Lease、输入和 Run fence；固定八阶段推进已隔离在首个真实 delivery Handler 中。八个必需 Stage 会通过正式 AgentExecution 推进；fixture 固定触发一次集成测试失败，并在同一完成事务中创建 implementation/self_test/integration_test attempt 2。部署前进入可超时、单次消费的审批 Wait，审批后由正式 ToolExecution 调用可配置的 Mock 或真实 HTTP DevOps Adapter。Due-work Scheduler、Recovery Worker、Lease Reclaimer 以及 Run deadline、Wait timeout、stale execution 维护服务均随进程启动。PostgreSQL 16 实测已覆盖 migration、完整事务套件、Provider conformance，以及 HTTP→返工→审批→Tool 部署→SSE/查询/终态和 deadline E2E。当前交付满足首个 PostgreSQL MVP，Phase 2A 已关闭；Phase 2B 仍需 MySQL 对等事务实现。后续可靠性扩展继续增加断流、限流和进程崩溃注入，但不再构成 Phase 2A 的关闭阻塞项。
+`agent-loom-server` 已形成 PostgreSQL MVP：启动时自动 migration/fixture，使用 API Key 和 tenant-scoped Store 暴露 Workflow、Run、Event/SSE、Stage、Artifact、Pending Action、PlanRevision 与控制 API。ExecutionPlan V1 会原子实例化初始执行图和 revision 1；版本化 Task Handler 信封贯穿初始、动态后继和 Wait 恢复路径。通用 Workflow Worker 使用经过冲突和能力验证的 Handler 注册表汇总领取 kind，再按稳定 Handler key 分发 Lease、输入和 Run fence；固定八阶段推进已隔离在首个真实 delivery Handler 中。Due-work Scheduler、Recovery Worker、Agent Event/Status/Stop Worker、Outbox Publisher、Lease Reclaimer 以及超时维护服务均随进程启动。PostgreSQL 16 实测已覆盖 migration、完整事务套件、Provider conformance、Plan revision fencing 和 Outbox 崩溃接管。Phase 2B 仍需 MySQL 对等事务实现；下一阶段聚焦通用依赖图和 Context。

@@ -57,6 +57,7 @@ define_id!(
     AgentVersionId,
     EndpointId,
     RunId,
+    PlanRevisionId,
     StageExecutionId,
     TaskId,
     TaskAttemptId,

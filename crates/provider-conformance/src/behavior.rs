@@ -2,14 +2,15 @@ use std::{error::Error, fmt, time::Duration};
 
 use agent_loom_domain::{
     CheckpointId, CommandId, CorrelationId, Digest, DurationMicros, EventId, IdempotencyKey,
-    JsonPayload, LeaseToken, LogicalKey, RunId, RunStatus, ScopeKey, TaskId, TaskKind, TenantId,
-    UnixMicros, WorkerId,
+    JsonPayload, LeaseToken, LogicalKey, PlanRevisionId, RunId, RunStatus, ScopeKey, TaskId,
+    TaskKind, TenantId, UnixMicros, WorkerId,
 };
 use agent_loom_durable_store::{
     ClaimTask, CommandContext, CommandDisposition, ControlRun, CreateRun, DurableStore,
-    ExpectedRun, InitialTask, LeaseExpiryAction, LeaseProof, NewCheckpoint, QueryContext,
-    ReclaimExpiredLease, RenewTaskLease, StoreError, conformance::ConformanceCase,
+    ExpectedRun, InitialTask, LeaseExpiryAction, LeaseProof, NewCheckpoint, NewPlanRevision,
+    QueryContext, ReclaimExpiredLease, RenewTaskLease, StoreError, conformance::ConformanceCase,
 };
+use sha2::{Digest as _, Sha256};
 
 const CASE: ConformanceCase = ConformanceCase::LeaseExpiryRetry;
 
@@ -95,6 +96,7 @@ pub async fn exercise_lease_expiry_retry(
                 input: empty_payload(),
                 deadline: None,
                 initial_event_id,
+                initial_plan_revision: initial_plan_revision(run_id, initial_event_id),
                 initial_checkpoint: NewCheckpoint {
                     checkpoint_id,
                     sequence: 1,
@@ -298,6 +300,19 @@ pub async fn exercise_lease_expiry_retry(
         retry_attempt: retry_claim.value.task.attempt,
         final_status: cancelled.value.status,
     })
+}
+
+fn initial_plan_revision(run_id: RunId, event_id: EventId) -> NewPlanRevision {
+    let plan = JsonPayload::from_validated_bytes(b"{}".to_vec());
+    NewPlanRevision {
+        plan_revision_id: PlanRevisionId::from_bytes(run_id.into_bytes()),
+        schema_version: 1,
+        plan_key: LogicalKey::parse("conformance/initial").expect("static logical key"),
+        plan_digest: Digest::from_bytes(Sha256::digest(plan.as_bytes()).into()),
+        plan,
+        change_summary: JsonPayload::from_validated_bytes(b"{}".to_vec()),
+        created_event_id: event_id,
+    }
 }
 
 fn command_context(

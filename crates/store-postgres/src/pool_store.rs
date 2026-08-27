@@ -1,7 +1,8 @@
 use agent_loom_domain::{AgentExecutionId, ToolExecutionId};
 use agent_loom_domain::{
-    AgentExecutionSnapshot, ArtifactRefSnapshot, OutboxMessage, RunId, RunSnapshot,
-    StageExecutionSnapshot, ToolExecutionSnapshot, WaitSnapshot, WorkflowId, WorkflowSnapshot,
+    AgentExecutionSnapshot, ArtifactRefSnapshot, OutboxMessage, PlanRevisionSnapshot, RunId,
+    RunSnapshot, StageExecutionSnapshot, ToolExecutionSnapshot, WaitSnapshot, WorkflowId,
+    WorkflowSnapshot,
 };
 use agent_loom_durable_store::{
     AgentEventBatchOutcome, AgentEventPage, AgentEventQuery, AgentInvocation, AgentStatusPage,
@@ -12,7 +13,8 @@ use agent_loom_durable_store::{
     MaintenanceOutcome, MaintenancePage, MaintenanceQuery, PrepareAgentExecution,
     PrepareToolExecution, QueryContext, ReclaimExpiredLease, RecordAgentOutcome,
     RecordAgentSubmission, RecordOutboxDelivery, RecordToolOutcome, RenewTaskLease, RetryClass,
-    StoreCapabilities, StoreError, StoreErrorCode, StoreFuture, StoreResult, ToolInvocation,
+    RevisePlan, StoreCapabilities, StoreError, StoreErrorCode, StoreFuture, StoreResult,
+    ToolInvocation,
 };
 use deadpool_postgres::{Object, Pool};
 
@@ -83,6 +85,32 @@ impl DurableStore for PostgresStore {
         Box::pin(async move {
             let client = self.connection().await?;
             self.executor.get_run(&client, context, run_id).await
+        })
+    }
+
+    fn revise_plan<'a>(
+        &'a self,
+        context: &'a CommandContext,
+        command: RevisePlan,
+    ) -> StoreFuture<'a, Committed<RunSnapshot>> {
+        Box::pin(async move {
+            let mut client = self.connection().await?;
+            self.executor
+                .revise_plan(&mut client, context, command)
+                .await
+        })
+    }
+
+    fn list_plan_revisions<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        run_id: RunId,
+    ) -> StoreFuture<'a, Vec<PlanRevisionSnapshot>> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor
+                .list_plan_revisions(&client, context, run_id)
+                .await
         })
     }
 

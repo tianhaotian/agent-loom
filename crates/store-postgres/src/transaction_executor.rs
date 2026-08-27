@@ -1,8 +1,8 @@
 use agent_loom_domain::{
     AgentEventReceiptId, AgentExecutionId, AgentExecutionSnapshot, AgentExecutionStatus,
     AgentVersionId, CheckpointId, EndpointId, EventId, JsonPayload, LogicalKey, OutboxId,
-    OutboxMessage, RunId, RunSnapshot, RunStatus, StageExecutionId, StageStatus, TaskId, TaskKind,
-    TaskSnapshot, TaskStatus, TenantId, ToolExecutionId, ToolExecutionSnapshot,
+    OutboxMessage, PlanRevisionId, RunId, RunSnapshot, RunStatus, StageExecutionId, StageStatus,
+    TaskId, TaskKind, TaskSnapshot, TaskStatus, TenantId, ToolExecutionId, ToolExecutionSnapshot,
     ToolExecutionStatus, UnixMicros, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
@@ -12,11 +12,11 @@ use agent_loom_durable_store::{
     CommandContext, CommandDisposition, Committed, CompleteTask, CompletionShapeError, ControlRun,
     CreateRun, DueWorkOutcome, DueWorkTarget, DurableFollowUp, ExecutionRetryClass, ExpectedRun,
     FailTask, InitialStage, InitialTask, LeaseExpiryAction, LeaseProof, LeaseReclaimOutcome,
-    MaintenanceOutcome, MaintenanceTarget, NewArtifactRef, NewTask, NewWaitSubscription,
-    NextActions, NormalizedAgentEventInput, OutboxDeliveryOutcome, PostCommitHint,
-    PrepareAgentExecution, PrepareToolExecution, QueryContext, ReclaimExpiredLease,
+    MaintenanceOutcome, MaintenanceTarget, NewArtifactRef, NewPlanRevision, NewTask,
+    NewWaitSubscription, NextActions, NormalizedAgentEventInput, OutboxDeliveryOutcome,
+    PostCommitHint, PrepareAgentExecution, PrepareToolExecution, QueryContext, ReclaimExpiredLease,
     RecordAgentOutcome, RecordAgentSubmission, RecordOutboxDelivery, RecordToolOutcome,
-    RenewTaskLease, SignatureVerification, StoreError, StoreErrorCode, StoreResult,
+    RenewTaskLease, RevisePlan, SignatureVerification, StoreError, StoreErrorCode, StoreResult,
     ToolRecordedOutcome,
 };
 use serde::{Deserialize, Serialize};
@@ -314,6 +314,18 @@ impl PostgresTransactionExecutor {
         )
         .await?;
 
+        insert_plan_revision(
+            &transaction,
+            tenant_id,
+            run_id,
+            1,
+            None,
+            db_now,
+            context,
+            &command.initial_plan_revision,
+        )
+        .await?;
+
         let checkpoint_workflow_version_id = command
             .initial_checkpoint
             .workflow_version_id
@@ -355,9 +367,15 @@ impl PostgresTransactionExecutor {
 
         transaction
             .execute(
-                "UPDATE agent_loom.runs SET current_checkpoint_id = $3 \
+                "UPDATE agent_loom.runs SET current_checkpoint_id = $3, \
+                    current_plan_revision_id = $4, current_plan_revision = 1 \
                  WHERE tenant_id = $1 AND run_id = $2",
-                &[&tenant_id, &run_id, &checkpoint_id],
+                &[
+                    &tenant_id,
+                    &run_id,
+                    &checkpoint_id,
+                    &uuid(command.initial_plan_revision.plan_revision_id.into_bytes()),
+                ],
             )
             .await
             .map_err(map_database_error)?;
@@ -3757,6 +3775,189 @@ impl PostgresTransactionExecutor {
     ) -> StoreResult<Committed<RunSnapshot>> {
         execute_control(self.config, client, context, command, ControlKind::Cancel).await
     }
+
+    /// Appends one immutable Plan revision and advances the Run projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for malformed snapshots, stale Run or Plan
+    /// expectations, terminal Runs, idempotency misuse, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn revise_plan(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: RevisePlan,
+    ) -> StoreResult<Committed<RunSnapshot>> {
+        validate_plan_revision(&command)?;
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        match acquire_receipt(
+            &transaction,
+            context,
+            db_now,
+            self.config.receipt_ttl_micros,
+        )
+        .await?
+        {
+            ReceiptGuard::Existing(receipt) => {
+                let snapshot = decode_run_receipt(context.tenant_id, &receipt.outcome)?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(committed_run(
+                    CommandDisposition::Duplicate,
+                    snapshot,
+                    receipt.event_id.map(event_id_from_uuid),
+                    Vec::new(),
+                ));
+            }
+            ReceiptGuard::Acquired => {}
+        }
+
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_id = uuid(command.expected_run.run_id.into_bytes());
+        let row = transaction
+            .query_opt(
+                "SELECT workflow_version_id, status, suspended_from_status, version, \
+                        execution_generation, next_event_sequence, current_checkpoint_id, \
+                        terminal_event_id, \
+                        CASE WHEN deadline IS NULL THEN NULL \
+                             ELSE (extract(epoch FROM deadline) * 1000000)::bigint END, \
+                        (extract(epoch FROM updated_at) * 1000000)::bigint, \
+                        current_plan_revision_id, current_plan_revision \
+                 FROM agent_loom.runs WHERE tenant_id = $1 AND run_id = $2 FOR UPDATE",
+                &[&tenant_id, &run_id],
+            )
+            .await
+            .map_err(map_database_error)?
+            .ok_or_else(|| store_error(StoreErrorCode::NotFound, "run was not found"))?;
+        let locked =
+            LockedControlRun::decode(context.tenant_id, command.expected_run.run_id, &row)?;
+        if locked.snapshot.status.is_terminal() {
+            return Err(store_error(StoreErrorCode::TerminalRun, "run is terminal"));
+        }
+        validate_plan_expectations(&command, &locked, row.get(11))?;
+        if locked
+            .snapshot
+            .deadline
+            .is_some_and(|deadline| deadline.get() <= db_now)
+        {
+            return Err(store_error(
+                StoreErrorCode::DeadlineExceeded,
+                "run deadline has elapsed",
+            ));
+        }
+        let parent_plan_revision_id: Uuid = row
+            .get::<_, Option<Uuid>>(10)
+            .ok_or_else(|| inconsistent("run has no current Plan revision"))?;
+        let next_plan_revision = command
+            .expected_plan_revision
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("Plan revision overflow"))?;
+        let next_plan_revision_i64 = to_i64(next_plan_revision, "Plan revision")?;
+        let event_id = uuid(command.event_id.into_bytes());
+        let change_summary = json_value(&command.revision.change_summary)?;
+        let event_payload = json!({
+            "plan_revision_id": command.revision.plan_revision_id.to_string(),
+            "parent_plan_revision_id": PlanRevisionId::from_bytes(parent_plan_revision_id.into_bytes()).to_string(),
+            "base_revision": command.expected_plan_revision,
+            "revision": next_plan_revision,
+            "schema_version": command.revision.schema_version,
+            "plan_key": command.revision.plan_key.as_str(),
+            "change_summary": change_summary,
+        });
+        insert_event(
+            &transaction,
+            EventInsert {
+                event_id,
+                tenant_id,
+                run_id,
+                sequence: locked.next_event_sequence_i64,
+                event_type: "run.plan_revised",
+                payload: &event_payload,
+                payload_schema_version: 1,
+                producer: "control-plane",
+                context,
+                correlation_id: uuid(context.correlation_id.into_bytes()),
+                occurred_at: None,
+                recorded_at: db_now,
+            },
+        )
+        .await?;
+        insert_plan_revision(
+            &transaction,
+            tenant_id,
+            run_id,
+            next_plan_revision_i64,
+            Some(parent_plan_revision_id),
+            db_now,
+            context,
+            &command.revision,
+        )
+        .await?;
+
+        let next_version_i64 = locked
+            .version_i64
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("run version overflow"))?;
+        let next_event_sequence_i64 = locked
+            .next_event_sequence_i64
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("run event sequence overflow"))?;
+        let plan_revision_id = uuid(command.revision.plan_revision_id.into_bytes());
+        let updated = transaction
+            .execute(
+                "UPDATE agent_loom.runs SET current_plan_revision_id = $5, \
+                    current_plan_revision = $6, version = $7, next_event_sequence = $8, \
+                    updated_at = to_timestamp(($9::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND run_id = $2 AND version = $3 \
+                   AND execution_generation = $4 AND current_plan_revision_id = $10 \
+                   AND current_plan_revision = $11",
+                &[
+                    &tenant_id,
+                    &run_id,
+                    &locked.version_i64,
+                    &locked.generation_i64,
+                    &plan_revision_id,
+                    &next_plan_revision_i64,
+                    &next_version_i64,
+                    &next_event_sequence_i64,
+                    &db_now,
+                    &parent_plan_revision_id,
+                    &to_i64(command.expected_plan_revision, "expected Plan revision")?,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if updated != 1 {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "run or Plan revision changed",
+            ));
+        }
+        let snapshot = RunSnapshot {
+            version: nonnegative_u64(next_version_i64, "run version")?,
+            next_event_sequence: nonnegative_u64(next_event_sequence_i64, "event sequence")?,
+            updated_at: UnixMicros::new(db_now),
+            ..locked.snapshot
+        };
+        let outcome = encode_run_receipt(&snapshot)?;
+        finish_receipt(
+            &transaction,
+            context,
+            "applied",
+            &outcome,
+            Some(event_id),
+            Some(("plan_revision", plan_revision_id, next_plan_revision_i64)),
+        )
+        .await?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(committed_run(
+            CommandDisposition::Applied,
+            snapshot,
+            Some(command.event_id),
+            Vec::new(),
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -6812,6 +7013,51 @@ async fn insert_event(transaction: &Transaction<'_>, event: EventInsert<'_>) -> 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn insert_plan_revision(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    revision: i64,
+    parent_plan_revision_id: Option<Uuid>,
+    db_now: i64,
+    context: &CommandContext,
+    plan_revision: &NewPlanRevision,
+) -> StoreResult<()> {
+    let plan_revision_id = uuid(plan_revision.plan_revision_id.into_bytes());
+    let schema_version = i64::from(plan_revision.schema_version);
+    let plan = json_value(&plan_revision.plan)?;
+    let change_summary = json_value(&plan_revision.change_summary)?;
+    let created_event_id = uuid(plan_revision.created_event_id.into_bytes());
+    transaction
+        .execute(
+            "INSERT INTO agent_loom.plan_revisions (\
+                plan_revision_id, tenant_id, run_id, revision, parent_plan_revision_id, \
+                schema_version, plan_key, plan_json, plan_digest, change_summary_json, \
+                created_event_id, created_by, created_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+                to_timestamp(($13::bigint)::double precision / 1000000.0))",
+            &[
+                &plan_revision_id,
+                &tenant_id,
+                &run_id,
+                &revision,
+                &parent_plan_revision_id,
+                &schema_version,
+                &plan_revision.plan_key.as_str(),
+                &plan,
+                &plan_revision.plan_digest.as_bytes().as_slice(),
+                &change_summary,
+                &created_event_id,
+                &context.actor_ref,
+                &db_now,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    Ok(())
+}
+
 async fn insert_initial_task(
     transaction: &Transaction<'_>,
     tenant_id: Uuid,
@@ -7508,7 +7754,13 @@ async fn insert_new_task(
 
 fn validate_create_run(command: &CreateRun) -> StoreResult<()> {
     let checkpoint = &command.initial_checkpoint;
-    if checkpoint.created_event_id != command.initial_event_id
+    let plan_revision = &command.initial_plan_revision;
+    let computed_plan_digest: [u8; 32] = Sha256::digest(plan_revision.plan.as_bytes()).into();
+    if plan_revision.created_event_id != command.initial_event_id
+        || plan_revision.plan_revision_id.is_nil()
+        || plan_revision.schema_version == 0
+        || computed_plan_digest != *plan_revision.plan_digest.as_bytes()
+        || checkpoint.created_event_id != command.initial_event_id
         || checkpoint.sequence != 1
         || checkpoint.schema_version == 0
         || checkpoint.execution_generation != 0
@@ -7544,6 +7796,47 @@ fn validate_create_run(command: &CreateRun) -> StoreResult<()> {
     {
         return Err(invalid_command(
             "create_run initial event/checkpoint/stage/task shape is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_plan_revision(command: &RevisePlan) -> StoreResult<()> {
+    let revision = &command.revision;
+    let computed_digest: [u8; 32] = Sha256::digest(revision.plan.as_bytes()).into();
+    if command.expected_plan_revision == 0
+        || command.event_id.is_nil()
+        || revision.plan_revision_id.is_nil()
+        || revision.created_event_id != command.event_id
+        || revision.schema_version == 0
+        || computed_digest != *revision.plan_digest.as_bytes()
+    {
+        return Err(invalid_command("Plan revision shape is invalid"));
+    }
+    json_value(&revision.plan)?;
+    json_value(&revision.change_summary)?;
+    Ok(())
+}
+
+fn validate_plan_expectations(
+    command: &RevisePlan,
+    locked: &LockedControlRun,
+    current_plan_revision: i64,
+) -> StoreResult<()> {
+    let expected_plan_revision = to_i64(command.expected_plan_revision, "expected Plan revision")?;
+    if command
+        .expected_run
+        .version
+        .is_some_and(|expected| expected != locked.snapshot.version)
+        || command
+            .expected_run
+            .execution_generation
+            .is_some_and(|expected| expected != locked.snapshot.execution_generation)
+        || expected_plan_revision != current_plan_revision
+    {
+        return Err(store_error(
+            StoreErrorCode::VersionConflict,
+            "run or Plan revision expectation changed",
         ));
     }
     Ok(())
@@ -8942,6 +9235,7 @@ mod tests {
             input: payload(&json!({"request": "smoke"})),
             deadline: None,
             initial_event_id,
+            initial_plan_revision: smoke_plan_revision(run_id, initial_event_id, "smoke"),
             initial_checkpoint: NewCheckpoint {
                 checkpoint_id,
                 sequence: 1,
@@ -9523,6 +9817,11 @@ mod tests {
                     input: payload(&json!({"request": "control-smoke"})),
                     deadline: None,
                     initial_event_id: control_initial_event,
+                    initial_plan_revision: smoke_plan_revision(
+                        control_run_id,
+                        control_initial_event,
+                        "control-smoke",
+                    ),
                     initial_checkpoint: NewCheckpoint {
                         checkpoint_id: CheckpointId::from_bytes(ids(15)),
                         sequence: 1,
@@ -9810,6 +10109,7 @@ mod tests {
             input: payload(&json!({"request": label})),
             deadline: None,
             initial_event_id: event_id,
+            initial_plan_revision: smoke_plan_revision(run_id, event_id, label),
             initial_checkpoint: NewCheckpoint {
                 checkpoint_id,
                 sequence: 1,
@@ -9832,6 +10132,19 @@ mod tests {
                 max_attempts: 3,
                 input: payload(&json!({"prompt": label})),
             }],
+        }
+    }
+
+    fn smoke_plan_revision(run_id: RunId, event_id: EventId, label: &str) -> NewPlanRevision {
+        let plan = payload(&json!({"schema": 1, "label": label}));
+        NewPlanRevision {
+            plan_revision_id: PlanRevisionId::from_bytes(run_id.into_bytes()),
+            schema_version: 1,
+            plan_key: LogicalKey::parse(format!("smoke/{label}")).expect("logical key"),
+            plan_digest: Digest::from_bytes(Sha256::digest(plan.as_bytes()).into()),
+            plan,
+            change_summary: payload(&json!({"kind": "initial"})),
+            created_event_id: event_id,
         }
     }
 

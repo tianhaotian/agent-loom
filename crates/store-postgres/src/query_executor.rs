@@ -1,9 +1,9 @@
 use agent_loom_domain::{
     AgentExecutionId, AgentExecutionSnapshot, AgentVersionId, ArtifactId, ArtifactRefSnapshot,
     ArtifactVersionRef, CheckpointId, Digest, EndpointId, EventId, EventRecord, IdempotencyKey,
-    JsonPayload, LogicalKey, RunId, RunSnapshot, ScopeKey, StageExecutionId,
-    StageExecutionSnapshot, StageStatus, TaskId, TenantId, ToolExecutionId, UnixMicros, WaitId,
-    WaitSnapshot, WaitStatus, WorkflowId, WorkflowSnapshot, WorkflowVersionId,
+    JsonPayload, LogicalKey, PlanRevisionId, PlanRevisionSnapshot, RunId, RunSnapshot, ScopeKey,
+    StageExecutionId, StageExecutionSnapshot, StageStatus, TaskId, TenantId, ToolExecutionId,
+    UnixMicros, WaitId, WaitSnapshot, WaitStatus, WorkflowId, WorkflowSnapshot, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
     AgentEventCandidate, AgentEventPage, AgentEventQuery, AgentInvocation, AgentStatusCandidate,
@@ -58,6 +58,36 @@ impl crate::PostgresTransactionExecutor {
             .map_err(map_database_error)?;
         row.map(|row| decode_run(context.tenant_id, &row))
             .transpose()
+    }
+
+    /// Lists immutable Plan revisions for one Run in revision order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for unavailable PostgreSQL or invalid
+    /// persisted revision metadata.
+    pub async fn list_plan_revisions(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        run_id: RunId,
+    ) -> StoreResult<Vec<PlanRevisionSnapshot>> {
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_uuid = uuid(run_id.into_bytes());
+        client
+            .query(
+                "SELECT plan_revision_id, revision, parent_plan_revision_id, schema_version, \
+                        plan_key, plan_json, plan_digest, change_summary_json, created_event_id, \
+                        created_by, (extract(epoch FROM created_at) * 1000000)::bigint \
+                 FROM agent_loom.plan_revisions WHERE tenant_id = $1 AND run_id = $2 \
+                 ORDER BY revision, plan_revision_id",
+                &[&tenant_id, &run_uuid],
+            )
+            .await
+            .map_err(map_database_error)?
+            .iter()
+            .map(|row| decode_plan_revision(context.tenant_id, run_id, row))
+            .collect()
     }
 
     /// Reads the latest published/draft version of a Workflow definition.
@@ -670,6 +700,36 @@ fn decode_digest(value: Vec<u8>, field: &str) -> StoreResult<Digest> {
         .try_into()
         .map_err(|_| inconsistent(&format!("{field} has an invalid length")))?;
     Ok(Digest::from_bytes(bytes))
+}
+
+fn decode_plan_revision(
+    tenant_id: TenantId,
+    run_id: RunId,
+    row: &Row,
+) -> StoreResult<PlanRevisionSnapshot> {
+    let schema_version = u32::try_from(row.get::<_, i64>(3))
+        .map_err(|_| inconsistent("Plan schema version exceeds u32 range"))?;
+    if schema_version == 0 {
+        return Err(inconsistent("Plan schema version is zero"));
+    }
+    Ok(PlanRevisionSnapshot {
+        tenant_id,
+        plan_revision_id: PlanRevisionId::from_bytes(row.get::<_, Uuid>(0).into_bytes()),
+        run_id,
+        revision: nonnegative_u64(row.get(1), "Plan revision")?,
+        parent_plan_revision_id: row
+            .get::<_, Option<Uuid>>(2)
+            .map(|id| PlanRevisionId::from_bytes(id.into_bytes())),
+        schema_version,
+        plan_key: LogicalKey::parse(row.get::<_, String>(4))
+            .map_err(|_| inconsistent("Plan revision has an invalid key"))?,
+        plan: decode_json_payload(&row.get(5))?,
+        plan_digest: decode_digest(row.get(6), "Plan digest")?,
+        change_summary: decode_json_payload(&row.get(7))?,
+        created_event_id: event_id_from_uuid(row.get(8)),
+        created_by: row.get(9),
+        created_at: UnixMicros::new(row.get(10)),
+    })
 }
 
 fn decode_agent_stop(tenant_id: TenantId, row: &Row) -> StoreResult<AgentStopCandidate> {

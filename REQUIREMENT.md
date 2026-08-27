@@ -233,7 +233,9 @@ GET  /v1/runs/{run_id}
 GET  /v1/runs/{run_id}/events
 GET  /v1/runs/{run_id}/stages
 GET  /v1/runs/{run_id}/artifacts
+GET  /v1/runs/{run_id}/plan-revisions
 POST /v1/runs/{run_id}/events
+POST /v1/runs/{run_id}/plan-revisions
 POST /v1/runs/{run_id}/pause
 POST /v1/runs/{run_id}/resume
 POST /v1/runs/{run_id}/cancel
@@ -313,6 +315,7 @@ events            不可变事件与审计日志
 tasks             可领取工作、重试与 Lease
 task_attempts      Task 领取、Lease 与尝试审计
 checkpoints       可恢复执行快照
+plan_revisions    不可变 ExecutionPlan 快照、父 revision 与变更审计
 stage_executions  业务阶段、门禁、负责人和返工关系
 tool_executions   外部副作用幂等记录
 tool_execution_attempts 外部工具尝试审计

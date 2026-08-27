@@ -2,15 +2,16 @@ use std::{error::Error, fmt};
 
 use agent_loom_domain::{
     CheckpointId, CommandId, CorrelationId, Digest, DurationMicros, EventId, IdempotencyKey,
-    JsonPayload, LeaseToken, LogicalKey, RunId, RunStatus, ScopeKey, TaskId, TaskKind, TenantId,
-    UnixMicros, WaitStatus, WorkerId,
+    JsonPayload, LeaseToken, LogicalKey, PlanRevisionId, RunId, RunStatus, ScopeKey, TaskId,
+    TaskKind, TenantId, UnixMicros, WaitStatus, WorkerId,
 };
 use agent_loom_durable_store::{
     ApplyEvent, ClaimTask, ClaimedTask, CommandContext, CompleteTask, ControlRun, CreateRun,
     DurableStore, EventCursor, ExpectedRun, FinalRunResult, InitialTask, LeaseProof, NewCheckpoint,
-    NewWaitSubscription, NextActions, QueryContext, SignatureVerification, StoreError, TaskResult,
-    WaitResumeTask, conformance::ConformanceCase,
+    NewPlanRevision, NewWaitSubscription, NextActions, QueryContext, SignatureVerification,
+    StoreError, TaskResult, WaitResumeTask, conformance::ConformanceCase,
 };
+use sha2::{Digest as _, Sha256};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Phase2aReliabilityFixture {
@@ -402,6 +403,7 @@ async fn create_task_run(
                 input: empty_payload(),
                 deadline: None,
                 initial_event_id,
+                initial_plan_revision: initial_plan_revision(run_id, initial_event_id),
                 initial_checkpoint: NewCheckpoint {
                     checkpoint_id: initial_checkpoint_id,
                     sequence: 1,
@@ -607,6 +609,19 @@ fn checkpoint_id(fixture: &Phase2aReliabilityFixture, tag: u16) -> CheckpointId 
 
 fn empty_payload() -> JsonPayload {
     JsonPayload::from_validated_bytes(b"{}".to_vec())
+}
+
+fn initial_plan_revision(run_id: RunId, event_id: EventId) -> NewPlanRevision {
+    let plan = empty_payload();
+    NewPlanRevision {
+        plan_revision_id: PlanRevisionId::from_bytes(run_id.into_bytes()),
+        schema_version: 1,
+        plan_key: LogicalKey::parse("conformance/initial").expect("static logical key"),
+        plan_digest: Digest::from_bytes(Sha256::digest(plan.as_bytes()).into()),
+        plan,
+        change_summary: empty_payload(),
+        created_event_id: event_id,
+    }
 }
 
 fn require(

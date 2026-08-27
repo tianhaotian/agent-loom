@@ -39,6 +39,7 @@ mod tests {
         "agent_executions",
         "agent_event_receipts",
         "outbox_messages",
+        "plan_revisions",
     ];
 
     #[test]

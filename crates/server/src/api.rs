@@ -7,12 +7,13 @@ use std::{
 };
 
 use agent_loom_domain::{
-    AgentVersionId, CheckpointId, EventId, JsonPayload, LogicalKey, RunId, RunSnapshot, RunStatus,
-    StageStatus, TenantId, UnixMicros, WaitStatus, WorkflowId,
+    AgentVersionId, CheckpointId, EventId, JsonPayload, LogicalKey, PlanRevisionId, RunId,
+    RunSnapshot, RunStatus, StageStatus, TenantId, UnixMicros, WaitStatus, WorkflowId,
 };
 use agent_loom_durable_store::{
     ApplyEvent, CommandDisposition, ControlRun, CreateRun, DurableStore, EventCursor, ExpectedRun,
-    NewCheckpoint, QueryContext, SignatureVerification, StoreError, StoreErrorCode,
+    NewCheckpoint, NewPlanRevision, QueryContext, RevisePlan, SignatureVerification, StoreError,
+    StoreErrorCode,
 };
 use axum::{
     Json, Router,
@@ -61,6 +62,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/workflows/{workflow_id}", get(get_workflow))
         .route("/v1/runs", post(create_run))
         .route("/v1/runs/{run_id}", get(get_run))
+        .route(
+            "/v1/runs/{run_id}/plan-revisions",
+            get(list_plan_revisions).post(revise_plan),
+        )
         .route(
             "/v1/runs/{run_id}/events",
             get(list_events).post(apply_event),
@@ -243,6 +248,7 @@ async fn create_run(
         materialize_execution_plan(&plan, run_id, &request.input, UnixMicros::new(now_micros()))
             .map_err(|error| ApiError::internal(error.to_string()))?;
     let initial_event_id = EventId::from_bytes(random_id());
+    let initial_plan = workflow.spec.clone();
     let command = CreateRun {
         run_id,
         workflow_version_id: Some(workflow.workflow_version_id),
@@ -250,6 +256,15 @@ async fn create_run(
         input: payload(&request.input)?,
         deadline: request.deadline_micros.map(UnixMicros::new),
         initial_event_id,
+        initial_plan_revision: NewPlanRevision {
+            plan_revision_id: PlanRevisionId::from_bytes(random_id()),
+            schema_version: plan.schema_version,
+            plan_key: plan.plan_key.clone(),
+            plan: initial_plan,
+            plan_digest: workflow.spec_digest,
+            change_summary: payload(&json!({"kind": "initial"}))?,
+            created_event_id: initial_event_id,
+        },
         initial_checkpoint: NewCheckpoint {
             checkpoint_id: CheckpointId::from_bytes(random_id()),
             sequence: 1,
@@ -286,6 +301,132 @@ async fn get_run(
         .map(RunResponse::from)
         .map(Json)
         .ok_or_else(|| ApiError::not_found("Run was not found"))
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RevisePlanRequest {
+    base_revision: u64,
+    plan: Value,
+    #[serde(default = "empty_object")]
+    change_summary: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct RevisePlanResponse {
+    run: RunResponse,
+    plan_revision: u64,
+    disposition: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct PlanRevisionResponse {
+    plan_revision_id: String,
+    revision: u64,
+    parent_plan_revision_id: Option<String>,
+    schema_version: u32,
+    plan_key: String,
+    plan: Value,
+    plan_digest: String,
+    change_summary: Value,
+    created_event_id: String,
+    created_by: String,
+    created_at_micros: i64,
+}
+
+async fn revise_plan(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<RevisePlanRequest>,
+) -> ApiResult<Json<RevisePlanResponse>> {
+    if request.base_revision == 0 {
+        return Err(ApiError::bad_request("base_revision must be positive"));
+    }
+    let run_id = parse_run_id(&run_id)?;
+    let run = load_run(&state, run_id).await?;
+    let plan_payload = payload(&request.plan)?;
+    let plan = parse_execution_plan(&plan_payload)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let change_summary = payload(&request.change_summary)?;
+    let key = required_idempotency(&headers)?;
+    let request_bytes = serde_json::to_vec(&request)
+        .map_err(|_| ApiError::bad_request("Plan revision request cannot be encoded"))?;
+    let identity = format!("api-plan-revision/{run_id}/{key}");
+    let context = command_context(
+        state.tenant_id,
+        run_id,
+        API_ACTOR,
+        "revise_plan",
+        &identity,
+        &request_bytes,
+    )
+    .map_err(ApiError::bad_request)?;
+    let event_id = EventId::from_bytes(crate::identity::derived_id("event", &identity));
+    let committed = state
+        .store
+        .revise_plan(
+            &context,
+            RevisePlan {
+                expected_run: expected(&run),
+                expected_plan_revision: request.base_revision,
+                event_id,
+                revision: NewPlanRevision {
+                    plan_revision_id: PlanRevisionId::from_bytes(crate::identity::derived_id(
+                        "plan-revision",
+                        &identity,
+                    )),
+                    schema_version: plan.schema_version,
+                    plan_key: plan.plan_key,
+                    plan_digest: hash_bytes(plan_payload.as_bytes()),
+                    plan: plan_payload,
+                    change_summary,
+                    created_event_id: event_id,
+                },
+            },
+        )
+        .await?;
+    let plan_revision = request
+        .base_revision
+        .checked_add(1)
+        .ok_or_else(|| ApiError::bad_request("Plan revision exceeds supported range"))?;
+    Ok(Json(RevisePlanResponse {
+        run: committed.value.into(),
+        plan_revision,
+        disposition: disposition(committed.disposition),
+    }))
+}
+
+async fn list_plan_revisions(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> ApiResult<Json<Vec<PlanRevisionResponse>>> {
+    let run_id = parse_run_id(&run_id)?;
+    load_run(&state, run_id).await?;
+    let revisions = state
+        .store
+        .list_plan_revisions(&query_context(&state), run_id)
+        .await?
+        .into_iter()
+        .map(|revision| PlanRevisionResponse {
+            plan_revision_id: revision.plan_revision_id.to_string(),
+            revision: revision.revision,
+            parent_plan_revision_id: revision.parent_plan_revision_id.map(|id| id.to_string()),
+            schema_version: revision.schema_version,
+            plan_key: revision.plan_key.into_string(),
+            plan: serde_json::from_slice(revision.plan.as_bytes()).unwrap_or(Value::Null),
+            plan_digest: hex(revision.plan_digest.as_bytes()),
+            change_summary: serde_json::from_slice(revision.change_summary.as_bytes())
+                .unwrap_or(Value::Null),
+            created_event_id: revision.created_event_id.to_string(),
+            created_by: revision.created_by,
+            created_at_micros: revision.created_at.get(),
+        })
+        .collect();
+    Ok(Json(revisions))
+}
+
+fn empty_object() -> Value {
+    json!({})
 }
 
 #[derive(Debug, Deserialize)]

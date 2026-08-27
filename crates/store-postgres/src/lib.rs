@@ -117,6 +117,12 @@ pub const MIGRATIONS: &[EmbeddedMigration] = &[
         created_tables: &["outbox_messages"],
         sql: include_str!("../migrations/0014_transactional_outbox.sql"),
     },
+    EmbeddedMigration {
+        logical_id: "0015_plan_revisions",
+        logical_model_version: 16,
+        created_tables: &["plan_revisions"],
+        sql: include_str!("../migrations/0015_plan_revisions.sql"),
+    },
 ];
 
 pub const fn capabilities() -> StoreCapabilities {
@@ -149,7 +155,7 @@ mod tests {
 
     #[test]
     fn migration_batch_is_embedded() {
-        assert_eq!(MIGRATIONS.len(), 15);
+        assert_eq!(MIGRATIONS.len(), 16);
         assert_eq!(MIGRATIONS[0].logical_id, "0000_migration_meta");
         assert!(MIGRATIONS[0].sql.contains("schema_migrations"));
         assert!(MIGRATIONS[0].sql.contains("timestamptz(6)"));

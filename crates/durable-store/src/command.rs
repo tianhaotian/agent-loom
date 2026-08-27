@@ -1,8 +1,8 @@
 use agent_loom_domain::{
     AgentVersionId, ArtifactId, ArtifactVersionRef, CheckpointId, CommandId, CorrelationId, Digest,
-    DurationMicros, EventId, IdempotencyKey, JsonPayload, LeaseToken, LogicalKey, RunId, RunStatus,
-    ScopeKey, StageExecutionId, StageStatus, TaskId, TaskKind, TenantId, UnixMicros, WaitId,
-    WorkerId, WorkflowVersionId,
+    DurationMicros, EventId, IdempotencyKey, JsonPayload, LeaseToken, LogicalKey, PlanRevisionId,
+    RunId, RunStatus, ScopeKey, StageExecutionId, StageStatus, TaskId, TaskKind, TenantId,
+    UnixMicros, WaitId, WorkerId, WorkflowVersionId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,9 +58,29 @@ pub struct CreateRun {
     pub input: JsonPayload,
     pub deadline: Option<UnixMicros>,
     pub initial_event_id: EventId,
+    pub initial_plan_revision: NewPlanRevision,
     pub initial_checkpoint: NewCheckpoint,
     pub initial_stages: Vec<InitialStage>,
     pub initial_tasks: Vec<InitialTask>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewPlanRevision {
+    pub plan_revision_id: PlanRevisionId,
+    pub schema_version: u32,
+    pub plan_key: LogicalKey,
+    pub plan: JsonPayload,
+    pub plan_digest: Digest,
+    pub change_summary: JsonPayload,
+    pub created_event_id: EventId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevisePlan {
+    pub expected_run: ExpectedRun,
+    pub expected_plan_revision: u64,
+    pub event_id: EventId,
+    pub revision: NewPlanRevision,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

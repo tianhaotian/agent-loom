@@ -816,7 +816,7 @@ async fn transactional_outbox_recovers_expired_publish_leases_without_losing_eve
         .duration_since(UNIX_EPOCH)
         .expect("system clock after epoch")
         .as_nanos();
-    let application = bootstrap_outbox_test(&database_url, nonce).await;
+    let (application, _) = bootstrap_outbox_test(&database_url, nonce).await;
     let query = QueryContext {
         tenant_id: application.tenant_id,
         actor_ref: "outbox-e2e".to_owned(),
@@ -906,10 +906,142 @@ async fn transactional_outbox_recovers_expired_publish_leases_without_losing_eve
     );
 }
 
+#[tokio::test]
+async fn plan_revisions_are_version_fenced_idempotent_and_auditable() {
+    let Ok(database_url) = std::env::var("AGENT_LOOM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos();
+    let (application, run_id) = bootstrap_outbox_test(&database_url, nonce).await;
+    let initial = get_plan_revisions(&application, &run_id).await;
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0]["revision"], 1);
+    assert!(initial[0]["parent_plan_revision_id"].is_null());
+
+    let mut revised_plan = initial[0]["plan"].clone();
+    revised_plan["extension"] = json!({"revision_test": 2});
+    let request = json!({
+        "base_revision": 1,
+        "plan": revised_plan,
+        "change_summary": {"reason": "add revision fencing"},
+    });
+    let applied = post_plan_revision(&application, &run_id, "plan-revision-2", &request).await;
+    assert_eq!(applied.status(), StatusCode::OK);
+    let applied_body: Value = serde_json::from_slice(
+        &to_bytes(applied.into_body(), 64 * 1024)
+            .await
+            .expect("read Plan revision response"),
+    )
+    .expect("decode Plan revision response");
+    assert_eq!(applied_body["plan_revision"], 2);
+    assert_eq!(applied_body["disposition"], "applied");
+
+    let duplicate = post_plan_revision(&application, &run_id, "plan-revision-2", &request).await;
+    assert_eq!(duplicate.status(), StatusCode::OK);
+    let duplicate_body: Value = serde_json::from_slice(
+        &to_bytes(duplicate.into_body(), 64 * 1024)
+            .await
+            .expect("read duplicate Plan revision response"),
+    )
+    .expect("decode duplicate Plan revision response");
+    assert_eq!(duplicate_body["disposition"], "duplicate");
+
+    let stale = post_plan_revision(&application, &run_id, "stale-plan-revision", &request).await;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let revisions = get_plan_revisions(&application, &run_id).await;
+    assert_eq!(revisions.len(), 2);
+    assert_eq!(revisions[1]["revision"], 2);
+    assert_eq!(
+        revisions[1]["parent_plan_revision_id"],
+        revisions[0]["plan_revision_id"]
+    );
+
+    let event_response = application
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/runs/{run_id}/events"))
+                .header("authorization", "Bearer mvp-e2e-api-key")
+                .body(Body::empty())
+                .expect("build Event history request"),
+        )
+        .await
+        .expect("Event history response");
+    let events: Value = serde_json::from_slice(
+        &to_bytes(event_response.into_body(), 256 * 1024)
+            .await
+            .expect("read Event history"),
+    )
+    .expect("decode Event history");
+    assert_eq!(
+        events["events"]
+            .as_array()
+            .expect("Event history array")
+            .iter()
+            .filter(|event| event["event_type"] == "run.plan_revised")
+            .count(),
+        1
+    );
+}
+
+async fn get_plan_revisions(
+    application: &agent_loom_server::BootstrappedServer,
+    run_id: &str,
+) -> Vec<Value> {
+    let response = application
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/runs/{run_id}/plan-revisions"))
+                .header("authorization", "Bearer mvp-e2e-api-key")
+                .body(Body::empty())
+                .expect("build list Plan revisions request"),
+        )
+        .await
+        .expect("list Plan revisions response");
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_slice(
+        &to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .expect("read Plan revisions"),
+    )
+    .expect("decode Plan revisions")
+}
+
+async fn post_plan_revision(
+    application: &agent_loom_server::BootstrappedServer,
+    run_id: &str,
+    idempotency_key: &str,
+    request: &Value,
+) -> axum::response::Response {
+    application
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/runs/{run_id}/plan-revisions"))
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer mvp-e2e-api-key")
+                .header("idempotency-key", idempotency_key)
+                .body(Body::from(
+                    serde_json::to_vec(request).expect("encode Plan revision request"),
+                ))
+                .expect("build Plan revision request"),
+        )
+        .await
+        .expect("Plan revision response")
+}
+
 async fn bootstrap_outbox_test(
     database_url: &str,
     nonce: u128,
-) -> agent_loom_server::BootstrappedServer {
+) -> (agent_loom_server::BootstrappedServer, String) {
     let application = bootstrap(&ServerConfig {
         database_url: database_url.to_owned(),
         bind: "127.0.0.1:0".to_owned(),
@@ -936,7 +1068,17 @@ async fn bootstrap_outbox_test(
         .await
         .expect("create Run response");
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    application
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read create Run response"),
+    )
+    .expect("decode create Run response");
+    let run_id = body["run"]["run_id"]
+        .as_str()
+        .expect("create response contains Run ID")
+        .to_owned();
+    (application, run_id)
 }
 
 fn test_id(nonce: u128, label: &str) -> [u8; 16] {

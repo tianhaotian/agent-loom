@@ -49,6 +49,7 @@ dependencies = [
  "agent-loom-store-mysql",
  "agent-loom-store-postgres",
  "deadpool-postgres",
+ "sha2 0.10.9",
  "tokio",
  "tokio-postgres",
  "uuid",
