@@ -1,19 +1,20 @@
 use agent_loom_domain::{
     AgentEventReceiptId, AgentExecutionId, AgentExecutionSnapshot, AgentExecutionStatus,
-    AgentVersionId, CheckpointId, EndpointId, EventId, JoinPolicy, JsonPayload, LogicalKey,
-    OutboxId, OutboxMessage, PlanRevisionId, RunId, RunSnapshot, RunStatus, StageExecutionId,
-    StageStatus, TaskId, TaskKind, TaskSnapshot, TaskStatus, TenantId, ToolExecutionId,
-    ToolExecutionSnapshot, ToolExecutionStatus, UnixMicros, WorkflowVersionId,
+    AgentVersionId, CheckpointId, ContextMergeStrategy, ContextSnapshotId, EndpointId, EventId,
+    JoinPolicy, JsonPayload, LogicalKey, OutboxId, OutboxMessage, PlanRevisionId, RunId,
+    RunSnapshot, RunStatus, StageExecutionId, StageStatus, TaskId, TaskKind, TaskSnapshot,
+    TaskStatus, TenantId, ToolExecutionId, ToolExecutionSnapshot, ToolExecutionStatus, UnixMicros,
+    WorkflowVersionId,
 };
 use agent_loom_durable_store::{
     AgentEventBatchOutcome, AgentEventExecutionOutcome, AgentSubmissionOutcome,
-    AgentWorkflowAction, AppendAgentEvents, ApplyDueWork, ApplyEvent, ApplyMaintenance,
-    BeginAgentResubmission, BeginToolRetryAttempt, ClaimOutbox, ClaimTask, ClaimedTask,
-    CommandContext, CommandDisposition, Committed, CompleteTask, CompletionShapeError, ControlRun,
-    CreateRun, DueWorkOutcome, DueWorkTarget, DurableFollowUp, ExecutionRetryClass, ExpectedRun,
-    FailTask, InitialStage, InitialTask, LeaseExpiryAction, LeaseProof, LeaseReclaimOutcome,
-    MaintenanceOutcome, MaintenanceTarget, NewArtifactRef, NewPlanRevision, NewTask,
-    NewWaitSubscription, NextActions, NormalizedAgentEventInput, OutboxDeliveryOutcome,
+    AgentWorkflowAction, AppendAgentEvents, ApplyContextPatch, ApplyDueWork, ApplyEvent,
+    ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt, ClaimOutbox, ClaimTask,
+    ClaimedTask, CommandContext, CommandDisposition, Committed, CompleteTask, CompletionShapeError,
+    ControlRun, CreateRun, DueWorkOutcome, DueWorkTarget, DurableFollowUp, ExecutionRetryClass,
+    ExpectedRun, FailTask, InitialStage, InitialTask, LeaseExpiryAction, LeaseProof,
+    LeaseReclaimOutcome, MaintenanceOutcome, MaintenanceTarget, NewArtifactRef, NewPlanRevision,
+    NewTask, NewWaitSubscription, NextActions, NormalizedAgentEventInput, OutboxDeliveryOutcome,
     PostCommitHint, PrepareAgentExecution, PrepareToolExecution, QueryContext, ReclaimExpiredLease,
     RecordAgentOutcome, RecordAgentSubmission, RecordOutboxDelivery, RecordToolOutcome,
     RenewTaskLease, RevisePlan, SignatureVerification, StoreError, StoreErrorCode, StoreResult,
@@ -326,6 +327,17 @@ impl PostgresTransactionExecutor {
             &command.initial_plan_revision,
         )
         .await?;
+        insert_context_snapshot(
+            &transaction,
+            tenant_id,
+            run_id,
+            1,
+            None,
+            db_now,
+            context,
+            &command.initial_context,
+        )
+        .await?;
 
         let checkpoint_workflow_version_id = command
             .initial_checkpoint
@@ -369,13 +381,15 @@ impl PostgresTransactionExecutor {
         transaction
             .execute(
                 "UPDATE agent_loom.runs SET current_checkpoint_id = $3, \
-                    current_plan_revision_id = $4, current_plan_revision = 1 \
+                    current_plan_revision_id = $4, current_plan_revision = 1, \
+                    current_context_snapshot_id = $5, current_context_revision = 1 \
                  WHERE tenant_id = $1 AND run_id = $2",
                 &[
                     &tenant_id,
                     &run_id,
                     &checkpoint_id,
                     &uuid(command.initial_plan_revision.plan_revision_id.into_bytes()),
+                    &uuid(command.initial_context.context_snapshot_id.into_bytes()),
                 ],
             )
             .await
@@ -4039,6 +4053,260 @@ impl PostgresTransactionExecutor {
                 .collect(),
         ))
     }
+
+    /// Applies a fenced Context patch and appends an immutable snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for malformed JSON, stale Run or Context
+    /// expectations, terminal Runs, idempotency misuse, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn apply_context_patch(
+        &self,
+        client: &mut Client,
+        context: &CommandContext,
+        command: ApplyContextPatch,
+    ) -> StoreResult<Committed<RunSnapshot>> {
+        validate_context_patch(&command)?;
+        let transaction = client.transaction().await.map_err(map_database_error)?;
+        let db_now = database_now(&transaction).await?;
+        match acquire_receipt(
+            &transaction,
+            context,
+            db_now,
+            self.config.receipt_ttl_micros,
+        )
+        .await?
+        {
+            ReceiptGuard::Existing(receipt) => {
+                let snapshot = decode_run_receipt(context.tenant_id, &receipt.outcome)?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(committed_run(
+                    CommandDisposition::Duplicate,
+                    snapshot,
+                    receipt.event_id.map(event_id_from_uuid),
+                    Vec::new(),
+                ));
+            }
+            ReceiptGuard::Acquired => {}
+        }
+
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_id = uuid(command.expected_run.run_id.into_bytes());
+        let row = transaction
+            .query_opt(
+                "SELECT r.workflow_version_id, r.status, r.suspended_from_status, r.version, \
+                        r.execution_generation, r.next_event_sequence, r.current_checkpoint_id, \
+                        r.terminal_event_id, \
+                        CASE WHEN r.deadline IS NULL THEN NULL \
+                             ELSE (extract(epoch FROM r.deadline) * 1000000)::bigint END, \
+                        (extract(epoch FROM r.updated_at) * 1000000)::bigint, \
+                        r.current_context_snapshot_id, r.current_context_revision, c.context_json \
+                 FROM agent_loom.runs r \
+                 JOIN agent_loom.context_snapshots c \
+                   ON c.tenant_id = r.tenant_id AND c.run_id = r.run_id \
+                  AND c.context_snapshot_id = r.current_context_snapshot_id \
+                 WHERE r.tenant_id = $1 AND r.run_id = $2 FOR UPDATE OF r",
+                &[&tenant_id, &run_id],
+            )
+            .await
+            .map_err(map_database_error)?
+            .ok_or_else(|| store_error(StoreErrorCode::NotFound, "run was not found"))?;
+        let locked =
+            LockedControlRun::decode(context.tenant_id, command.expected_run.run_id, &row)?;
+        if locked.snapshot.status.is_terminal() {
+            return Err(store_error(StoreErrorCode::TerminalRun, "run is terminal"));
+        }
+        if command
+            .expected_run
+            .version
+            .is_some_and(|expected| expected != locked.snapshot.version)
+            || command
+                .expected_run
+                .execution_generation
+                .is_some_and(|expected| expected != locked.snapshot.execution_generation)
+            || to_i64(
+                command.expected_context_revision,
+                "expected Context revision",
+            )? != row.get::<_, i64>(11)
+        {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "run or Context revision expectation changed",
+            ));
+        }
+        if locked
+            .snapshot
+            .deadline
+            .is_some_and(|deadline| deadline.get() <= db_now)
+        {
+            return Err(store_error(
+                StoreErrorCode::DeadlineExceeded,
+                "run deadline has elapsed",
+            ));
+        }
+
+        let parent_context_snapshot_id: Uuid = row
+            .get::<_, Option<Uuid>>(10)
+            .ok_or_else(|| inconsistent("run has no current Context snapshot"))?;
+        let mut value: Value = row.get(12);
+        let patch = json_value(&command.patch)?;
+        match command.merge_strategy {
+            ContextMergeStrategy::Replace => value = patch.clone(),
+            ContextMergeStrategy::MergePatch => merge_json_patch(&mut value, &patch),
+        }
+        let value_payload = JsonPayload::from_validated_bytes(
+            serde_json::to_vec(&value).map_err(|_| invalid_command("Context cannot be encoded"))?,
+        );
+        let digest =
+            agent_loom_domain::Digest::from_bytes(Sha256::digest(value_payload.as_bytes()).into());
+        let next_revision = command
+            .expected_context_revision
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("Context revision overflow"))?;
+        let next_revision_i64 = to_i64(next_revision, "Context revision")?;
+        let event_id = uuid(command.event_id.into_bytes());
+        let context_snapshot_id = uuid(command.context_snapshot_id.into_bytes());
+        let merge_strategy = match command.merge_strategy {
+            ContextMergeStrategy::Replace => "replace",
+            ContextMergeStrategy::MergePatch => "merge_patch",
+        };
+        let event_payload = json!({
+            "context_snapshot_id": command.context_snapshot_id.to_string(),
+            "parent_context_snapshot_id": ContextSnapshotId::from_bytes(parent_context_snapshot_id.into_bytes()).to_string(),
+            "base_revision": command.expected_context_revision,
+            "revision": next_revision,
+            "schema_version": command.schema_version,
+            "merge_strategy": merge_strategy,
+            "context_digest": digest.as_bytes(),
+        });
+        insert_event(
+            &transaction,
+            EventInsert {
+                event_id,
+                tenant_id,
+                run_id,
+                sequence: locked.next_event_sequence_i64,
+                event_type: "run.context_patched",
+                payload: &event_payload,
+                payload_schema_version: 1,
+                producer: "control-plane",
+                context,
+                correlation_id: uuid(context.correlation_id.into_bytes()),
+                occurred_at: None,
+                recorded_at: db_now,
+            },
+        )
+        .await?;
+        let new_snapshot = agent_loom_durable_store::NewContextSnapshot {
+            context_snapshot_id: command.context_snapshot_id,
+            schema_version: command.schema_version,
+            value: value_payload,
+            digest,
+            created_event_id: command.event_id,
+        };
+        insert_context_snapshot(
+            &transaction,
+            tenant_id,
+            run_id,
+            next_revision_i64,
+            Some(parent_context_snapshot_id),
+            db_now,
+            context,
+            &new_snapshot,
+        )
+        .await?;
+        transaction
+            .execute(
+                "INSERT INTO agent_loom.context_patches (\
+                    context_patch_id, tenant_id, run_id, base_context_snapshot_id, \
+                    result_context_snapshot_id, schema_version, merge_strategy, patch_json, \
+                    created_event_id, created_by, created_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                    to_timestamp(($11::bigint)::double precision / 1000000.0))",
+                &[
+                    &uuid(command.patch_id.into_bytes()),
+                    &tenant_id,
+                    &run_id,
+                    &parent_context_snapshot_id,
+                    &context_snapshot_id,
+                    &i32::try_from(command.schema_version)
+                        .map_err(|_| invalid_command("Context schema version exceeds i32 range"))?,
+                    &merge_strategy,
+                    &patch,
+                    &event_id,
+                    &context.actor_ref,
+                    &db_now,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+
+        let next_version_i64 = locked
+            .version_i64
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("run version overflow"))?;
+        let next_event_sequence_i64 = locked
+            .next_event_sequence_i64
+            .checked_add(1)
+            .ok_or_else(|| inconsistent("run event sequence overflow"))?;
+        let updated = transaction
+            .execute(
+                "UPDATE agent_loom.runs SET current_context_snapshot_id = $5, \
+                    current_context_revision = $6, version = $7, next_event_sequence = $8, \
+                    updated_at = to_timestamp(($9::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND run_id = $2 AND version = $3 \
+                   AND execution_generation = $4 AND current_context_snapshot_id = $10 \
+                   AND current_context_revision = $11",
+                &[
+                    &tenant_id,
+                    &run_id,
+                    &locked.version_i64,
+                    &locked.generation_i64,
+                    &context_snapshot_id,
+                    &next_revision_i64,
+                    &next_version_i64,
+                    &next_event_sequence_i64,
+                    &db_now,
+                    &parent_context_snapshot_id,
+                    &to_i64(
+                        command.expected_context_revision,
+                        "expected Context revision",
+                    )?,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        if updated != 1 {
+            return Err(store_error(
+                StoreErrorCode::VersionConflict,
+                "run or Context revision changed",
+            ));
+        }
+        let snapshot = RunSnapshot {
+            version: nonnegative_u64(next_version_i64, "run version")?,
+            next_event_sequence: nonnegative_u64(next_event_sequence_i64, "event sequence")?,
+            updated_at: UnixMicros::new(db_now),
+            ..locked.snapshot
+        };
+        let outcome = encode_run_receipt(&snapshot)?;
+        finish_receipt(
+            &transaction,
+            context,
+            "applied",
+            &outcome,
+            Some(event_id),
+            Some(("context_snapshot", context_snapshot_id, next_revision_i64)),
+        )
+        .await?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(committed_run(
+            CommandDisposition::Applied,
+            snapshot,
+            Some(command.event_id),
+            Vec::new(),
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -7140,6 +7408,48 @@ async fn insert_plan_revision(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn insert_context_snapshot(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    revision: i64,
+    parent_context_snapshot_id: Option<Uuid>,
+    db_now: i64,
+    context: &CommandContext,
+    snapshot: &agent_loom_durable_store::NewContextSnapshot,
+) -> StoreResult<()> {
+    let context_snapshot_id = uuid(snapshot.context_snapshot_id.into_bytes());
+    let schema_version = i32::try_from(snapshot.schema_version)
+        .map_err(|_| invalid_command("Context schema version exceeds i32 range"))?;
+    let value = json_value(&snapshot.value)?;
+    let created_event_id = uuid(snapshot.created_event_id.into_bytes());
+    transaction
+        .execute(
+            "INSERT INTO agent_loom.context_snapshots (\
+                context_snapshot_id, tenant_id, run_id, revision, parent_context_snapshot_id, \
+                schema_version, context_json, context_digest, created_event_id, created_by, created_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                to_timestamp(($11::bigint)::double precision / 1000000.0))",
+            &[
+                &context_snapshot_id,
+                &tenant_id,
+                &run_id,
+                &revision,
+                &parent_context_snapshot_id,
+                &schema_version,
+                &value,
+                &snapshot.digest.as_bytes().as_slice(),
+                &created_event_id,
+                &context.actor_ref,
+                &db_now,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn insert_initial_task(
     transaction: &Transaction<'_>,
     tenant_id: Uuid,
@@ -8015,7 +8325,9 @@ async fn insert_new_task(
 fn validate_create_run(command: &CreateRun) -> StoreResult<()> {
     let checkpoint = &command.initial_checkpoint;
     let plan_revision = &command.initial_plan_revision;
+    let initial_context = &command.initial_context;
     let computed_plan_digest: [u8; 32] = Sha256::digest(plan_revision.plan.as_bytes()).into();
+    let computed_context_digest: [u8; 32] = Sha256::digest(initial_context.value.as_bytes()).into();
     for dependency in command
         .initial_tasks
         .iter()
@@ -8030,6 +8342,10 @@ fn validate_create_run(command: &CreateRun) -> StoreResult<()> {
         || plan_revision.plan_revision_id.is_nil()
         || plan_revision.schema_version == 0
         || computed_plan_digest != *plan_revision.plan_digest.as_bytes()
+        || initial_context.created_event_id != command.initial_event_id
+        || initial_context.context_snapshot_id.is_nil()
+        || initial_context.schema_version == 0
+        || computed_context_digest != *initial_context.digest.as_bytes()
         || checkpoint.created_event_id != command.initial_event_id
         || checkpoint.sequence != 1
         || checkpoint.schema_version == 0
@@ -8165,6 +8481,40 @@ fn validate_plan_revision(command: &RevisePlan) -> StoreResult<()> {
         return Err(invalid_command("revised Task graph is invalid"));
     }
     Ok(())
+}
+
+fn validate_context_patch(command: &ApplyContextPatch) -> StoreResult<()> {
+    if command.expected_context_revision == 0
+        || command.event_id.is_nil()
+        || command.patch_id.is_nil()
+        || command.context_snapshot_id.is_nil()
+        || command.schema_version == 0
+    {
+        return Err(invalid_command("Context patch shape is invalid"));
+    }
+    json_value(&command.patch)?;
+    Ok(())
+}
+
+fn merge_json_patch(target: &mut Value, patch: &Value) {
+    let Value::Object(patch_object) = patch else {
+        *target = patch.clone();
+        return;
+    };
+    if !target.is_object() {
+        *target = json!({});
+    }
+    let target_object = target.as_object_mut().expect("target was made an object");
+    for (key, patch_value) in patch_object {
+        if patch_value.is_null() {
+            target_object.remove(key);
+        } else {
+            merge_json_patch(
+                target_object.entry(key.clone()).or_insert(Value::Null),
+                patch_value,
+            );
+        }
+    }
 }
 
 fn validate_plan_expectations(
@@ -9281,6 +9631,19 @@ mod tests {
     }
 
     #[test]
+    fn context_merge_patch_recurses_and_removes_null_members() {
+        let mut context = json!({"goal": "ship", "facts": {"old": true, "keep": 1}});
+        merge_json_patch(
+            &mut context,
+            &json!({"goal": null, "facts": {"old": null, "new": true}}),
+        );
+        assert_eq!(context, json!({"facts": {"keep": 1, "new": true}}));
+
+        merge_json_patch(&mut context, &json!(["replacement"]));
+        assert_eq!(context, json!(["replacement"]));
+    }
+
+    #[test]
     fn tool_retry_projection_requires_a_durable_due_time() {
         let retry_at = UnixMicros::new(123);
         let projected = project_tool_outcome(&ToolRecordedOutcome::Failed {
@@ -9614,6 +9977,7 @@ mod tests {
             deadline: None,
             initial_event_id,
             initial_plan_revision: smoke_plan_revision(run_id, initial_event_id, "smoke"),
+            initial_context: smoke_context_snapshot(run_id, initial_event_id),
             initial_checkpoint: NewCheckpoint {
                 checkpoint_id,
                 sequence: 1,
@@ -10202,6 +10566,7 @@ mod tests {
                         control_initial_event,
                         "control-smoke",
                     ),
+                    initial_context: smoke_context_snapshot(control_run_id, control_initial_event),
                     initial_checkpoint: NewCheckpoint {
                         checkpoint_id: CheckpointId::from_bytes(ids(15)),
                         sequence: 1,
@@ -10492,6 +10857,7 @@ mod tests {
             deadline: None,
             initial_event_id: event_id,
             initial_plan_revision: smoke_plan_revision(run_id, event_id, label),
+            initial_context: smoke_context_snapshot(run_id, event_id),
             initial_checkpoint: NewCheckpoint {
                 checkpoint_id,
                 sequence: 1,
@@ -10528,6 +10894,20 @@ mod tests {
             plan_digest: Digest::from_bytes(Sha256::digest(plan.as_bytes()).into()),
             plan,
             change_summary: payload(&json!({"kind": "initial"})),
+            created_event_id: event_id,
+        }
+    }
+
+    fn smoke_context_snapshot(
+        run_id: RunId,
+        event_id: EventId,
+    ) -> agent_loom_durable_store::NewContextSnapshot {
+        let value = payload(&json!({}));
+        agent_loom_durable_store::NewContextSnapshot {
+            context_snapshot_id: ContextSnapshotId::from_bytes(run_id.into_bytes()),
+            schema_version: 1,
+            digest: Digest::from_bytes(Sha256::digest(value.as_bytes()).into()),
+            value,
             created_event_id: event_id,
         }
     }

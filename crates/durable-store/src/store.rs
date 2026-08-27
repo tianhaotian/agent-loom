@@ -1,21 +1,21 @@
 use std::{future::Future, pin::Pin};
 
 use agent_loom_domain::{
-    AgentExecutionId, AgentExecutionSnapshot, ArtifactRefSnapshot, JsonPayload, OutboxMessage,
-    PlanRevisionSnapshot, RunId, RunSnapshot, StageExecutionSnapshot, ToolExecutionId,
-    ToolExecutionSnapshot, WaitSnapshot, WorkflowId, WorkflowSnapshot,
+    AgentExecutionId, AgentExecutionSnapshot, ArtifactRefSnapshot, ContextSnapshot, JsonPayload,
+    OutboxMessage, PlanRevisionSnapshot, RunId, RunSnapshot, StageExecutionSnapshot,
+    ToolExecutionId, ToolExecutionSnapshot, WaitSnapshot, WorkflowId, WorkflowSnapshot,
 };
 
 use crate::{
     AgentEventBatchOutcome, AgentEventPage, AgentEventQuery, AgentInvocation, AgentStatusPage,
-    AgentStatusQuery, AgentStopPage, AgentStopQuery, AppendAgentEvents, ApplyDueWork, ApplyEvent,
-    ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt, ClaimOutbox, ClaimTask,
-    ClaimedTask, CommandContext, Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome,
-    DueWorkPage, DueWorkQuery, EventCursor, EventPage, FailTask, LeaseReclaimOutcome,
-    MaintenanceOutcome, MaintenancePage, MaintenanceQuery, PrepareAgentExecution,
-    PrepareToolExecution, QueryContext, ReclaimExpiredLease, RecordAgentOutcome,
-    RecordAgentSubmission, RecordOutboxDelivery, RecordToolOutcome, RenewTaskLease, RevisePlan,
-    StoreResult, ToolInvocation,
+    AgentStatusQuery, AgentStopPage, AgentStopQuery, AppendAgentEvents, ApplyContextPatch,
+    ApplyDueWork, ApplyEvent, ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt,
+    ClaimOutbox, ClaimTask, ClaimedTask, CommandContext, Committed, CompleteTask, ControlRun,
+    CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery, EventCursor, EventPage, FailTask,
+    LeaseReclaimOutcome, MaintenanceOutcome, MaintenancePage, MaintenanceQuery,
+    PrepareAgentExecution, PrepareToolExecution, QueryContext, ReclaimExpiredLease,
+    RecordAgentOutcome, RecordAgentSubmission, RecordOutboxDelivery, RecordToolOutcome,
+    RenewTaskLease, RevisePlan, StoreResult, ToolInvocation,
 };
 
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = StoreResult<T>> + Send + 'a>>;
@@ -72,6 +72,18 @@ pub trait DurableStore: Send + Sync {
         context: &'a QueryContext,
         run_id: RunId,
     ) -> StoreFuture<'a, Vec<PlanRevisionSnapshot>>;
+
+    fn apply_context_patch<'a>(
+        &'a self,
+        context: &'a CommandContext,
+        command: ApplyContextPatch,
+    ) -> StoreFuture<'a, Committed<RunSnapshot>>;
+
+    fn list_context_snapshots<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        run_id: RunId,
+    ) -> StoreFuture<'a, Vec<ContextSnapshot>>;
 
     fn get_workflow<'a>(
         &'a self,

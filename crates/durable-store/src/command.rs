@@ -1,8 +1,9 @@
 use agent_loom_domain::{
-    AgentVersionId, ArtifactId, ArtifactVersionRef, CheckpointId, CommandId, CorrelationId, Digest,
-    DurationMicros, EventId, IdempotencyKey, JoinPolicy, JsonPayload, LeaseToken, LogicalKey,
-    PlanRevisionId, RunId, RunStatus, ScopeKey, StageExecutionId, StageStatus, TaskId, TaskKind,
-    TenantId, UnixMicros, WaitId, WorkerId, WorkflowVersionId,
+    AgentVersionId, ArtifactId, ArtifactVersionRef, CheckpointId, CommandId, ContextMergeStrategy,
+    ContextPatchId, ContextSnapshotId, CorrelationId, Digest, DurationMicros, EventId,
+    IdempotencyKey, JoinPolicy, JsonPayload, LeaseToken, LogicalKey, PlanRevisionId, RunId,
+    RunStatus, ScopeKey, StageExecutionId, StageStatus, TaskId, TaskKind, TenantId, UnixMicros,
+    WaitId, WorkerId, WorkflowVersionId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,9 +68,31 @@ pub struct CreateRun {
     pub deadline: Option<UnixMicros>,
     pub initial_event_id: EventId,
     pub initial_plan_revision: NewPlanRevision,
+    pub initial_context: NewContextSnapshot,
     pub initial_checkpoint: NewCheckpoint,
     pub initial_stages: Vec<InitialStage>,
     pub initial_tasks: Vec<InitialTask>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewContextSnapshot {
+    pub context_snapshot_id: ContextSnapshotId,
+    pub schema_version: u32,
+    pub value: JsonPayload,
+    pub digest: Digest,
+    pub created_event_id: EventId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApplyContextPatch {
+    pub expected_run: ExpectedRun,
+    pub expected_context_revision: u64,
+    pub event_id: EventId,
+    pub patch_id: ContextPatchId,
+    pub context_snapshot_id: ContextSnapshotId,
+    pub schema_version: u32,
+    pub patch: JsonPayload,
+    pub merge_strategy: ContextMergeStrategy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

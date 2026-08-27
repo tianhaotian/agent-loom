@@ -7,13 +7,14 @@ use std::{
 };
 
 use agent_loom_domain::{
-    AgentVersionId, CheckpointId, EventId, JsonPayload, LogicalKey, PlanRevisionId, RunId,
-    RunSnapshot, RunStatus, StageStatus, TenantId, UnixMicros, WaitStatus, WorkflowId,
+    AgentVersionId, CheckpointId, ContextMergeStrategy, ContextPatchId, ContextSnapshotId, EventId,
+    JsonPayload, LogicalKey, PlanRevisionId, RunId, RunSnapshot, RunStatus, StageStatus, TenantId,
+    UnixMicros, WaitStatus, WorkflowId,
 };
 use agent_loom_durable_store::{
-    ApplyEvent, CommandDisposition, ControlRun, CreateRun, DurableStore, EventCursor, ExpectedRun,
-    NewCheckpoint, NewPlanRevision, QueryContext, RevisePlan, SignatureVerification, StoreError,
-    StoreErrorCode,
+    ApplyContextPatch, ApplyEvent, CommandDisposition, ControlRun, CreateRun, DurableStore,
+    EventCursor, ExpectedRun, NewCheckpoint, NewContextSnapshot, NewPlanRevision, QueryContext,
+    RevisePlan, SignatureVerification, StoreError, StoreErrorCode,
 };
 use axum::{
     Json, Router,
@@ -67,6 +68,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/runs/{run_id}/plan-revisions",
             get(list_plan_revisions).post(revise_plan),
+        )
+        .route(
+            "/v1/runs/{run_id}/context-snapshots",
+            get(list_context_snapshots).post(apply_context_patch),
         )
         .route(
             "/v1/runs/{run_id}/events",
@@ -267,6 +272,17 @@ async fn create_run(
             change_summary: payload(&json!({"kind": "initial"}))?,
             created_event_id: initial_event_id,
         },
+        initial_context: NewContextSnapshot {
+            context_snapshot_id: ContextSnapshotId::from_bytes(random_id()),
+            schema_version: 1,
+            value: payload(&request.input)?,
+            digest: hash_bytes(
+                serde_json::to_vec(&request.input)
+                    .map_err(|_| ApiError::bad_request("request input cannot be encoded"))?
+                    .as_slice(),
+            ),
+            created_event_id: initial_event_id,
+        },
         initial_checkpoint: NewCheckpoint {
             checkpoint_id: CheckpointId::from_bytes(random_id()),
             sequence: 1,
@@ -458,6 +474,136 @@ async fn list_plan_revisions(
         })
         .collect();
     Ok(Json(revisions))
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ContextMergeStrategyRequest {
+    Replace,
+    MergePatch,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ApplyContextPatchRequest {
+    base_revision: u64,
+    #[serde(default = "default_context_schema_version")]
+    schema_version: u32,
+    merge_strategy: ContextMergeStrategyRequest,
+    patch: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct ApplyContextPatchResponse {
+    run: RunResponse,
+    context_revision: u64,
+    disposition: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextSnapshotResponse {
+    context_snapshot_id: String,
+    revision: u64,
+    parent_context_snapshot_id: Option<String>,
+    schema_version: u32,
+    context: Value,
+    context_digest: String,
+    created_event_id: String,
+    created_by: String,
+    created_at_micros: i64,
+}
+
+async fn apply_context_patch(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<ApplyContextPatchRequest>,
+) -> ApiResult<Json<ApplyContextPatchResponse>> {
+    if request.base_revision == 0 || request.schema_version == 0 {
+        return Err(ApiError::bad_request(
+            "base_revision and schema_version must be positive",
+        ));
+    }
+    let run_id = parse_run_id(&run_id)?;
+    let run = load_run(&state, run_id).await?;
+    let patch = payload(&request.patch)?;
+    let key = required_idempotency(&headers)?;
+    let request_bytes = serde_json::to_vec(&request)
+        .map_err(|_| ApiError::bad_request("Context patch request cannot be encoded"))?;
+    let identity = format!("api-context-patch/{run_id}/{key}");
+    let context = command_context(
+        state.tenant_id,
+        run_id,
+        API_ACTOR,
+        "apply_context_patch",
+        &identity,
+        &request_bytes,
+    )
+    .map_err(ApiError::bad_request)?;
+    let committed = state
+        .store
+        .apply_context_patch(
+            &context,
+            ApplyContextPatch {
+                expected_run: expected(&run),
+                expected_context_revision: request.base_revision,
+                event_id: EventId::from_bytes(crate::identity::derived_id("event", &identity)),
+                patch_id: ContextPatchId::from_bytes(crate::identity::derived_id(
+                    "context-patch",
+                    &identity,
+                )),
+                context_snapshot_id: ContextSnapshotId::from_bytes(crate::identity::derived_id(
+                    "context-snapshot",
+                    &identity,
+                )),
+                schema_version: request.schema_version,
+                patch,
+                merge_strategy: match request.merge_strategy {
+                    ContextMergeStrategyRequest::Replace => ContextMergeStrategy::Replace,
+                    ContextMergeStrategyRequest::MergePatch => ContextMergeStrategy::MergePatch,
+                },
+            },
+        )
+        .await?;
+    Ok(Json(ApplyContextPatchResponse {
+        run: committed.value.into(),
+        context_revision: request
+            .base_revision
+            .checked_add(1)
+            .ok_or_else(|| ApiError::bad_request("Context revision exceeds supported range"))?,
+        disposition: disposition(committed.disposition),
+    }))
+}
+
+async fn list_context_snapshots(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> ApiResult<Json<Vec<ContextSnapshotResponse>>> {
+    let run_id = parse_run_id(&run_id)?;
+    load_run(&state, run_id).await?;
+    let snapshots = state
+        .store
+        .list_context_snapshots(&query_context(&state), run_id)
+        .await?
+        .into_iter()
+        .map(|snapshot| ContextSnapshotResponse {
+            context_snapshot_id: snapshot.context_snapshot_id.to_string(),
+            revision: snapshot.revision,
+            parent_context_snapshot_id: snapshot
+                .parent_context_snapshot_id
+                .map(|id| id.to_string()),
+            schema_version: snapshot.schema_version,
+            context: serde_json::from_slice(snapshot.value.as_bytes()).unwrap_or(Value::Null),
+            context_digest: hex(snapshot.digest.as_bytes()),
+            created_event_id: snapshot.created_event_id.to_string(),
+            created_by: snapshot.created_by,
+            created_at_micros: snapshot.created_at.get(),
+        })
+        .collect();
+    Ok(Json(snapshots))
+}
+
+const fn default_context_schema_version() -> u32 {
+    1
 }
 
 fn empty_object() -> Value {

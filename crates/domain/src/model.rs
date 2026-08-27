@@ -80,6 +80,27 @@ pub struct PlanRevisionSnapshot {
     pub created_at: UnixMicros,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextSnapshot {
+    pub tenant_id: TenantId,
+    pub context_snapshot_id: crate::ContextSnapshotId,
+    pub run_id: RunId,
+    pub revision: u64,
+    pub parent_context_snapshot_id: Option<crate::ContextSnapshotId>,
+    pub schema_version: u32,
+    pub value: JsonPayload,
+    pub digest: Digest,
+    pub created_event_id: EventId,
+    pub created_by: String,
+    pub created_at: UnixMicros,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextMergeStrategy {
+    Replace,
+    MergePatch,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TaskKind {
     Model,

@@ -60,6 +60,7 @@ Tenant
     │   └── ArtifactRef
     ├── Event
     ├── PlanRevision
+    ├── ContextSnapshot ── ContextPatch
     ├── Checkpoint
     ├── WaitSubscription
     ├── CommandReceipt
@@ -69,6 +70,8 @@ Tenant
 Run 是主要事务聚合根。涉及 Run 状态推进的 Stage、Task、Wait、Checkpoint、Artifact 和 Event 写入必须通过 DurableStore 领域操作完成，不能由 Adapter 直接 CRUD。
 
 每个新 Run 都从不可变 `PlanRevision` 1 开始。后续 revision 保存完整 ExecutionPlan 快照、父 revision、摘要、变更说明和创建 Event；提交时同时校验 Run version、execution generation 与当前 Plan revision，避免并发 Replan 覆盖。V1 动态修订只允许 append-only Task 变更；revision、审计 Event、Outbox、Task 和 Dependency 必须在同一事务提交，新增 Task 的 `created_event_id` 指向该 revision Event。
+
+每个 Run 同时从不可变 `ContextSnapshot` 1 开始。ContextSnapshot 保存通用版本化 JSON、内容摘要、父 Snapshot 和创建 Event；`ContextPatch` 保存 base/result Snapshot、`replace` 或 RFC 7396 `merge_patch` 策略及原始 Patch。提交必须同时 fence Run version、execution generation 与 Context revision，且 Snapshot、Patch、Event、Outbox 和 Run 当前 Context 投影原子提交。核心不解释 OPC 或其他集成的业务字段。
 
 ## 4. 定义与配置模型
 

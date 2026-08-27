@@ -58,6 +58,8 @@ define_id!(
     EndpointId,
     RunId,
     PlanRevisionId,
+    ContextSnapshotId,
+    ContextPatchId,
     StageExecutionId,
     TaskId,
     TaskAttemptId,

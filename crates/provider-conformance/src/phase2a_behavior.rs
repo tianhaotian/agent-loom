@@ -1,15 +1,15 @@
 use std::{error::Error, fmt};
 
 use agent_loom_domain::{
-    CheckpointId, CommandId, CorrelationId, Digest, DurationMicros, EventId, IdempotencyKey,
-    JoinPolicy, JsonPayload, LeaseToken, LogicalKey, PlanRevisionId, RunId, RunStatus, ScopeKey,
-    TaskId, TaskKind, TenantId, UnixMicros, WaitStatus, WorkerId,
+    CheckpointId, CommandId, ContextSnapshotId, CorrelationId, Digest, DurationMicros, EventId,
+    IdempotencyKey, JoinPolicy, JsonPayload, LeaseToken, LogicalKey, PlanRevisionId, RunId,
+    RunStatus, ScopeKey, TaskId, TaskKind, TenantId, UnixMicros, WaitStatus, WorkerId,
 };
 use agent_loom_durable_store::{
     ApplyEvent, ClaimTask, ClaimedTask, CommandContext, CompleteTask, ControlRun, CreateRun,
     DurableStore, EventCursor, ExpectedRun, FinalRunResult, InitialTask, LeaseProof, NewCheckpoint,
-    NewPlanRevision, NewWaitSubscription, NextActions, QueryContext, SignatureVerification,
-    StoreError, TaskResult, WaitResumeTask, conformance::ConformanceCase,
+    NewContextSnapshot, NewPlanRevision, NewWaitSubscription, NextActions, QueryContext,
+    SignatureVerification, StoreError, TaskResult, WaitResumeTask, conformance::ConformanceCase,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -404,6 +404,13 @@ async fn create_task_run(
                 deadline: None,
                 initial_event_id,
                 initial_plan_revision: initial_plan_revision(run_id, initial_event_id),
+                initial_context: NewContextSnapshot {
+                    context_snapshot_id: ContextSnapshotId::from_bytes(identity(fixture, base + 6)),
+                    schema_version: 1,
+                    value: empty_payload(),
+                    digest: Digest::from_bytes(Sha256::digest(b"{}").into()),
+                    created_event_id: initial_event_id,
+                },
                 initial_checkpoint: NewCheckpoint {
                     checkpoint_id: initial_checkpoint_id,
                     sequence: 1,

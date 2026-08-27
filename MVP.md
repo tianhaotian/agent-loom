@@ -6,7 +6,7 @@
 
 已包含：
 
-- 启动时自动执行 `0000` 至 `0016` migration；
+- 启动时自动执行 `0000` 至 `0017` migration；
 - PostgreSQL 连接池与对象安全的 `DurableStore`；
 - API Key 认证边界和 tenant-scoped 查询/命令；
 - Workflow、Run、Stage、Artifact、Pending Action 和 Event HTTP 查询；
@@ -84,6 +84,10 @@ curl -sS -H 'authorization: Bearer replace-with-at-least-16-characters' \
 ### 查询和提交 PlanRevision
 
 `GET /v1/runs/RUN_ID/plan-revisions` 返回从 revision 1 开始的完整不可变历史。`POST` 使用完整 `agent-loom.execution-plan/v1` 快照，并要求 `Idempotency-Key` 与当前 `base_revision`；提交会用 Run version、execution generation 和 Plan revision 双重 fencing，原子追加 `run.plan_revised` Event、Outbox、新 revision 和新增 Task。V1 动态修订采用 append-only 约束：可以追加 Task 和修改不透明 extension，但不能删除或改写已有 Task/Stage；新增 Task 继续绑定创建 Run 时的原始 input，并可依赖既有或同批新增 Task。
+
+### 查询和更新 Context
+
+`GET /v1/runs/RUN_ID/context-snapshots` 返回从 revision 1 开始的不可变 ContextSnapshot 历史。`POST` 要求 `Idempotency-Key`、`base_revision`、`merge_strategy`（`replace` 或 RFC 7396 `merge_patch`）和通用 JSON `patch`。Store 同时 fence Run version、execution generation 与当前 Context revision，并在一个事务中写入 ContextPatch、新 Snapshot、父级 lineage、`run.context_patched` Event、Outbox 和 Run 当前 Context 投影。
 
 ### 暂停、恢复、取消
 

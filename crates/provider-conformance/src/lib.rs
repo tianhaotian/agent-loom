@@ -41,6 +41,8 @@ mod tests {
         "outbox_messages",
         "plan_revisions",
         "task_dependencies",
+        "context_snapshots",
+        "context_patches",
     ];
 
     #[test]

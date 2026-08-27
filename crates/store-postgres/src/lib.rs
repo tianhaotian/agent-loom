@@ -129,6 +129,12 @@ pub const MIGRATIONS: &[EmbeddedMigration] = &[
         created_tables: &["task_dependencies"],
         sql: include_str!("../migrations/0016_task_dependencies.sql"),
     },
+    EmbeddedMigration {
+        logical_id: "0017_context_snapshots",
+        logical_model_version: 18,
+        created_tables: &["context_snapshots", "context_patches"],
+        sql: include_str!("../migrations/0017_context_snapshots.sql"),
+    },
 ];
 
 pub const fn capabilities() -> StoreCapabilities {
@@ -161,7 +167,7 @@ mod tests {
 
     #[test]
     fn migration_batch_is_embedded() {
-        assert_eq!(MIGRATIONS.len(), 17);
+        assert_eq!(MIGRATIONS.len(), 18);
         assert_eq!(MIGRATIONS[0].logical_id, "0000_migration_meta");
         assert!(MIGRATIONS[0].sql.contains("schema_migrations"));
         assert!(MIGRATIONS[0].sql.contains("timestamptz(6)"));

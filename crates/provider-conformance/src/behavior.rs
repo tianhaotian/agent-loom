@@ -1,14 +1,15 @@
 use std::{error::Error, fmt, time::Duration};
 
 use agent_loom_domain::{
-    CheckpointId, CommandId, CorrelationId, Digest, DurationMicros, EventId, IdempotencyKey,
-    JoinPolicy, JsonPayload, LeaseToken, LogicalKey, PlanRevisionId, RunId, RunStatus, ScopeKey,
-    TaskId, TaskKind, TenantId, UnixMicros, WorkerId,
+    CheckpointId, CommandId, ContextSnapshotId, CorrelationId, Digest, DurationMicros, EventId,
+    IdempotencyKey, JoinPolicy, JsonPayload, LeaseToken, LogicalKey, PlanRevisionId, RunId,
+    RunStatus, ScopeKey, TaskId, TaskKind, TenantId, UnixMicros, WorkerId,
 };
 use agent_loom_durable_store::{
     ClaimTask, CommandContext, CommandDisposition, ControlRun, CreateRun, DurableStore,
-    ExpectedRun, InitialTask, LeaseExpiryAction, LeaseProof, NewCheckpoint, NewPlanRevision,
-    QueryContext, ReclaimExpiredLease, RenewTaskLease, StoreError, conformance::ConformanceCase,
+    ExpectedRun, InitialTask, LeaseExpiryAction, LeaseProof, NewCheckpoint, NewContextSnapshot,
+    NewPlanRevision, QueryContext, ReclaimExpiredLease, RenewTaskLease, StoreError,
+    conformance::ConformanceCase,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -97,6 +98,16 @@ pub async fn exercise_lease_expiry_retry(
                 deadline: None,
                 initial_event_id,
                 initial_plan_revision: initial_plan_revision(run_id, initial_event_id),
+                initial_context: NewContextSnapshot {
+                    context_snapshot_id: ContextSnapshotId::from_bytes(derived_identity(
+                        fixture.identity_seed,
+                        6,
+                    )),
+                    schema_version: 1,
+                    value: empty_payload(),
+                    digest: Digest::from_bytes(Sha256::digest(b"{}").into()),
+                    created_event_id: initial_event_id,
+                },
                 initial_checkpoint: NewCheckpoint {
                     checkpoint_id,
                     sequence: 1,

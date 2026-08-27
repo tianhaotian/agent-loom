@@ -1,20 +1,20 @@
 use agent_loom_domain::{AgentExecutionId, ToolExecutionId};
 use agent_loom_domain::{
-    AgentExecutionSnapshot, ArtifactRefSnapshot, JsonPayload, OutboxMessage, PlanRevisionSnapshot,
-    RunId, RunSnapshot, StageExecutionSnapshot, ToolExecutionSnapshot, WaitSnapshot, WorkflowId,
-    WorkflowSnapshot,
+    AgentExecutionSnapshot, ArtifactRefSnapshot, ContextSnapshot, JsonPayload, OutboxMessage,
+    PlanRevisionSnapshot, RunId, RunSnapshot, StageExecutionSnapshot, ToolExecutionSnapshot,
+    WaitSnapshot, WorkflowId, WorkflowSnapshot,
 };
 use agent_loom_durable_store::{
     AgentEventBatchOutcome, AgentEventPage, AgentEventQuery, AgentInvocation, AgentStatusPage,
-    AgentStatusQuery, AgentStopPage, AgentStopQuery, AppendAgentEvents, ApplyDueWork, ApplyEvent,
-    ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt, ClaimOutbox, ClaimTask,
-    ClaimedTask, CommandContext, Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome,
-    DueWorkPage, DueWorkQuery, DurableStore, EventCursor, EventPage, FailTask, LeaseReclaimOutcome,
-    MaintenanceOutcome, MaintenancePage, MaintenanceQuery, PrepareAgentExecution,
-    PrepareToolExecution, QueryContext, ReclaimExpiredLease, RecordAgentOutcome,
-    RecordAgentSubmission, RecordOutboxDelivery, RecordToolOutcome, RenewTaskLease, RetryClass,
-    RevisePlan, StoreCapabilities, StoreError, StoreErrorCode, StoreFuture, StoreResult,
-    ToolInvocation,
+    AgentStatusQuery, AgentStopPage, AgentStopQuery, AppendAgentEvents, ApplyContextPatch,
+    ApplyDueWork, ApplyEvent, ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt,
+    ClaimOutbox, ClaimTask, ClaimedTask, CommandContext, Committed, CompleteTask, ControlRun,
+    CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery, DurableStore, EventCursor, EventPage,
+    FailTask, LeaseReclaimOutcome, MaintenanceOutcome, MaintenancePage, MaintenanceQuery,
+    PrepareAgentExecution, PrepareToolExecution, QueryContext, ReclaimExpiredLease,
+    RecordAgentOutcome, RecordAgentSubmission, RecordOutboxDelivery, RecordToolOutcome,
+    RenewTaskLease, RetryClass, RevisePlan, StoreCapabilities, StoreError, StoreErrorCode,
+    StoreFuture, StoreResult, ToolInvocation,
 };
 use deadpool_postgres::{Object, Pool};
 
@@ -121,6 +121,32 @@ impl DurableStore for PostgresStore {
             let client = self.connection().await?;
             self.executor
                 .list_plan_revisions(&client, context, run_id)
+                .await
+        })
+    }
+
+    fn apply_context_patch<'a>(
+        &'a self,
+        context: &'a CommandContext,
+        command: ApplyContextPatch,
+    ) -> StoreFuture<'a, Committed<RunSnapshot>> {
+        Box::pin(async move {
+            let mut client = self.connection().await?;
+            self.executor
+                .apply_context_patch(&mut client, context, command)
+                .await
+        })
+    }
+
+    fn list_context_snapshots<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        run_id: RunId,
+    ) -> StoreFuture<'a, Vec<ContextSnapshot>> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor
+                .list_context_snapshots(&client, context, run_id)
                 .await
         })
     }

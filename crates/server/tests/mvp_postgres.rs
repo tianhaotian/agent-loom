@@ -1215,6 +1215,110 @@ async fn plan_revisions_are_version_fenced_idempotent_and_auditable() {
     );
 }
 
+#[tokio::test]
+async fn context_patches_are_versioned_merged_idempotent_and_lineaged() {
+    let Ok(database_url) = std::env::var("AGENT_LOOM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos();
+    let (application, run_id) = bootstrap_outbox_test(&database_url, nonce).await;
+    let initial = get_context_snapshots(&application, &run_id).await;
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0]["revision"], 1);
+    assert_eq!(initial[0]["context"]["goal"], "publish reliably");
+
+    let request = json!({
+        "base_revision": 1,
+        "merge_strategy": "merge_patch",
+        "patch": {"goal": null, "facts": {"approved": true}}
+    });
+    let applied = post_context_patch(&application, &run_id, "context-2", &request).await;
+    assert_eq!(applied.status(), StatusCode::OK);
+    let applied_body: Value = serde_json::from_slice(
+        &to_bytes(applied.into_body(), 64 * 1024)
+            .await
+            .expect("read Context patch response"),
+    )
+    .expect("decode Context patch response");
+    assert_eq!(applied_body["context_revision"], 2);
+    assert_eq!(applied_body["disposition"], "applied");
+
+    let duplicate = post_context_patch(&application, &run_id, "context-2", &request).await;
+    assert_eq!(duplicate.status(), StatusCode::OK);
+    let duplicate_body: Value = serde_json::from_slice(
+        &to_bytes(duplicate.into_body(), 64 * 1024)
+            .await
+            .expect("read duplicate Context response"),
+    )
+    .expect("decode duplicate Context response");
+    assert_eq!(duplicate_body["disposition"], "duplicate");
+
+    let stale = post_context_patch(&application, &run_id, "context-stale", &request).await;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let snapshots = get_context_snapshots(&application, &run_id).await;
+    assert_eq!(snapshots.len(), 2);
+    assert_eq!(snapshots[1]["revision"], 2);
+    assert_eq!(
+        snapshots[1]["parent_context_snapshot_id"],
+        snapshots[0]["context_snapshot_id"]
+    );
+    assert!(snapshots[1]["context"].get("goal").is_none());
+    assert_eq!(snapshots[1]["context"]["facts"]["approved"], true);
+}
+
+async fn get_context_snapshots(
+    application: &agent_loom_server::BootstrappedServer,
+    run_id: &str,
+) -> Vec<Value> {
+    let response = application
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/runs/{run_id}/context-snapshots"))
+                .header("authorization", "Bearer mvp-e2e-api-key")
+                .body(Body::empty())
+                .expect("build list Context snapshots request"),
+        )
+        .await
+        .expect("list Context snapshots response");
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_slice(
+        &to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .expect("read Context snapshots"),
+    )
+    .expect("decode Context snapshots")
+}
+
+async fn post_context_patch(
+    application: &agent_loom_server::BootstrappedServer,
+    run_id: &str,
+    idempotency_key: &str,
+    request: &Value,
+) -> axum::response::Response {
+    application
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/runs/{run_id}/context-snapshots"))
+                .header("authorization", "Bearer mvp-e2e-api-key")
+                .header("content-type", "application/json")
+                .header("idempotency-key", idempotency_key)
+                .body(Body::from(
+                    serde_json::to_vec(request).expect("encode Context request"),
+                ))
+                .expect("build Context patch request"),
+        )
+        .await
+        .expect("Context patch response")
+}
+
 async fn get_plan_revisions(
     application: &agent_loom_server::BootstrappedServer,
     run_id: &str,

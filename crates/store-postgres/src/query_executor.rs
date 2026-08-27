@@ -1,9 +1,10 @@
 use agent_loom_domain::{
     AgentExecutionId, AgentExecutionSnapshot, AgentVersionId, ArtifactId, ArtifactRefSnapshot,
-    ArtifactVersionRef, CheckpointId, Digest, EndpointId, EventId, EventRecord, IdempotencyKey,
-    JsonPayload, LogicalKey, PlanRevisionId, PlanRevisionSnapshot, RunId, RunSnapshot, ScopeKey,
-    StageExecutionId, StageExecutionSnapshot, StageStatus, TaskId, TenantId, ToolExecutionId,
-    UnixMicros, WaitId, WaitSnapshot, WaitStatus, WorkflowId, WorkflowSnapshot, WorkflowVersionId,
+    ArtifactVersionRef, CheckpointId, ContextSnapshot, ContextSnapshotId, Digest, EndpointId,
+    EventId, EventRecord, IdempotencyKey, JsonPayload, LogicalKey, PlanRevisionId,
+    PlanRevisionSnapshot, RunId, RunSnapshot, ScopeKey, StageExecutionId, StageExecutionSnapshot,
+    StageStatus, TaskId, TenantId, ToolExecutionId, UnixMicros, WaitId, WaitSnapshot, WaitStatus,
+    WorkflowId, WorkflowSnapshot, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
     AgentEventCandidate, AgentEventPage, AgentEventQuery, AgentInvocation, AgentStatusCandidate,
@@ -112,6 +113,36 @@ impl crate::PostgresTransactionExecutor {
             .map_err(map_database_error)?
             .iter()
             .map(|row| decode_plan_revision(context.tenant_id, run_id, row))
+            .collect()
+    }
+
+    /// Lists immutable Context snapshots for one Run in revision order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for unavailable PostgreSQL or malformed
+    /// persisted Context metadata.
+    pub async fn list_context_snapshots(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        run_id: RunId,
+    ) -> StoreResult<Vec<ContextSnapshot>> {
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let run_uuid = uuid(run_id.into_bytes());
+        client
+            .query(
+                "SELECT context_snapshot_id, revision, parent_context_snapshot_id, \
+                        schema_version, context_json, context_digest, created_event_id, \
+                        created_by, (extract(epoch FROM created_at) * 1000000)::bigint \
+                 FROM agent_loom.context_snapshots WHERE tenant_id = $1 AND run_id = $2 \
+                 ORDER BY revision, context_snapshot_id",
+                &[&tenant_id, &run_uuid],
+            )
+            .await
+            .map_err(map_database_error)?
+            .iter()
+            .map(|row| decode_context_snapshot(context.tenant_id, run_id, row))
             .collect()
     }
 
@@ -754,6 +785,35 @@ fn decode_plan_revision(
         created_event_id: event_id_from_uuid(row.get(8)),
         created_by: row.get(9),
         created_at: UnixMicros::new(row.get(10)),
+    })
+}
+
+fn decode_context_snapshot(
+    tenant_id: TenantId,
+    run_id: RunId,
+    row: &Row,
+) -> StoreResult<ContextSnapshot> {
+    let revision: i64 = row.get(1);
+    let schema_version = u32::try_from(row.get::<_, i32>(3))
+        .map_err(|_| inconsistent("Context schema version exceeds u32 range"))?;
+    if schema_version == 0 {
+        return Err(inconsistent("Context schema version is zero"));
+    }
+    let digest: Vec<u8> = row.get(5);
+    Ok(ContextSnapshot {
+        tenant_id,
+        context_snapshot_id: ContextSnapshotId::from_bytes(row.get::<_, Uuid>(0).into_bytes()),
+        run_id,
+        revision: nonnegative_u64(revision, "Context revision")?,
+        parent_context_snapshot_id: row
+            .get::<_, Option<Uuid>>(2)
+            .map(|id| ContextSnapshotId::from_bytes(id.into_bytes())),
+        schema_version,
+        value: decode_json_payload(&row.get(4))?,
+        digest: decode_digest(digest, "Context digest")?,
+        created_event_id: EventId::from_bytes(row.get::<_, Uuid>(6).into_bytes()),
+        created_by: row.get(7),
+        created_at: UnixMicros::new(row.get(8)),
     })
 }
 
