@@ -9,11 +9,12 @@ use agent_loom_domain::{
     AgentExecutionSnapshot, AgentExecutionStatus, CorrelationId, DurationMicros, RunId, TaskId,
     ToolExecutionSnapshot, ToolExecutionStatus,
 };
-use agent_loom_durable_store::{CommandDisposition, Committed};
+use agent_loom_durable_store::{CommandDisposition, Committed, ExpectedRun};
 
 use super::*;
 
 type SeenToolCall = Arc<Mutex<Option<(ExecutionId, Vec<u8>)>>>;
+type SeenStopCalls = Arc<Mutex<Vec<(IdempotencyKey, Digest, RemoteAgentRef, String)>>>;
 
 #[derive(Debug)]
 struct FakeStoreState {
@@ -21,6 +22,7 @@ struct FakeStoreState {
     agent_invocation: AgentInvocation,
     tool_outcome: Mutex<Option<RecordToolOutcome>>,
     agent_outcome: Mutex<Option<RecordAgentSubmission>>,
+    agent_stop_outcome: Mutex<Option<RecordAgentOutcome>>,
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +88,30 @@ impl AdapterDispatchStore for FakeStore {
             })
         })
     }
+
+    fn record_agent_outcome<'a>(
+        &'a self,
+        _context: &'a CommandContext,
+        command: RecordAgentOutcome,
+    ) -> StoreFuture<'a, Committed<AgentExecutionSnapshot>> {
+        Box::pin(async move {
+            *self
+                .0
+                .agent_stop_outcome
+                .lock()
+                .expect("agent stop outcome lock") = Some(command.clone());
+            let mut snapshot = agent_snapshot();
+            snapshot.status = command.status;
+            snapshot.version = command.expected_version + 1;
+            Ok(Committed {
+                disposition: CommandDisposition::Applied,
+                value: snapshot,
+                event_ids: vec![command.outcome_event_id],
+                durable_follow_ups: Vec::new(),
+                post_commit_hints: Vec::new(),
+            })
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -144,6 +170,8 @@ impl ToolAdapter for FakeToolAdapter {
 #[derive(Debug)]
 struct FakeAgentAdapter {
     seen: Arc<Mutex<Option<AgentRunRequest>>>,
+    stop_calls: SeenStopCalls,
+    stop_outcome: StopRequestOutcome,
 }
 
 impl AgentServerAdapter for FakeAgentAdapter {
@@ -206,11 +234,19 @@ impl AgentServerAdapter for FakeAgentAdapter {
 
     fn request_stop<'a>(
         &'a self,
-        _context: &'a AdapterCallContext,
-        _remote: &'a RemoteAgentRef,
-        _reason: &'a str,
+        context: &'a AdapterCallContext,
+        remote: &'a RemoteAgentRef,
+        reason: &'a str,
     ) -> AdapterFuture<'a, StopRequestOutcome> {
-        Box::pin(async { Ok(StopRequestOutcome::Unsupported) })
+        Box::pin(async move {
+            self.stop_calls.lock().expect("stop calls lock").push((
+                context.idempotency_key.clone(),
+                context.request_hash,
+                remote.clone(),
+                reason.to_owned(),
+            ));
+            Ok(self.stop_outcome)
+        })
     }
 }
 
@@ -315,6 +351,7 @@ fn state() -> Arc<FakeStoreState> {
         },
         tool_outcome: Mutex::new(None),
         agent_outcome: Mutex::new(None),
+        agent_stop_outcome: Mutex::new(None),
     })
 }
 
@@ -349,6 +386,7 @@ fn agent_snapshot() -> AgentExecutionSnapshot {
         version: 4,
         remote_run_ref: None,
         remote_session_ref: None,
+        remote_protocol_version: None,
         event_cursor: None,
         cursor_version: 0,
         retry_at: None,
@@ -386,7 +424,11 @@ fn registry_tool(seen: SeenToolCall, fail: bool) -> Arc<dyn ToolAdapter> {
 }
 
 fn registry_agent(seen: Arc<Mutex<Option<AgentRunRequest>>>) -> Arc<dyn AgentServerAdapter> {
-    Arc::new(FakeAgentAdapter { seen })
+    Arc::new(FakeAgentAdapter {
+        seen,
+        stop_calls: Arc::new(Mutex::new(Vec::new())),
+        stop_outcome: StopRequestOutcome::Unsupported,
+    })
 }
 
 #[test]
@@ -524,9 +566,65 @@ async fn agent_dispatch_decodes_request_and_records_remote_identity() {
         AgentSubmissionOutcome::Accepted {
             ref remote_run_ref,
             ref remote_session_ref,
-        } if remote_run_ref == "remote-run-1" && remote_session_ref.as_deref() == Some("session-1")
+            ref remote_protocol_version,
+        } if remote_run_ref == "remote-run-1"
+            && remote_session_ref.as_deref() == Some("session-1")
+            && remote_protocol_version == "test-v1"
     ));
     assert_eq!(recorded.expected_version, 4);
+}
+
+#[tokio::test]
+async fn agent_stop_uses_stable_identity_and_records_reconciliation() {
+    let state = state();
+    let stop_calls = Arc::new(Mutex::new(Vec::new()));
+    let agent: Arc<dyn AgentServerAdapter> = Arc::new(FakeAgentAdapter {
+        seen: Arc::new(Mutex::new(None)),
+        stop_calls: Arc::clone(&stop_calls),
+        stop_outcome: StopRequestOutcome::Accepted { cooperative: true },
+    });
+    let dispatcher = dispatcher(
+        FakeStore(Arc::clone(&state)),
+        registry_tool(Arc::new(Mutex::new(None)), false),
+        agent,
+    );
+    let mut execution = agent_snapshot();
+    execution.status = AgentExecutionStatus::Stopping;
+    execution.version = 5;
+    execution.remote_run_ref = Some("remote-run-1".to_owned());
+    execution.remote_session_ref = Some("session-1".to_owned());
+    execution.remote_protocol_version = Some("test-v1".to_owned());
+    let candidate = AgentStopCandidate {
+        tenant_id: tenant_id(),
+        execution,
+        expected_run: ExpectedRun {
+            run_id: run_id(),
+            version: Some(8),
+            execution_generation: Some(7),
+        },
+    };
+
+    crate::AgentStopDispatcher::request_stop(&dispatcher, candidate.clone())
+        .await
+        .expect("first stop dispatch");
+    crate::AgentStopDispatcher::request_stop(&dispatcher, candidate)
+        .await
+        .expect("duplicate stop dispatch");
+
+    let calls = stop_calls.lock().expect("stop calls lock");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].0, calls[1].0);
+    assert_eq!(calls[0].1, calls[1].1);
+    assert_eq!(calls[0].2.protocol_version, "test-v1");
+    assert_eq!(calls[0].3, "run control requested");
+    let recorded = state
+        .agent_stop_outcome
+        .lock()
+        .expect("agent stop outcome lock")
+        .clone()
+        .expect("recorded stop outcome");
+    assert_eq!(recorded.status, AgentExecutionStatus::Reconciling);
+    assert_eq!(recorded.expected_version, 5);
 }
 
 #[tokio::test]

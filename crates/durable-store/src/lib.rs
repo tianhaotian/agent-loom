@@ -1,5 +1,6 @@
 //! Durable persistence boundary shared by every production store provider.
 
+mod agent_control;
 mod command;
 pub mod conformance;
 mod due_work;
@@ -14,6 +15,7 @@ mod migration_runner;
 mod outcome;
 mod store;
 
+pub use agent_control::*;
 pub use command::*;
 pub use due_work::*;
 pub use error::*;

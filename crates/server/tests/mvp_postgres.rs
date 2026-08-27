@@ -3,8 +3,17 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use agent_loom_domain::WorkerId;
-use agent_loom_runtime::{PollingActivity, PollingJob as _};
+use agent_loom_domain::{
+    AgentExecutionId, AgentExecutionStatus, CommandId, CorrelationId, Digest, DurationMicros,
+    EventId, IdempotencyKey, JsonPayload, LeaseToken, RunId, ScopeKey, WorkerId,
+};
+use agent_loom_durable_store::{
+    AgentSubmissionOutcome, ClaimTask, CommandContext, ControlRun, DurableStore as _, ExpectedRun,
+    LeaseProof, PrepareAgentExecution, QueryContext, RecordAgentSubmission,
+};
+use agent_loom_runtime::{
+    AgentStopPollOutcome, AgentStopWorker, AgentStopWorkerConfig, PollingActivity, PollingJob as _,
+};
 use agent_loom_server::{
     MaintenancePollingConfig, MaintenancePollingJob, ServerConfig, WorkflowWorker,
     WorkflowWorkerActivity, WorkflowWorkerConfig, bootstrap, mock_dispatcher,
@@ -14,6 +23,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use tower::ServiceExt as _;
 
 #[tokio::test]
@@ -320,6 +330,231 @@ async fn http_to_postgres_mock_delivery_completes_when_configured() {
     ));
     let deadline_run = get_json(application.router, &format!("/v1/runs/{deadline_run_id}")).await;
     assert_eq!(deadline_run["status"], "timed_out");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn cancel_before_submission_response_still_stops_the_remote_agent() {
+    let Ok(database_url) = std::env::var("AGENT_LOOM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos();
+    let config = ServerConfig {
+        database_url,
+        bind: "127.0.0.1:0".to_owned(),
+        tenant_key: format!("agent-stop-e2e-{nonce}"),
+        api_key: "mvp-e2e-api-key".to_owned(),
+        pool_size: 4,
+        http_adapters: None,
+    };
+    let application = bootstrap(&config).await.expect("bootstrap MVP server");
+    let response = application
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/runs")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer mvp-e2e-api-key")
+                .header("idempotency-key", format!("agent-stop-run-{nonce}"))
+                .body(Body::from(r#"{"input":{"goal":"stop remote work"}}"#))
+                .expect("build create Run request"),
+        )
+        .await
+        .expect("create Run response");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read create response"),
+    )
+    .expect("decode create response");
+    let run_uuid = uuid::Uuid::parse_str(body["run"]["run_id"].as_str().expect("Run ID"))
+        .expect("valid Run ID");
+    let run_id = RunId::from_bytes(*run_uuid.as_bytes());
+    let worker_id = WorkerId::from_bytes(test_id(nonce, "worker"));
+    let lease_token =
+        LeaseToken::from_bytes(Sha256::digest(format!("lease-{nonce}").as_bytes()).into());
+    let claimed = application
+        .store
+        .claim_task(
+            &test_command_context(application.tenant_id, nonce, "claim-agent-stop"),
+            ClaimTask {
+                worker_id,
+                lease_token: lease_token.clone(),
+                lease_duration: DurationMicros::new(60_000_000),
+                candidate_window: 16,
+                kind: None,
+            },
+        )
+        .await
+        .expect("claim initial Task")
+        .expect("initial Task is claimable");
+    let execution_id = AgentExecutionId::from_bytes(test_id(nonce, "agent-execution"));
+    let request = JsonPayload::from_validated_bytes(
+        br#"{"instructions":"perform cancellable work","input":{},"budget":{"max_duration_micros":30000000,"max_output_bytes":4096}}"#.to_vec(),
+    );
+    let prepared = application
+        .store
+        .prepare_agent_execution(
+            &test_command_context(application.tenant_id, nonce, "prepare-agent-stop"),
+            PrepareAgentExecution {
+                expected_run: ExpectedRun {
+                    run_id,
+                    version: Some(claimed.value.run_version),
+                    execution_generation: Some(claimed.value.task.generation),
+                },
+                lease: LeaseProof {
+                    task_id: claimed.value.task.task_id,
+                    worker_id,
+                    token: lease_token,
+                    execution_generation: claimed.value.task.generation,
+                },
+                agent_execution_id: execution_id,
+                stage_execution_id: claimed.value.task.stage_execution_id,
+                endpoint_id: application.endpoint_id,
+                agent_version_id: application.coordinator_agent_version_id,
+                idempotency_key: IdempotencyKey::parse(format!("submit-agent-stop-{nonce}"))
+                    .expect("valid Agent idempotency key"),
+                request_hash: Digest::from_bytes(Sha256::digest(request.as_bytes()).into()),
+                request,
+                capabilities_snapshot: JsonPayload::from_validated_bytes(
+                    br#"{"submission_idempotency":true,"cooperative_stop":true}"#.to_vec(),
+                ),
+                prepared_event_id: EventId::from_bytes(test_id(nonce, "prepared-event")),
+            },
+        )
+        .await
+        .expect("prepare Agent execution");
+    let before_cancel = application
+        .store
+        .get_run(
+            &QueryContext {
+                tenant_id: application.tenant_id,
+                actor_ref: "agent-stop-e2e".to_owned(),
+                authoritative: true,
+            },
+            run_id,
+        )
+        .await
+        .expect("query prepared Run")
+        .expect("prepared Run exists");
+    let cancelled = application
+        .store
+        .cancel_run(
+            &test_command_context(application.tenant_id, nonce, "cancel-agent-stop"),
+            ControlRun {
+                expected_run: ExpectedRun {
+                    run_id,
+                    version: Some(before_cancel.version),
+                    execution_generation: Some(before_cancel.execution_generation),
+                },
+                event_id: EventId::from_bytes(test_id(nonce, "cancel-event")),
+                reason: "operator cancelled while submit response was in flight".to_owned(),
+            },
+        )
+        .await
+        .expect("cancel Run");
+    assert_eq!(
+        cancelled.value.status,
+        agent_loom_domain::RunStatus::Cancelled
+    );
+
+    let late_submission = application
+        .store
+        .record_agent_submission(
+            &test_command_context(application.tenant_id, nonce, "late-agent-submission"),
+            RecordAgentSubmission {
+                expected_run: ExpectedRun {
+                    run_id,
+                    version: Some(before_cancel.version),
+                    execution_generation: Some(before_cancel.execution_generation),
+                },
+                agent_execution_id: execution_id,
+                expected_version: prepared.value.version,
+                outcome: AgentSubmissionOutcome::Accepted {
+                    remote_run_ref: "remote-stop-e2e".to_owned(),
+                    remote_session_ref: Some("remote-session-e2e".to_owned()),
+                    remote_protocol_version: "1".to_owned(),
+                },
+                submission_event_id: EventId::from_bytes(test_id(nonce, "submission-event")),
+            },
+        )
+        .await
+        .expect("retain late accepted submission");
+    assert_eq!(late_submission.value.status, AgentExecutionStatus::Stopping);
+    assert_eq!(
+        late_submission.value.remote_protocol_version.as_deref(),
+        Some("1")
+    );
+
+    let dispatcher = mock_dispatcher(
+        application.store.clone(),
+        application.endpoint_id,
+        application.coordinator_agent_version_id,
+    )
+    .expect("build Mock Agent dispatcher");
+    let stop_worker = AgentStopWorker::new(
+        application.store.clone(),
+        dispatcher,
+        application.tenant_id,
+        AgentStopWorkerConfig::default(),
+    )
+    .expect("build Agent stop worker");
+    assert!(matches!(
+        stop_worker.poll_once().await.expect("dispatch remote stop"),
+        AgentStopPollOutcome::Dispatched(candidate)
+            if candidate.execution.agent_execution_id == execution_id
+    ));
+    let client = application
+        .store
+        .pool()
+        .get()
+        .await
+        .expect("pool connection");
+    let row = client
+        .query_one(
+            "SELECT status, remote_protocol_version FROM agent_loom.agent_executions \
+             WHERE tenant_id = $1 AND agent_execution_id = $2",
+            &[
+                &uuid::Uuid::from_bytes(application.tenant_id.into_bytes()),
+                &uuid::Uuid::from_bytes(execution_id.into_bytes()),
+            ],
+        )
+        .await
+        .expect("query stopped Agent execution");
+    assert_eq!(row.get::<_, String>(0), "reconciling");
+    assert_eq!(row.get::<_, Option<String>>(1).as_deref(), Some("1"));
+}
+
+fn test_id(nonce: u128, label: &str) -> [u8; 16] {
+    let digest: [u8; 32] = Sha256::digest(format!("{nonce}/{label}").as_bytes()).into();
+    let mut id = [0; 16];
+    id.copy_from_slice(&digest[..16]);
+    id
+}
+
+fn test_command_context(
+    tenant_id: agent_loom_domain::TenantId,
+    nonce: u128,
+    scope: &str,
+) -> CommandContext {
+    let request_hash =
+        Digest::from_bytes(Sha256::digest(format!("{nonce}/{scope}").as_bytes()).into());
+    CommandContext {
+        tenant_id,
+        command_id: CommandId::from_bytes(test_id(nonce, &format!("command/{scope}"))),
+        correlation_id: CorrelationId::from_bytes(test_id(nonce, "correlation")),
+        actor_ref: "agent-stop-e2e".to_owned(),
+        scope: ScopeKey::parse(scope.to_owned()).expect("valid test scope"),
+        idempotency_key: IdempotencyKey::parse(format!("{scope}-{nonce}"))
+            .expect("valid test idempotency key"),
+        request_hash,
+    }
 }
 
 async fn get_json(router: axum::Router, uri: &str) -> Value {

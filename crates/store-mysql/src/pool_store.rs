@@ -197,8 +197,8 @@ mod tests {
             .migrate(env!("CARGO_PKG_VERSION"))
             .await
             .expect("replay migrations");
-        assert_eq!(first.target_model_version, 11);
-        assert_eq!(second.target_model_version, 11);
+        assert_eq!(first.target_model_version, 12);
+        assert_eq!(second.target_model_version, 12);
         assert!(!second.changed());
 
         let concurrent_a = store.clone();

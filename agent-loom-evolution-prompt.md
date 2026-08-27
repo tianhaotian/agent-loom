@@ -130,7 +130,7 @@ Agent Loom 不应该内置：
 - 固定八阶段推进已隔离在 delivery Handler，server 仍以该 Handler 和 Mock Adapter 作为默认 MVP fixture
 - MySQL 只有 migration，没有真实 Store Provider
 - Runtime Adapter Trait 已定义，但大量方法没有接入真实执行路径
-- 异步事件同步、Reconcile、request_stop 尚未形成完整闭环
+- `request_stop` 已形成生产闭环，并覆盖 Cancel 与提交响应竞态；异步事件同步、`get_status` 和完整 Reconcile 尚未形成闭环
 - Worker 仍偏单进程 MVP
 - Wait 主要验证了 approval
 - Child Run、Fan-out/Fan-in、Handoff、Conditional 尚未完成

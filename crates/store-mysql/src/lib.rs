@@ -90,6 +90,12 @@ pub const MIGRATIONS: &[EmbeddedMigration] = &[
         created_tables: &[],
         sql: include_str!("../migrations/0010_agent_invocation_envelope.sql"),
     },
+    EmbeddedMigration {
+        logical_id: "0011_agent_remote_protocol",
+        logical_model_version: 12,
+        created_tables: &[],
+        sql: include_str!("../migrations/0011_agent_remote_protocol.sql"),
+    },
 ];
 
 pub const fn capabilities() -> StoreCapabilities {
@@ -119,7 +125,7 @@ mod tests {
 
     #[test]
     fn migration_batch_is_embedded() {
-        assert_eq!(MIGRATIONS.len(), 11);
+        assert_eq!(MIGRATIONS.len(), 12);
         assert_eq!(MIGRATIONS[0].logical_id, "0000_migration_meta");
         assert!(MIGRATIONS[0].sql.contains("schema_migrations"));
         assert!(MIGRATIONS[0].sql.contains("ENGINE=InnoDB"));

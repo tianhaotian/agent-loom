@@ -631,7 +631,7 @@ mod tests {
         .migrate()
         .await
         .expect("apply PostgreSQL migrations");
-        assert_eq!(report.target_model_version, 11);
+        assert_eq!(report.target_model_version, 12);
 
         drop(client);
         connection_task

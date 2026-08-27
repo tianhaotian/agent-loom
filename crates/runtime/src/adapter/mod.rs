@@ -2,16 +2,18 @@ use std::{collections::BTreeMap, fmt, future::Future, pin::Pin, sync::Arc};
 
 use agent_loom_adapter_core::{
     AdapterCallContext, AdapterError, AdapterRetryClass, AgentRunRequest, AgentServerAdapter,
-    ExecutionBudget, ExecutionId, SubmitAgentOutcome, ToolAdapter, ToolCallOutcome, ToolRequest,
+    ExecutionBudget, ExecutionId, RemoteAgentRef, RemoteAgentStatus, StopRequestOutcome,
+    SubmitAgentOutcome, ToolAdapter, ToolCallOutcome, ToolRequest,
 };
 use agent_loom_domain::{
-    AgentExecutionId, AgentVersionId, CommandId, Digest, EndpointId, EventId, IdempotencyKey,
-    JsonPayload, ScopeKey, TenantId, ToolExecutionId, UnixMicros,
+    AgentExecutionId, AgentExecutionStatus, AgentVersionId, CommandId, CorrelationId, Digest,
+    EndpointId, EventId, IdempotencyKey, JsonPayload, ScopeKey, TenantId, ToolExecutionId,
+    UnixMicros,
 };
 use agent_loom_durable_store::{
-    AgentInvocation, AgentSubmissionOutcome, CommandContext, DurableStore, ExecutionRetryClass,
-    QueryContext, RecordAgentSubmission, RecordToolOutcome, StoreFuture, ToolInvocation,
-    ToolRecordedOutcome,
+    AgentInvocation, AgentStopCandidate, AgentSubmissionOutcome, CommandContext, DurableStore,
+    ExecutionRetryClass, QueryContext, RecordAgentOutcome, RecordAgentSubmission,
+    RecordToolOutcome, StoreFuture, ToolInvocation, ToolRecordedOutcome,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -46,6 +48,15 @@ pub trait AdapterDispatchStore: Send + Sync {
         &'a self,
         context: &'a CommandContext,
         command: RecordAgentSubmission,
+    ) -> StoreFuture<
+        'a,
+        agent_loom_durable_store::Committed<agent_loom_domain::AgentExecutionSnapshot>,
+    >;
+
+    fn record_agent_outcome<'a>(
+        &'a self,
+        context: &'a CommandContext,
+        command: RecordAgentOutcome,
     ) -> StoreFuture<
         'a,
         agent_loom_durable_store::Committed<agent_loom_domain::AgentExecutionSnapshot>,
@@ -92,6 +103,17 @@ where
         agent_loom_durable_store::Committed<agent_loom_domain::AgentExecutionSnapshot>,
     > {
         DurableStore::record_agent_submission(self, context, command)
+    }
+
+    fn record_agent_outcome<'a>(
+        &'a self,
+        context: &'a CommandContext,
+        command: RecordAgentOutcome,
+    ) -> StoreFuture<
+        'a,
+        agent_loom_durable_store::Committed<agent_loom_domain::AgentExecutionSnapshot>,
+    > {
+        DurableStore::record_agent_outcome(self, context, command)
     }
 }
 
@@ -521,6 +543,7 @@ where
             Ok(SubmitAgentOutcome::Accepted(remote)) => AgentSubmissionOutcome::Accepted {
                 remote_run_ref: remote.remote_run_id,
                 remote_session_ref: remote.remote_session_id,
+                remote_protocol_version: remote.protocol_version,
             },
             Ok(SubmitAgentOutcome::SubmissionUncertain) => AgentSubmissionOutcome::Uncertain,
             Err(error) => agent_error_outcome(&*self.retry_schedule, &error, execution.version)?,
@@ -569,6 +592,137 @@ where
             .map_err(|error| store_dispatch_error(&error))?;
         Ok(())
     }
+
+    async fn dispatch_agent_stop(
+        &self,
+        candidate: AgentStopCandidate,
+    ) -> Result<(), crate::AgentStopDispatchError> {
+        if !candidate.shape_is_valid() {
+            return Err(stop_dispatch_error("Agent stop candidate is malformed"));
+        }
+        let execution = &candidate.execution;
+        let correlation_id = CorrelationId::from_bytes(derived_id(
+            "agent-stop-correlation",
+            &execution.agent_execution_id.to_string(),
+        ));
+        let fence = RecoveryDispatchFence {
+            expected_run: candidate.expected_run,
+            execution_generation: candidate
+                .expected_run
+                .execution_generation
+                .unwrap_or_default(),
+            correlation_id,
+            actor_ref: "agent-loom-agent-stop".to_owned(),
+        };
+        let query = query_context(candidate.tenant_id, &fence);
+        let invocation = self
+            .store
+            .get_agent_invocation(&query, execution.agent_execution_id)
+            .await
+            .map_err(|error| stop_dispatch_error(&error.to_string()))?;
+        let Some(invocation) = invocation else {
+            return self
+                .record_stop_projection(
+                    &candidate,
+                    &fence,
+                    AgentExecutionStatus::ManualReview,
+                    Some("INVOCATION_ENVELOPE_MISSING".to_owned()),
+                )
+                .await;
+        };
+        if validate_agent_invocation(&invocation, execution).is_err() {
+            return self
+                .record_stop_projection(
+                    &candidate,
+                    &fence,
+                    AgentExecutionStatus::ManualReview,
+                    Some("INVOCATION_ENVELOPE_MISMATCH".to_owned()),
+                )
+                .await;
+        }
+        let Some(adapter) = self
+            .registry
+            .agent(invocation.endpoint_id, invocation.agent_version_id)
+        else {
+            return self
+                .record_stop_projection(
+                    &candidate,
+                    &fence,
+                    AgentExecutionStatus::ManualReview,
+                    Some("ADAPTER_NOT_REGISTERED".to_owned()),
+                )
+                .await;
+        };
+        let remote = RemoteAgentRef {
+            remote_run_id: execution
+                .remote_run_ref
+                .clone()
+                .ok_or_else(|| stop_dispatch_error("Agent stop has no remote Run identity"))?,
+            remote_session_id: execution.remote_session_ref.clone(),
+            protocol_version: execution
+                .remote_protocol_version
+                .clone()
+                .ok_or_else(|| stop_dispatch_error("Agent stop has no remote protocol version"))?,
+        };
+        let seed = stop_context_seed(&invocation, &remote, correlation_id)?;
+        let context = match self.context_factory.create(seed.clone()).await {
+            Ok(context) => context,
+            Err(error) => {
+                let (status, error_code) = stop_error_projection(&error);
+                return self
+                    .record_stop_projection(&candidate, &fence, status, error_code)
+                    .await;
+            }
+        };
+        if let Err(error) = validate_adapter_context(&context, &seed) {
+            let (status, error_code) = stop_error_projection(&error);
+            return self
+                .record_stop_projection(&candidate, &fence, status, error_code)
+                .await;
+        }
+        let (status, error_code) = match adapter
+            .request_stop(&context, &remote, "run control requested")
+            .await
+        {
+            Ok(outcome) => stop_request_projection(outcome),
+            Err(error) => stop_error_projection(&error),
+        };
+        self.record_stop_projection(&candidate, &fence, status, error_code)
+            .await
+    }
+
+    async fn record_stop_projection(
+        &self,
+        candidate: &AgentStopCandidate,
+        fence: &RecoveryDispatchFence,
+        status: AgentExecutionStatus,
+        error_code: Option<String>,
+    ) -> Result<(), crate::AgentStopDispatchError> {
+        let execution = &candidate.execution;
+        let identity = format!(
+            "agent-stop/{}/version/{}",
+            execution.agent_execution_id, execution.version
+        );
+        let request_hash = stop_projection_digest(status, error_code.as_deref());
+        let context = outcome_context(candidate.tenant_id, fence, &identity, request_hash)
+            .map_err(|error| stop_dispatch_error(&error.safe_message))?;
+        self.store
+            .record_agent_outcome(
+                &context,
+                RecordAgentOutcome {
+                    expected_run: candidate.expected_run,
+                    agent_execution_id: execution.agent_execution_id,
+                    expected_version: execution.version,
+                    status,
+                    result: None,
+                    error_code,
+                    outcome_event_id: EventId::from_bytes(derived_id("event", &identity)),
+                },
+            )
+            .await
+            .map_err(|error| stop_dispatch_error(&error.to_string()))?;
+        Ok(())
+    }
 }
 
 impl<S> crate::ExternalRecoveryDispatcher for AdapterRecoveryDispatcher<S>
@@ -586,6 +740,15 @@ where
                 } => self.dispatch_agent(execution, fence).await,
             }
         })
+    }
+}
+
+impl<S> crate::AgentStopDispatcher for AdapterRecoveryDispatcher<S>
+where
+    S: AdapterDispatchStore,
+{
+    fn request_stop(&self, candidate: AgentStopCandidate) -> crate::AgentStopFuture<'_> {
+        Box::pin(async move { self.dispatch_agent_stop(candidate).await })
     }
 }
 
@@ -730,6 +893,28 @@ fn context_seed_agent(
     }
 }
 
+fn stop_context_seed(
+    invocation: &AgentInvocation,
+    remote: &RemoteAgentRef,
+    correlation_id: CorrelationId,
+) -> Result<AdapterContextSeed, crate::AgentStopDispatchError> {
+    let identity = format!("agent-stop-{}", invocation.agent_execution_id);
+    let mut hasher = Sha256::new();
+    hasher.update(b"agent-stop\0");
+    hasher.update(remote.remote_run_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(remote.protocol_version.as_bytes());
+    hasher.update(b"\0run control requested");
+    Ok(AdapterContextSeed {
+        tenant_id: invocation.tenant_id,
+        execution_id: ExecutionId::Agent(invocation.agent_execution_id),
+        correlation_id,
+        idempotency_key: IdempotencyKey::parse(identity)
+            .map_err(|_| stop_dispatch_error("generated Agent stop identity is invalid"))?,
+        request_hash: Digest::from_bytes(hasher.finalize().into()),
+    })
+}
+
 fn query_context(tenant_id: TenantId, fence: &RecoveryDispatchFence) -> QueryContext {
     QueryContext {
         tenant_id,
@@ -791,6 +976,56 @@ fn agent_error_outcome(
         retry,
         retry_at,
     })
+}
+
+fn stop_request_projection(outcome: StopRequestOutcome) -> (AgentExecutionStatus, Option<String>) {
+    match outcome {
+        StopRequestOutcome::Accepted { .. } => (AgentExecutionStatus::Reconciling, None),
+        StopRequestOutcome::AlreadyTerminal {
+            status: RemoteAgentStatus::Cancelled,
+        } => (AgentExecutionStatus::Cancelled, None),
+        StopRequestOutcome::AlreadyTerminal {
+            status: RemoteAgentStatus::Failed,
+        } => (
+            AgentExecutionStatus::Failed,
+            Some("REMOTE_AGENT_FAILED".to_owned()),
+        ),
+        StopRequestOutcome::AlreadyTerminal { .. } | StopRequestOutcome::Uncertain => (
+            AgentExecutionStatus::Reconciling,
+            Some("STOP_OUTCOME_REQUIRES_RECONCILIATION".to_owned()),
+        ),
+        StopRequestOutcome::Unsupported => (
+            AgentExecutionStatus::ManualReview,
+            Some("STOP_UNSUPPORTED".to_owned()),
+        ),
+    }
+}
+
+fn stop_error_projection(error: &AdapterError) -> (AgentExecutionStatus, Option<String>) {
+    let status = match error.retry {
+        AdapterRetryClass::Never | AdapterRetryClass::ManualReview => {
+            AgentExecutionStatus::ManualReview
+        }
+        AdapterRetryClass::SameRequestBackoff
+        | AdapterRetryClass::ReconnectAndResume
+        | AdapterRetryClass::QueryOutcome => AgentExecutionStatus::Reconciling,
+    };
+    let code = if error.code.is_empty() {
+        "AGENT_STOP_FAILED".to_owned()
+    } else {
+        error.code.to_owned()
+    };
+    (status, Some(code))
+}
+
+fn stop_projection_digest(status: AgentExecutionStatus, error_code: Option<&str>) -> Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{status:?}").as_bytes());
+    if let Some(error_code) = error_code {
+        hasher.update(b"\0");
+        hasher.update(error_code.as_bytes());
+    }
+    Digest::from_bytes(hasher.finalize().into())
 }
 
 const fn retry_class(value: AdapterRetryClass) -> ExecutionRetryClass {
@@ -867,12 +1102,14 @@ fn agent_digest(outcome: &AgentSubmissionOutcome) -> Digest {
         AgentSubmissionOutcome::Accepted {
             remote_run_ref,
             remote_session_ref,
+            remote_protocol_version,
         } => {
             hasher.update(b"accepted\0");
             hasher.update(remote_run_ref.as_bytes());
             if let Some(remote_session_ref) = remote_session_ref {
                 hasher.update(remote_session_ref.as_bytes());
             }
+            hasher.update(remote_protocol_version.as_bytes());
         }
         AgentSubmissionOutcome::Uncertain => hasher.update(b"uncertain\0"),
         AgentSubmissionOutcome::Rejected {
@@ -907,6 +1144,12 @@ fn store_dispatch_error(error: &agent_loom_durable_store::StoreError) -> Externa
 
 fn dispatch_error(message: &str) -> ExternalDispatchError {
     ExternalDispatchError {
+        safe_message: message.to_owned(),
+    }
+}
+
+fn stop_dispatch_error(message: &str) -> crate::AgentStopDispatchError {
+    crate::AgentStopDispatchError {
         safe_message: message.to_owned(),
     }
 }

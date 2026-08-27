@@ -2097,6 +2097,7 @@ impl PostgresTransactionExecutor {
             version: 0,
             remote_run_ref: None,
             remote_session_ref: None,
+            remote_protocol_version: None,
             event_cursor: None,
             cursor_version: 0,
             retry_at: None,
@@ -2284,6 +2285,7 @@ impl PostgresTransactionExecutor {
             version: nonnegative_u64(next_version, "Agent execution version")?,
             remote_run_ref: None,
             remote_session_ref: execution.remote_session_ref,
+            remote_protocol_version: execution.remote_protocol_version,
             event_cursor: execution.event_cursor,
             cursor_version: nonnegative_u64(execution.cursor_version, "Agent cursor version")?,
             retry_at: None,
@@ -2356,13 +2358,16 @@ impl PostgresTransactionExecutor {
                 "Agent execution belongs to another run",
             ));
         }
-        if execution.version != to_i64(command.expected_version, "Agent execution version")? {
+        let expected_version = to_i64(command.expected_version, "Agent execution version")?;
+        let late_after_stop = execution.status == "stopping"
+            && execution.version.checked_sub(1) == Some(expected_version);
+        if execution.version != expected_version && !late_after_stop {
             return Err(store_error(
                 StoreErrorCode::VersionConflict,
                 "Agent execution version changed",
             ));
         }
-        if execution.status != "submitting" {
+        if execution.status != "submitting" && !late_after_stop {
             return Err(store_error(
                 StoreErrorCode::InvalidTransition,
                 "Agent execution is not awaiting submission outcome",
@@ -2372,18 +2377,27 @@ impl PostgresTransactionExecutor {
             .version
             .checked_add(1)
             .ok_or_else(|| inconsistent("Agent execution version overflow"))?;
-        let terminal = projection.status.is_terminal();
-        let status = agent_status(projection.status);
+        let effective_status = if late_after_stop
+            && matches!(&command.outcome, AgentSubmissionOutcome::Accepted { .. })
+        {
+            AgentExecutionStatus::Stopping
+        } else {
+            projection.status
+        };
+        let terminal = effective_status.is_terminal();
+        let status = agent_status(effective_status);
+        let current_status = execution.status.as_str();
         let updated = transaction
             .execute(
                 "UPDATE agent_loom.agent_executions SET status = $3, version = $4, \
-                    remote_run_ref = $5, remote_session_ref = $6, error_code = $7, \
-                    retry_at = to_timestamp(($8::bigint)::double precision / 1000000.0), \
-                    completed_at = CASE WHEN $9 THEN \
-                        to_timestamp(($10::bigint)::double precision / 1000000.0) ELSE NULL END, \
-                    updated_at = to_timestamp(($10::bigint)::double precision / 1000000.0) \
+                    remote_run_ref = $5, remote_session_ref = $6, \
+                    remote_protocol_version = $7, error_code = $8, \
+                    retry_at = to_timestamp(($9::bigint)::double precision / 1000000.0), \
+                    completed_at = CASE WHEN $10 THEN \
+                        to_timestamp(($11::bigint)::double precision / 1000000.0) ELSE NULL END, \
+                    updated_at = to_timestamp(($11::bigint)::double precision / 1000000.0) \
                  WHERE tenant_id = $1 AND agent_execution_id = $2 \
-                   AND version = $11 AND status = 'submitting'",
+                   AND version = $12 AND status = $13",
                 &[
                     &tenant_id,
                     &execution_id,
@@ -2391,11 +2405,13 @@ impl PostgresTransactionExecutor {
                     &next_version,
                     &projection.remote_run_ref,
                     &projection.remote_session_ref,
+                    &projection.remote_protocol_version,
                     &projection.error_code,
                     &projection.retry_at,
                     &terminal,
                     &db_now,
                     &execution.version,
+                    &current_status,
                 ],
             )
             .await
@@ -2458,18 +2474,24 @@ impl PostgresTransactionExecutor {
             task_id: task_id_from_uuid(execution.task_id),
             endpoint_id: EndpointId::from_bytes(execution.endpoint_id.into_bytes()),
             agent_version_id: AgentVersionId::from_bytes(execution.agent_version_id.into_bytes()),
-            status: projection.status,
+            status: effective_status,
             version: nonnegative_u64(next_version, "Agent execution version")?,
             remote_run_ref: projection.remote_run_ref.clone(),
             remote_session_ref: projection.remote_session_ref.clone(),
+            remote_protocol_version: projection.remote_protocol_version.clone(),
             event_cursor: execution.event_cursor,
             cursor_version: nonnegative_u64(execution.cursor_version, "Agent cursor version")?,
             retry_at: projection.retry_at.map(UnixMicros::new),
             updated_at: UnixMicros::new(db_now),
         };
         let mut follow_ups = Vec::new();
-        if projection.status.requires_reconciliation() {
+        if effective_status.requires_reconciliation() {
             follow_ups.push(DurableFollowUp::ReconcileAgent {
+                execution_id: command.agent_execution_id,
+            });
+        }
+        if effective_status == AgentExecutionStatus::Stopping {
+            follow_ups.push(DurableFollowUp::StopAgent {
                 execution_id: command.agent_execution_id,
             });
         }
@@ -2864,6 +2886,7 @@ impl PostgresTransactionExecutor {
             version: nonnegative_u64(next_version, "Agent execution version")?,
             remote_run_ref: execution.remote_run_ref,
             remote_session_ref: execution.remote_session_ref,
+            remote_protocol_version: execution.remote_protocol_version,
             event_cursor: execution.event_cursor,
             cursor_version: nonnegative_u64(execution.cursor_version, "Agent cursor version")?,
             retry_at: None,
@@ -4795,6 +4818,7 @@ struct LockedAgentExecution {
     version: i64,
     remote_run_ref: Option<String>,
     remote_session_ref: Option<String>,
+    remote_protocol_version: Option<String>,
     event_cursor: Option<String>,
     cursor_version: i64,
     retry_at: Option<i64>,
@@ -4815,6 +4839,7 @@ impl LockedAgentExecution {
             version: nonnegative_u64(self.version, "Agent execution version")?,
             remote_run_ref: self.remote_run_ref.clone(),
             remote_session_ref: self.remote_session_ref.clone(),
+            remote_protocol_version: self.remote_protocol_version.clone(),
             event_cursor: self.event_cursor.clone(),
             cursor_version: nonnegative_u64(self.cursor_version, "Agent cursor version")?,
             retry_at: self.retry_at.map(UnixMicros::new),
@@ -4831,7 +4856,7 @@ fn validate_prepare_agent(command: &PrepareAgentExecution) -> StoreResult<()> {
 
 const AGENT_EXECUTION_SELECT: &str = "SELECT agent_execution_id, run_id, stage_execution_id, task_id, endpoint_id, \
             agent_version_id, request_hash, status, version, remote_run_ref, \
-            remote_session_ref, event_cursor, cursor_version, \
+            remote_session_ref, remote_protocol_version, event_cursor, cursor_version, \
             CASE WHEN retry_at IS NULL THEN NULL \
                 ELSE (extract(epoch FROM retry_at) * 1000000)::bigint END, \
             (extract(epoch FROM updated_at) * 1000000)::bigint \
@@ -4850,10 +4875,11 @@ fn decode_locked_agent(row: &Row) -> LockedAgentExecution {
         version: row.get(8),
         remote_run_ref: row.get(9),
         remote_session_ref: row.get(10),
-        event_cursor: row.get(11),
-        cursor_version: row.get(12),
-        retry_at: row.get(13),
-        updated_at: row.get(14),
+        remote_protocol_version: row.get(11),
+        event_cursor: row.get(12),
+        cursor_version: row.get(13),
+        retry_at: row.get(14),
+        updated_at: row.get(15),
     }
 }
 
@@ -4917,6 +4943,7 @@ struct ProjectedAgentSubmission {
     status: AgentExecutionStatus,
     remote_run_ref: Option<String>,
     remote_session_ref: Option<String>,
+    remote_protocol_version: Option<String>,
     error_code: Option<String>,
     retry_at: Option<i64>,
     event_type: &'static str,
@@ -4929,9 +4956,11 @@ fn project_agent_submission(
         AgentSubmissionOutcome::Accepted {
             remote_run_ref,
             remote_session_ref,
+            remote_protocol_version,
         } => {
             if remote_run_ref.is_empty()
                 || remote_session_ref.as_ref().is_some_and(String::is_empty)
+                || remote_protocol_version.is_empty()
             {
                 return Err(invalid_command(
                     "accepted Agent submission has invalid remote identity",
@@ -4941,6 +4970,7 @@ fn project_agent_submission(
                 status: AgentExecutionStatus::Running,
                 remote_run_ref: Some(remote_run_ref.clone()),
                 remote_session_ref: remote_session_ref.clone(),
+                remote_protocol_version: Some(remote_protocol_version.clone()),
                 error_code: None,
                 retry_at: None,
                 event_type: "agent.submission_accepted",
@@ -4950,6 +4980,7 @@ fn project_agent_submission(
             status: AgentExecutionStatus::OutcomeUnknown,
             remote_run_ref: None,
             remote_session_ref: None,
+            remote_protocol_version: None,
             error_code: None,
             retry_at: None,
             event_type: "agent.submission_outcome_unknown",
@@ -4981,6 +5012,7 @@ fn project_agent_submission(
                 status,
                 remote_run_ref: None,
                 remote_session_ref: None,
+                remote_protocol_version: None,
                 error_code: Some(error_code.clone()),
                 retry_at,
                 event_type: "agent.submission_rejected",
@@ -7408,7 +7440,7 @@ const fn tool_status(value: ToolExecutionStatus) -> &'static str {
     }
 }
 
-fn parse_agent_status(value: &str) -> StoreResult<AgentExecutionStatus> {
+pub(crate) fn parse_agent_status(value: &str) -> StoreResult<AgentExecutionStatus> {
     match value {
         "planned" => Ok(AgentExecutionStatus::Planned),
         "submitting" => Ok(AgentExecutionStatus::Submitting),
@@ -7805,6 +7837,8 @@ struct AgentReceipt {
     version: u64,
     remote_run_ref: Option<String>,
     remote_session_ref: Option<String>,
+    #[serde(default)]
+    remote_protocol_version: Option<String>,
     event_cursor: Option<String>,
     cursor_version: u64,
     retry_at: Option<i64>,
@@ -7826,6 +7860,7 @@ fn encode_agent_receipt(snapshot: &AgentExecutionSnapshot) -> StoreResult<Value>
         version: snapshot.version,
         remote_run_ref: snapshot.remote_run_ref.clone(),
         remote_session_ref: snapshot.remote_session_ref.clone(),
+        remote_protocol_version: snapshot.remote_protocol_version.clone(),
         event_cursor: snapshot.event_cursor.clone(),
         cursor_version: snapshot.cursor_version,
         retry_at: snapshot.retry_at.map(UnixMicros::get),
@@ -7854,6 +7889,7 @@ fn decode_agent_receipt(tenant_id: TenantId, value: &Value) -> StoreResult<Agent
         version: receipt.version,
         remote_run_ref: receipt.remote_run_ref,
         remote_session_ref: receipt.remote_session_ref,
+        remote_protocol_version: receipt.remote_protocol_version,
         event_cursor: receipt.event_cursor,
         cursor_version: receipt.cursor_version,
         retry_at: receipt.retry_at.map(UnixMicros::new),
@@ -8402,6 +8438,7 @@ mod tests {
             version: 3,
             remote_run_ref: Some("remote-run".to_owned()),
             remote_session_ref: Some("remote-session".to_owned()),
+            remote_protocol_version: Some("1".to_owned()),
             event_cursor: Some("cursor-4".to_owned()),
             cursor_version: 4,
             retry_at: Some(UnixMicros::new(500)),

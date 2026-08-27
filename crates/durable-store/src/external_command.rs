@@ -140,6 +140,7 @@ pub enum AgentSubmissionOutcome {
     Accepted {
         remote_run_ref: String,
         remote_session_ref: Option<String>,
+        remote_protocol_version: String,
     },
     Uncertain,
     Rejected {

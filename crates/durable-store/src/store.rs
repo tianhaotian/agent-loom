@@ -7,13 +7,13 @@ use agent_loom_domain::{
 };
 
 use crate::{
-    AgentEventBatchOutcome, AgentInvocation, AppendAgentEvents, ApplyDueWork, ApplyEvent,
-    ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt, ClaimTask, ClaimedTask,
-    Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery,
-    EventCursor, EventPage, FailTask, LeaseReclaimOutcome, MaintenanceOutcome, MaintenancePage,
-    MaintenanceQuery, PrepareAgentExecution, PrepareToolExecution, QueryContext,
-    ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission, RecordToolOutcome,
-    RenewTaskLease, StoreResult, ToolInvocation,
+    AgentEventBatchOutcome, AgentInvocation, AgentStopPage, AgentStopQuery, AppendAgentEvents,
+    ApplyDueWork, ApplyEvent, ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt,
+    ClaimTask, ClaimedTask, Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome,
+    DueWorkPage, DueWorkQuery, EventCursor, EventPage, FailTask, LeaseReclaimOutcome,
+    MaintenanceOutcome, MaintenancePage, MaintenanceQuery, PrepareAgentExecution,
+    PrepareToolExecution, QueryContext, ReclaimExpiredLease, RecordAgentOutcome,
+    RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, StoreResult, ToolInvocation,
 };
 
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = StoreResult<T>> + Send + 'a>>;
@@ -94,6 +94,12 @@ pub trait DurableStore: Send + Sync {
         context: &'a QueryContext,
         query: MaintenanceQuery,
     ) -> StoreFuture<'a, MaintenancePage>;
+
+    fn scan_agent_stops<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        query: AgentStopQuery,
+    ) -> StoreFuture<'a, AgentStopPage>;
 
     fn get_tool_invocation<'a>(
         &'a self,

@@ -1,15 +1,15 @@
 use agent_loom_domain::{
-    AgentExecutionId, AgentVersionId, ArtifactId, ArtifactRefSnapshot, ArtifactVersionRef,
-    CheckpointId, Digest, EndpointId, EventId, EventRecord, IdempotencyKey, JsonPayload,
-    LogicalKey, RunId, RunSnapshot, ScopeKey, StageExecutionId, StageExecutionSnapshot,
-    StageStatus, TenantId, ToolExecutionId, UnixMicros, WaitId, WaitSnapshot, WaitStatus,
-    WorkflowId, WorkflowSnapshot, WorkflowVersionId,
+    AgentExecutionId, AgentExecutionSnapshot, AgentVersionId, ArtifactId, ArtifactRefSnapshot,
+    ArtifactVersionRef, CheckpointId, Digest, EndpointId, EventId, EventRecord, IdempotencyKey,
+    JsonPayload, LogicalKey, RunId, RunSnapshot, ScopeKey, StageExecutionId,
+    StageExecutionSnapshot, StageStatus, TaskId, TenantId, ToolExecutionId, UnixMicros, WaitId,
+    WaitSnapshot, WaitStatus, WorkflowId, WorkflowSnapshot, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
-    AgentInvocation, DueWorkCandidate, DueWorkKind, DueWorkPage, DueWorkQuery, DueWorkTarget,
-    EventCursor, EventPage, MaintenanceCandidate, MaintenanceKind, MaintenancePage,
-    MaintenanceQuery, MaintenanceTarget, QueryContext, StoreError, StoreErrorCode, StoreResult,
-    ToolInvocation,
+    AgentInvocation, AgentStopCandidate, AgentStopPage, AgentStopQuery, DueWorkCandidate,
+    DueWorkKind, DueWorkPage, DueWorkQuery, DueWorkTarget, EventCursor, EventPage,
+    MaintenanceCandidate, MaintenanceKind, MaintenancePage, MaintenanceQuery, MaintenanceTarget,
+    QueryContext, StoreError, StoreErrorCode, StoreResult, ToolInvocation,
 };
 use serde_json::Value;
 use tokio_postgres::{Client, Row};
@@ -23,6 +23,7 @@ use crate::{
 const MAX_EVENT_PAGE_SIZE: u32 = 1_000;
 const MAX_DUE_WORK_PAGE_SIZE: u32 = 1_000;
 const MAX_MAINTENANCE_PAGE_SIZE: u32 = 1_000;
+const MAX_AGENT_STOP_PAGE_SIZE: u32 = 1_000;
 
 impl crate::PostgresTransactionExecutor {
     /// Reads the authoritative Run projection for one tenant.
@@ -425,6 +426,57 @@ impl crate::PostgresTransactionExecutor {
         })
     }
 
+    /// Returns bounded remote-stop work backed by authoritative Agent and Run revisions.
+    ///
+    /// Rows remain visible until a stop outcome commits. Multiple processes may
+    /// observe the same row; the runtime therefore uses a stable idempotency key
+    /// and the outcome transaction fences on the Agent execution version.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for an invalid limit, database failure, or
+    /// malformed persisted Agent state.
+    pub async fn scan_agent_stops(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        query: AgentStopQuery,
+    ) -> StoreResult<AgentStopPage> {
+        if query.limit == 0 {
+            return Err(StoreError::new(
+                StoreErrorCode::ConstraintViolation,
+                agent_loom_durable_store::RetryClass::Never,
+                "agent stop page limit must be positive",
+            ));
+        }
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let limit = i64::from(query.limit.min(MAX_AGENT_STOP_PAGE_SIZE));
+        let rows = client
+            .query(
+                "SELECT x.agent_execution_id, x.run_id, x.stage_execution_id, x.task_id, \
+                        x.endpoint_id, x.agent_version_id, x.status, x.version, \
+                        x.remote_run_ref, x.remote_session_ref, x.remote_protocol_version, \
+                        x.event_cursor, x.cursor_version, \
+                        CASE WHEN x.retry_at IS NULL THEN NULL ELSE \
+                            (extract(epoch FROM x.retry_at) * 1000000)::bigint END, \
+                        (extract(epoch FROM x.updated_at) * 1000000)::bigint, \
+                        r.version, r.execution_generation \
+                 FROM agent_loom.agent_executions x \
+                 JOIN agent_loom.runs r ON r.tenant_id = x.tenant_id AND r.run_id = x.run_id \
+                 WHERE x.tenant_id = $1 AND x.status = 'stopping' \
+                   AND x.remote_run_ref IS NOT NULL \
+                 ORDER BY x.updated_at, x.agent_execution_id LIMIT $2",
+                &[&tenant_id, &limit],
+            )
+            .await
+            .map_err(map_database_error)?;
+        let candidates = rows
+            .iter()
+            .map(|row| decode_agent_stop(context.tenant_id, row))
+            .collect::<StoreResult<Vec<_>>>()?;
+        Ok(AgentStopPage { candidates })
+    }
+
     /// Loads the immutable Tool Adapter invocation envelope for one execution.
     ///
     /// # Errors
@@ -515,6 +567,49 @@ fn decode_digest(value: Vec<u8>, field: &str) -> StoreResult<Digest> {
         .try_into()
         .map_err(|_| inconsistent(&format!("{field} has an invalid length")))?;
     Ok(Digest::from_bytes(bytes))
+}
+
+fn decode_agent_stop(tenant_id: TenantId, row: &Row) -> StoreResult<AgentStopCandidate> {
+    let execution_id: Uuid = row.get(0);
+    let run_uuid: Uuid = row.get(1);
+    let stage_id: Option<Uuid> = row.get(2);
+    let task_id: Uuid = row.get(3);
+    let endpoint_id: Uuid = row.get(4);
+    let agent_version_id: Uuid = row.get(5);
+    let run_id = run_id_from_uuid(run_uuid);
+    let candidate = AgentStopCandidate {
+        tenant_id,
+        execution: AgentExecutionSnapshot {
+            tenant_id,
+            agent_execution_id: AgentExecutionId::from_bytes(execution_id.into_bytes()),
+            run_id,
+            stage_execution_id: stage_id
+                .map(|value| StageExecutionId::from_bytes(value.into_bytes())),
+            task_id: TaskId::from_bytes(task_id.into_bytes()),
+            endpoint_id: EndpointId::from_bytes(endpoint_id.into_bytes()),
+            agent_version_id: AgentVersionId::from_bytes(agent_version_id.into_bytes()),
+            status: crate::parse_agent_status(row.get::<_, &str>(6))?,
+            version: nonnegative_u64(row.get(7), "Agent execution version")?,
+            remote_run_ref: row.get(8),
+            remote_session_ref: row.get(9),
+            remote_protocol_version: row.get(10),
+            event_cursor: row.get(11),
+            cursor_version: nonnegative_u64(row.get(12), "Agent cursor version")?,
+            retry_at: row.get::<_, Option<i64>>(13).map(UnixMicros::new),
+            updated_at: UnixMicros::new(row.get(14)),
+        },
+        expected_run: agent_loom_durable_store::ExpectedRun {
+            run_id,
+            version: Some(nonnegative_u64(row.get(15), "Run version")?),
+            execution_generation: Some(nonnegative_u64(row.get(16), "Run execution generation")?),
+        },
+    };
+    if !candidate.shape_is_valid() {
+        return Err(inconsistent(
+            "Agent stop candidate violates its durable shape",
+        ));
+    }
+    Ok(candidate)
 }
 
 fn decode_workflow(tenant_id: TenantId, row: &Row) -> StoreResult<WorkflowSnapshot> {

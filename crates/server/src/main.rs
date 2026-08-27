@@ -3,9 +3,10 @@ use std::{error::Error, sync::Arc, time::Duration};
 use agent_loom_domain::{CorrelationId, Digest, IdempotencyKey, LeaseToken, ScopeKey, WorkerId};
 use agent_loom_durable_store::{CommandContext, QueryContext};
 use agent_loom_runtime::{
-    DeterministicDueWorkPlanner, DueWorkPollingJob, DueWorkScheduler, DueWorkSchedulerConfig,
-    LeaseReclaimPollingJob, PollingService, PollingServiceConfig, RecoveryPollingJob,
-    RecoveryWorker, RecoveryWorkerConfig, SeededRecoveryIdentitySource,
+    AgentStopPollingJob, AgentStopWorker, AgentStopWorkerConfig, DeterministicDueWorkPlanner,
+    DueWorkPollingJob, DueWorkScheduler, DueWorkSchedulerConfig, LeaseReclaimPollingJob,
+    PollingService, PollingServiceConfig, RecoveryPollingJob, RecoveryWorker, RecoveryWorkerConfig,
+    SeededRecoveryIdentitySource,
 };
 use agent_loom_server::{
     MaintenancePollingConfig, MaintenancePollingJob, ServerConfig, WorkflowWorker,
@@ -101,7 +102,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )?;
     let recovery_worker = RecoveryWorker::new(
         application.store.clone(),
-        dispatcher,
+        dispatcher.clone(),
         RecoveryWorkerConfig::default(),
     );
     let recovery_service = PollingService::new(
@@ -130,6 +131,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
             error_delay: Duration::from_secs(2),
         },
     )?;
+    let agent_stop_service = PollingService::new(
+        AgentStopPollingJob::new(AgentStopWorker::new(
+            application.store.clone(),
+            dispatcher,
+            application.tenant_id,
+            AgentStopWorkerConfig::default(),
+        )?),
+        PollingServiceConfig {
+            concurrency: 1,
+            busy_delay: Duration::from_millis(10),
+            idle_delay: Duration::from_millis(250),
+            error_delay: Duration::from_secs(2),
+        },
+    )?;
 
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let worker_shutdown = shutdown_receiver.clone();
@@ -137,12 +152,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let due_shutdown = shutdown_receiver.clone();
     let recovery_shutdown = shutdown_receiver.clone();
     let maintenance_shutdown = shutdown_receiver.clone();
+    let agent_stop_shutdown = shutdown_receiver.clone();
     let worker_task = tokio::spawn(async move { workflow_worker.run(worker_shutdown).await });
     let reclaim_task = tokio::spawn(async move { reclaim_service.run(reclaim_shutdown).await });
     let due_task = tokio::spawn(async move { due_service.run(due_shutdown).await });
     let recovery_task = tokio::spawn(async move { recovery_service.run(recovery_shutdown).await });
     let maintenance_task =
         tokio::spawn(async move { maintenance_service.run(maintenance_shutdown).await });
+    let agent_stop_task =
+        tokio::spawn(async move { agent_stop_service.run(agent_stop_shutdown).await });
 
     println!(
         "{}",
@@ -176,6 +194,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = due_task.await;
     let _ = recovery_task.await;
     let _ = maintenance_task.await;
+    let _ = agent_stop_task.await;
     Ok(())
 }
 

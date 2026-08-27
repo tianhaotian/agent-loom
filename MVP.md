@@ -6,7 +6,7 @@
 
 已包含：
 
-- 启动时自动执行 `0000` 至 `0010` migration；
+- 启动时自动执行 `0000` 至 `0011` migration；
 - PostgreSQL 连接池与对象安全的 `DurableStore`；
 - API Key 认证边界和 tenant-scoped 查询/命令；
 - Workflow、Run、Stage、Artifact、Pending Action 和 Event HTTP 查询；
@@ -15,7 +15,7 @@
 - 部署审批 Wait、重复事件幂等消费和持久化恢复 Task；
 - 通过正式 Adapter/Execution 契约执行的 Mock Agent Server 与 Mock DevOps Tool；
 - 可通过配置切换的真实 HTTP Agent Server 与 DevOps Tool profile；
-- Scheduler、Recovery Worker、过期 Lease 回收和 deadline/Wait/stale execution 维护服务；
+- Scheduler、Recovery Worker、Agent Stop Worker、过期 Lease 回收和 deadline/Wait/stale execution 维护服务；
 - 幂等命令、Run version 和 execution generation fencing；
 - JSON 结构化请求/Worker 日志和响应关联 ID；
 - 从 HTTP 创建到 PostgreSQL 终态、返工、审批、Tool 部署和 deadline 的自动化 E2E 验收。
@@ -94,6 +94,8 @@ curl -sS -X POST http://127.0.0.1:8080/v1/runs/RUN_ID/pause \
 ```
 
 将路径中的 `pause` 替换为 `resume` 或 `cancel` 即可执行对应操作。
+
+Pause/Cancel 会把已经提交或正在提交的远端 Agent 执行持久化为 `stopping`。后台 Agent Stop Worker 使用稳定幂等身份调用对应 Adapter；即使取消发生在提交响应返回前，迟到的远端 Run、Session 和协议版本仍会保留并继续触发停止。停止已受理或结果不确定时进入 `reconciling`，不支持停止时进入 `manual_review`，不会把“请求已受理”误记为远端已取消。
 
 ### 注入等待事件
 

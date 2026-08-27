@@ -10,10 +10,11 @@ use agent_loom_adapter_core::{
 use agent_loom_domain::{
     AgentVersionId, Digest, DurationMicros, EndpointId, JsonPayload, UnixMicros,
 };
+use agent_loom_durable_store::AgentStopCandidate;
 use agent_loom_runtime::{
     AdapterContextFactory, AdapterContextFuture, AdapterContextSeed, AdapterRecoveryDispatcher,
-    AdapterRetrySchedule, DispatchFuture, ExternalDispatchError, ExternalRecoveryDispatcher,
-    StartedRecovery, StaticAdapterRegistry,
+    AdapterRetrySchedule, AgentStopDispatcher, AgentStopFuture, DispatchFuture,
+    ExternalDispatchError, ExternalRecoveryDispatcher, StartedRecovery, StaticAdapterRegistry,
 };
 use agent_loom_store_postgres::PostgresStore;
 use serde_json::json;
@@ -275,8 +276,15 @@ pub fn mock_dispatcher(
     )))
 }
 
+pub(crate) trait ExternalDispatcher:
+    ExternalRecoveryDispatcher + AgentStopDispatcher
+{
+}
+
+impl<T> ExternalDispatcher for T where T: ExternalRecoveryDispatcher + AgentStopDispatcher {}
+
 #[derive(Clone)]
-pub struct SharedExternalDispatcher(Arc<dyn ExternalRecoveryDispatcher>);
+pub struct SharedExternalDispatcher(Arc<dyn ExternalDispatcher>);
 
 impl fmt::Debug for SharedExternalDispatcher {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -287,7 +295,7 @@ impl fmt::Debug for SharedExternalDispatcher {
 }
 
 impl SharedExternalDispatcher {
-    pub(crate) fn new(dispatcher: Arc<dyn ExternalRecoveryDispatcher>) -> Self {
+    pub(crate) fn new(dispatcher: Arc<dyn ExternalDispatcher>) -> Self {
         Self(dispatcher)
     }
 }
@@ -295,6 +303,12 @@ impl SharedExternalDispatcher {
 impl ExternalRecoveryDispatcher for SharedExternalDispatcher {
     fn dispatch(&self, started: StartedRecovery) -> DispatchFuture<'_> {
         self.0.dispatch(started)
+    }
+}
+
+impl AgentStopDispatcher for SharedExternalDispatcher {
+    fn request_stop(&self, candidate: AgentStopCandidate) -> AgentStopFuture<'_> {
+        self.0.request_stop(candidate)
     }
 }
 
