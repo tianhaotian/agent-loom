@@ -99,6 +99,19 @@ impl DurableStore for PostgresStore {
         })
     }
 
+    fn list_child_runs<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        parent_run_id: RunId,
+    ) -> StoreFuture<'a, Vec<RunSnapshot>> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor
+                .list_child_runs(&client, context, parent_run_id)
+                .await
+        })
+    }
+
     fn revise_plan<'a>(
         &'a self,
         context: &'a CommandContext,

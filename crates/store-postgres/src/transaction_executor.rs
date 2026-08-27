@@ -253,6 +253,8 @@ impl PostgresTransactionExecutor {
 
         let tenant_id = uuid(context.tenant_id.into_bytes());
         let run_id = uuid(command.run_id.into_bytes());
+        let parent_run_id = command.parent_run_id.map(|id| uuid(id.into_bytes()));
+        let parent_task_id = command.parent_task_id.map(|id| uuid(id.into_bytes()));
         let workflow_version_id = command.workflow_version_id.map(|id| uuid(id.into_bytes()));
         let coordinator_agent_version_id = command
             .coordinator_agent_version_id
@@ -271,6 +273,45 @@ impl PostgresTransactionExecutor {
             "execution generation",
         )?;
 
+        if let Some(parent_run_id) = parent_run_id {
+            let parent_status = transaction
+                .query_opt(
+                    "SELECT status FROM agent_loom.runs \
+                     WHERE tenant_id = $1 AND run_id = $2 FOR SHARE",
+                    &[&tenant_id, &parent_run_id],
+                )
+                .await
+                .map_err(map_database_error)?
+                .map(|row| row.get::<_, String>(0))
+                .ok_or_else(|| store_error(StoreErrorCode::NotFound, "parent Run was not found"))?;
+            if matches!(
+                parent_status.as_str(),
+                "completed" | "failed" | "cancelled" | "timed_out"
+            ) {
+                return Err(store_error(
+                    StoreErrorCode::TerminalRun,
+                    "parent Run is terminal",
+                ));
+            }
+            if let Some(parent_task_id) = parent_task_id {
+                let exists = transaction
+                    .query_opt(
+                        "SELECT 1 FROM agent_loom.tasks \
+                         WHERE tenant_id = $1 AND run_id = $2 AND task_id = $3",
+                        &[&tenant_id, &parent_run_id, &parent_task_id],
+                    )
+                    .await
+                    .map_err(map_database_error)?
+                    .is_some();
+                if !exists {
+                    return Err(store_error(
+                        StoreErrorCode::NotFound,
+                        "parent Task was not found in parent Run",
+                    ));
+                }
+            }
+        }
+
         transaction
             .execute(
                 "INSERT INTO agent_loom.runs (\
@@ -279,15 +320,17 @@ impl PostgresTransactionExecutor {
                     execution_generation, next_event_sequence, current_checkpoint_id, \
                     terminal_event_id, input_json, state_summary_json, deadline, \
                     resume_blocked_reason, created_by, created_at, updated_at, terminal_at\
-                 ) VALUES ($1, $2, $3, $4, NULL, NULL, 'queued', NULL, 0, 0, 2, NULL, \
-                    NULL, $5, '{}'::jsonb, to_timestamp(($6::bigint)::double precision / 1000000.0), \
-                    NULL, $7, to_timestamp(($8::bigint)::double precision / 1000000.0), \
-                    to_timestamp(($8::bigint)::double precision / 1000000.0), NULL)",
+                 ) VALUES ($1, $2, $3, $4, $5, $6, 'queued', NULL, 0, 0, 2, NULL, \
+                    NULL, $7, '{}'::jsonb, to_timestamp(($8::bigint)::double precision / 1000000.0), \
+                    NULL, $9, to_timestamp(($10::bigint)::double precision / 1000000.0), \
+                    to_timestamp(($10::bigint)::double precision / 1000000.0), NULL)",
                 &[
                     &run_id,
                     &tenant_id,
                     &workflow_version_id,
                     &coordinator_agent_version_id,
+                    &parent_run_id,
+                    &parent_task_id,
                     &input,
                     &deadline,
                     &context.actor_ref,
@@ -8410,6 +8453,8 @@ fn validate_create_run(command: &CreateRun) -> StoreResult<()> {
         }
     }
     if plan_revision.created_event_id != command.initial_event_id
+        || command.parent_run_id == Some(command.run_id)
+        || (command.parent_task_id.is_some() && command.parent_run_id.is_none())
         || plan_revision.plan_revision_id.is_nil()
         || plan_revision.schema_version == 0
         || computed_plan_digest != *plan_revision.plan_digest.as_bytes()
@@ -10042,6 +10087,8 @@ mod tests {
         let create_context = command_context(tenant_id, ids(6), "create_run", &tenant_key, 6);
         let create = CreateRun {
             run_id,
+            parent_run_id: None,
+            parent_task_id: None,
             workflow_version_id: None,
             coordinator_agent_version_id: None,
             input: payload(&json!({"request": "smoke"})),
@@ -10628,6 +10675,8 @@ mod tests {
                 &control_create_context,
                 CreateRun {
                     run_id: control_run_id,
+                    parent_run_id: None,
+                    parent_task_id: None,
                     workflow_version_id: None,
                     coordinator_agent_version_id: None,
                     input: payload(&json!({"request": "control-smoke"})),
@@ -10924,6 +10973,8 @@ mod tests {
     ) -> CreateRun {
         CreateRun {
             run_id,
+            parent_run_id: None,
+            parent_task_id: None,
             workflow_version_id: None,
             coordinator_agent_version_id: None,
             input: payload(&json!({"request": label})),

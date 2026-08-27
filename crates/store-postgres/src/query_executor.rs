@@ -86,6 +86,39 @@ impl crate::PostgresTransactionExecutor {
             .transpose()
     }
 
+    /// Lists direct Child Runs in stable creation order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for unavailable PostgreSQL or malformed
+    /// persisted Run metadata.
+    pub async fn list_child_runs(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        parent_run_id: RunId,
+    ) -> StoreResult<Vec<RunSnapshot>> {
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let parent_run_id = uuid(parent_run_id.into_bytes());
+        client
+            .query(
+                "SELECT run_id, workflow_version_id, status, suspended_from_status, version, \
+                        execution_generation, next_event_sequence, current_checkpoint_id, \
+                        terminal_event_id, \
+                        CASE WHEN deadline IS NULL THEN NULL \
+                             ELSE (extract(epoch FROM deadline) * 1000000)::bigint END, \
+                        (extract(epoch FROM updated_at) * 1000000)::bigint \
+                 FROM agent_loom.runs WHERE tenant_id = $1 AND parent_run_id = $2 \
+                 ORDER BY created_at, run_id",
+                &[&tenant_id, &parent_run_id],
+            )
+            .await
+            .map_err(map_database_error)?
+            .iter()
+            .map(|row| decode_run(context.tenant_id, row))
+            .collect()
+    }
+
     /// Lists immutable Plan revisions for one Run in revision order.
     ///
     /// # Errors

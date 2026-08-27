@@ -1277,6 +1277,53 @@ async fn context_patches_are_versioned_merged_idempotent_and_lineaged() {
     assert_eq!(snapshots[1]["context"]["facts"]["approved"], true);
 }
 
+#[tokio::test]
+async fn child_runs_are_parent_scoped_idempotent_and_queryable() {
+    let Ok(database_url) = std::env::var("AGENT_LOOM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos();
+    let (application, parent_run_id) = bootstrap_outbox_test(&database_url, nonce).await;
+    for branch in ["research", "review"] {
+        let request = json!({
+            "input": {"branch": branch},
+            "parent_run_id": parent_run_id,
+        });
+        let response = application
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/runs")
+                    .header("authorization", "Bearer mvp-e2e-api-key")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", format!("child-{branch}-{nonce}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&request).expect("encode Child Run request"),
+                    ))
+                    .expect("build Child Run request"),
+            )
+            .await
+            .expect("Child Run response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    let children = get_json(
+        application.router.clone(),
+        &format!("/v1/runs/{parent_run_id}/children"),
+    )
+    .await;
+    let children = children
+        .as_array()
+        .expect("Child Runs response is an array");
+    assert_eq!(children.len(), 2);
+    assert!(children.iter().all(|child| child["status"] == "queued"));
+}
+
 async fn get_context_snapshots(
     application: &agent_loom_server::BootstrappedServer,
     run_id: &str,

@@ -65,6 +65,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/workflows/{workflow_id}", get(get_workflow))
         .route("/v1/runs", post(create_run))
         .route("/v1/runs/{run_id}", get(get_run))
+        .route("/v1/runs/{run_id}/children", get(list_child_runs))
         .route(
             "/v1/runs/{run_id}/plan-revisions",
             get(list_plan_revisions).post(revise_plan),
@@ -201,6 +202,10 @@ pub struct CreateRunRequest {
     pub input: Value,
     #[serde(default)]
     pub deadline_micros: Option<i64>,
+    #[serde(default)]
+    pub parent_run_id: Option<String>,
+    #[serde(default)]
+    pub parent_task_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -224,6 +229,21 @@ async fn create_run(
         ));
     }
     let run_id = RunId::from_bytes(random_id());
+    let parent_run_id = request
+        .parent_run_id
+        .as_deref()
+        .map(parse_run_id)
+        .transpose()?;
+    let parent_task_id = request
+        .parent_task_id
+        .as_deref()
+        .map(parse_task_id)
+        .transpose()?;
+    if parent_task_id.is_some() && parent_run_id.is_none() {
+        return Err(ApiError::bad_request(
+            "parent_task_id requires parent_run_id",
+        ));
+    }
     let idempotency = headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
@@ -259,6 +279,8 @@ async fn create_run(
     let initial_plan = workflow.spec.clone();
     let command = CreateRun {
         run_id,
+        parent_run_id,
+        parent_task_id,
         workflow_version_id: Some(workflow.workflow_version_id),
         coordinator_agent_version_id: Some(state.coordinator_agent_version_id),
         input: payload(&request.input)?,
@@ -320,6 +342,22 @@ async fn get_run(
         .map(RunResponse::from)
         .map(Json)
         .ok_or_else(|| ApiError::not_found("Run was not found"))
+}
+
+async fn list_child_runs(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> ApiResult<Json<Vec<RunResponse>>> {
+    let run_id = parse_run_id(&run_id)?;
+    load_run(&state, run_id).await?;
+    let children = state
+        .store
+        .list_child_runs(&query_context(&state), run_id)
+        .await?
+        .into_iter()
+        .map(RunResponse::from)
+        .collect();
+    Ok(Json(children))
 }
 
 #[derive(Debug, Deserialize, Serialize)]

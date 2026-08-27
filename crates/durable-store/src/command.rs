@@ -63,6 +63,8 @@ pub struct InitialTaskDependency {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateRun {
     pub run_id: RunId,
+    pub parent_run_id: Option<RunId>,
+    pub parent_task_id: Option<TaskId>,
     pub workflow_version_id: Option<WorkflowVersionId>,
     pub coordinator_agent_version_id: Option<AgentVersionId>,
     pub input: JsonPayload,

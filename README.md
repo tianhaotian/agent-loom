@@ -44,6 +44,8 @@ ExecutionPlan 的初始 Task 可以声明有向无环依赖、`all`/`any` JoinPo
 
 每个 ExecutionPlan Task 还会固定引用创建时的 ContextSnapshot，并可用 JSON Pointer 列表声明 ContextProjection。空投影返回完整 Snapshot，非空投影返回稳定的 Pointer→值视图；Task 不会因后续 Context revision 漂移。
 
+创建 Run 时可指定 `parent_run_id` 与可选 `parent_task_id`。Store 在子 Run 创建事务内锁定并校验父 Run 非终态、父 Task 归属，随后依靠既有复合外键持久化父子关系；直接 Child Run 可通过父 Run API 稳定分页前的创建顺序查询，为 Fan-out 提供可恢复身份和审计基础。
+
 ## MVP 快速开始
 
 MVP 会在启动时自动执行 PostgreSQL migration、创建一个由 `AGENT_LOOM_TENANT_KEY` 标识的开发 Tenant，并启动 HTTP API、交付 Worker、Scheduler、Recovery Worker、Agent Event/Stop/Status Worker、Outbox Publisher、Lease Reclaimer 和超时维护服务。详细边界与 API 示例见 [MVP 使用说明](./MVP.md)。

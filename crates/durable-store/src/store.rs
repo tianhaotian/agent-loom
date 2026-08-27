@@ -62,6 +62,12 @@ pub trait DurableStore: Send + Sync {
         run_id: RunId,
     ) -> StoreFuture<'a, Option<JsonPayload>>;
 
+    fn list_child_runs<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        parent_run_id: RunId,
+    ) -> StoreFuture<'a, Vec<RunSnapshot>>;
+
     fn revise_plan<'a>(
         &'a self,
         context: &'a CommandContext,
