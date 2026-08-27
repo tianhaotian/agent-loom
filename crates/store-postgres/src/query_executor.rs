@@ -6,11 +6,11 @@ use agent_loom_domain::{
     WaitSnapshot, WaitStatus, WorkflowId, WorkflowSnapshot, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
-    AgentInvocation, AgentStatusCandidate, AgentStatusPage, AgentStatusQuery, AgentStopCandidate,
-    AgentStopPage, AgentStopQuery, DueWorkCandidate, DueWorkKind, DueWorkPage, DueWorkQuery,
-    DueWorkTarget, EventCursor, EventPage, MaintenanceCandidate, MaintenanceKind, MaintenancePage,
-    MaintenanceQuery, MaintenanceTarget, QueryContext, StoreError, StoreErrorCode, StoreResult,
-    ToolInvocation,
+    AgentEventCandidate, AgentEventPage, AgentEventQuery, AgentInvocation, AgentStatusCandidate,
+    AgentStatusPage, AgentStatusQuery, AgentStopCandidate, AgentStopPage, AgentStopQuery,
+    DueWorkCandidate, DueWorkKind, DueWorkPage, DueWorkQuery, DueWorkTarget, EventCursor,
+    EventPage, MaintenanceCandidate, MaintenanceKind, MaintenancePage, MaintenanceQuery,
+    MaintenanceTarget, QueryContext, StoreError, StoreErrorCode, StoreResult, ToolInvocation,
 };
 use serde_json::Value;
 use tokio_postgres::{Client, Row};
@@ -26,6 +26,7 @@ const MAX_DUE_WORK_PAGE_SIZE: u32 = 1_000;
 const MAX_MAINTENANCE_PAGE_SIZE: u32 = 1_000;
 const MAX_AGENT_STOP_PAGE_SIZE: u32 = 1_000;
 const MAX_AGENT_STATUS_PAGE_SIZE: u32 = 1_000;
+const MAX_AGENT_EVENT_PAGE_SIZE: u32 = 1_000;
 
 impl crate::PostgresTransactionExecutor {
     /// Reads the authoritative Run projection for one tenant.
@@ -529,6 +530,56 @@ impl crate::PostgresTransactionExecutor {
         Ok(AgentStatusPage { candidates })
     }
 
+    /// Returns due resumable remote event reads using PostgreSQL transaction time.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for an invalid limit, database failure, or
+    /// malformed persisted Agent state.
+    pub async fn scan_agent_events(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        query: AgentEventQuery,
+    ) -> StoreResult<AgentEventPage> {
+        if query.limit == 0 {
+            return Err(StoreError::new(
+                StoreErrorCode::ConstraintViolation,
+                agent_loom_durable_store::RetryClass::Never,
+                "agent event page limit must be positive",
+            ));
+        }
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let limit = i64::from(query.limit.min(MAX_AGENT_EVENT_PAGE_SIZE));
+        let rows = client
+            .query(
+                "SELECT x.agent_execution_id, x.run_id, x.stage_execution_id, x.task_id, \
+                        x.endpoint_id, x.agent_version_id, x.status, x.version, \
+                        x.remote_run_ref, x.remote_session_ref, x.remote_protocol_version, \
+                        x.event_cursor, x.cursor_version, \
+                        CASE WHEN x.retry_at IS NULL THEN NULL ELSE \
+                            (extract(epoch FROM x.retry_at) * 1000000)::bigint END, \
+                        (extract(epoch FROM x.updated_at) * 1000000)::bigint, \
+                        r.version, r.execution_generation, \
+                        (extract(epoch FROM x.status_poll_at) * 1000000)::bigint \
+                 FROM agent_loom.agent_executions x \
+                 JOIN agent_loom.runs r ON r.tenant_id = x.tenant_id AND r.run_id = x.run_id \
+                 WHERE x.tenant_id = $1 AND x.status = 'running' \
+                   AND x.remote_run_ref IS NOT NULL \
+                   AND x.remote_protocol_version IS NOT NULL \
+                   AND x.status_poll_at <= transaction_timestamp() \
+                 ORDER BY x.status_poll_at, x.agent_execution_id LIMIT $2",
+                &[&tenant_id, &limit],
+            )
+            .await
+            .map_err(map_database_error)?;
+        let candidates = rows
+            .iter()
+            .map(|row| decode_agent_event(context.tenant_id, row))
+            .collect::<StoreResult<Vec<_>>>()?;
+        Ok(AgentEventPage { candidates })
+    }
+
     /// Loads the immutable Tool Adapter invocation envelope for one execution.
     ///
     /// # Errors
@@ -690,6 +741,22 @@ fn decode_agent_status(tenant_id: TenantId, row: &Row) -> StoreResult<AgentStatu
     if !candidate.shape_is_valid() {
         return Err(inconsistent(
             "Agent status candidate violates its durable shape",
+        ));
+    }
+    Ok(candidate)
+}
+
+fn decode_agent_event(tenant_id: TenantId, row: &Row) -> StoreResult<AgentEventCandidate> {
+    let (mut execution, expected_run) = decode_agent_control_execution(tenant_id, row)?;
+    execution.status_poll_at = Some(UnixMicros::new(row.get(17)));
+    let candidate = AgentEventCandidate {
+        tenant_id,
+        execution,
+        expected_run,
+    };
+    if !candidate.shape_is_valid() {
+        return Err(inconsistent(
+            "Agent event candidate violates its durable shape",
         ));
     }
     Ok(candidate)

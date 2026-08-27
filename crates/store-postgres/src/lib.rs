@@ -105,6 +105,12 @@ pub const MIGRATIONS: &[EmbeddedMigration] = &[
         created_tables: &[],
         sql: include_str!("../migrations/0012_agent_status_poll.sql"),
     },
+    EmbeddedMigration {
+        logical_id: "0013_agent_event_poll",
+        logical_model_version: 14,
+        created_tables: &[],
+        sql: include_str!("../migrations/0013_agent_event_poll.sql"),
+    },
 ];
 
 pub const fn capabilities() -> StoreCapabilities {
@@ -137,7 +143,7 @@ mod tests {
 
     #[test]
     fn migration_batch_is_embedded() {
-        assert_eq!(MIGRATIONS.len(), 13);
+        assert_eq!(MIGRATIONS.len(), 14);
         assert_eq!(MIGRATIONS[0].logical_id, "0000_migration_meta");
         assert!(MIGRATIONS[0].sql.contains("schema_migrations"));
         assert!(MIGRATIONS[0].sql.contains("timestamptz(6)"));

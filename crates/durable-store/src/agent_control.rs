@@ -59,6 +59,35 @@ pub struct AgentStatusPage {
     pub candidates: Vec<AgentStatusCandidate>,
 }
 
+/// One due resumable remote event read backed by an Agent cursor version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentEventCandidate {
+    pub tenant_id: TenantId,
+    pub execution: AgentExecutionSnapshot,
+    pub expected_run: ExpectedRun,
+}
+
+impl AgentEventCandidate {
+    pub fn shape_is_valid(&self) -> bool {
+        self.tenant_id == self.execution.tenant_id
+            && self.execution.status == agent_loom_domain::AgentExecutionStatus::Running
+            && self.execution.remote_run_ref.is_some()
+            && self.execution.remote_protocol_version.is_some()
+            && self.execution.status_poll_at.is_some()
+            && self.expected_run.run_id == self.execution.run_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentEventQuery {
+    pub limit: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentEventPage {
+    pub candidates: Vec<AgentEventCandidate>,
+}
+
 #[cfg(test)]
 mod tests {
     use agent_loom_domain::{

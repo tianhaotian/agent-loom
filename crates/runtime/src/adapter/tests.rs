@@ -2,8 +2,9 @@ use std::sync::{Arc, Mutex};
 
 use agent_loom_adapter_core::{
     AdapterFuture, AgentCapabilities, CompensationOutcome, CompensationRequest, EventReadLimits,
-    RemoteAgentRef, RemoteAgentSnapshot, RemoteEventBatch, ResolvedAuth, SideEffectClass,
-    StopRequestOutcome, ToolCapabilities, ToolDescriptor, ToolQueryOutcome, TraceContext,
+    NormalizedAgentEvent, RemoteAgentRef, RemoteAgentSnapshot, RemoteEventBatch, ResolvedAuth,
+    SideEffectClass, StopRequestOutcome, ToolCapabilities, ToolDescriptor, ToolQueryOutcome,
+    TraceContext,
 };
 use agent_loom_domain::{
     AgentExecutionSnapshot, AgentExecutionStatus, CorrelationId, DurationMicros, RunId, TaskId,
@@ -23,6 +24,7 @@ struct FakeStoreState {
     tool_outcome: Mutex<Option<RecordToolOutcome>>,
     agent_outcome: Mutex<Option<RecordAgentSubmission>>,
     agent_stop_outcome: Mutex<Option<RecordAgentOutcome>>,
+    agent_event_batch: Mutex<Option<AppendAgentEvents>>,
 }
 
 #[derive(Clone, Debug)]
@@ -112,6 +114,43 @@ impl AdapterDispatchStore for FakeStore {
             })
         })
     }
+
+    fn append_agent_events<'a>(
+        &'a self,
+        _context: &'a CommandContext,
+        command: AppendAgentEvents,
+    ) -> StoreFuture<'a, Committed<agent_loom_durable_store::AgentEventBatchOutcome>> {
+        Box::pin(async move {
+            *self
+                .0
+                .agent_event_batch
+                .lock()
+                .expect("agent event batch lock") = Some(command.clone());
+            Ok(Committed {
+                disposition: CommandDisposition::Applied,
+                value: agent_loom_durable_store::AgentEventBatchOutcome {
+                    tenant_id: tenant_id(),
+                    agent_execution_id: command.agent_execution_id,
+                    run_id: command.expected_run.run_id,
+                    accepted_receipts: command
+                        .events
+                        .iter()
+                        .map(|event| event.receipt_id)
+                        .collect(),
+                    duplicate_receipts: Vec::new(),
+                    cursor_version: command.expected_cursor_version + 1,
+                    run_status: agent_loom_domain::RunStatus::Running,
+                },
+                event_ids: command
+                    .events
+                    .iter()
+                    .filter_map(|event| event.local_event_id)
+                    .collect(),
+                durable_follow_ups: Vec::new(),
+                post_commit_hints: Vec::new(),
+            })
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -173,6 +212,7 @@ struct FakeAgentAdapter {
     stop_calls: SeenStopCalls,
     stop_outcome: StopRequestOutcome,
     status_snapshot: Option<RemoteAgentSnapshot>,
+    event_batch: Option<RemoteEventBatch>,
 }
 
 impl AgentServerAdapter for FakeAgentAdapter {
@@ -231,7 +271,8 @@ impl AgentServerAdapter for FakeAgentAdapter {
         _cursor: Option<&'a str>,
         _limits: EventReadLimits,
     ) -> AdapterFuture<'a, RemoteEventBatch> {
-        Box::pin(async { panic!("events are not used by submission tests") })
+        let batch = self.event_batch.clone();
+        Box::pin(async move { Ok(batch.expect("events are configured for this test")) })
     }
 
     fn request_stop<'a>(
@@ -360,6 +401,7 @@ fn state() -> Arc<FakeStoreState> {
         tool_outcome: Mutex::new(None),
         agent_outcome: Mutex::new(None),
         agent_stop_outcome: Mutex::new(None),
+        agent_event_batch: Mutex::new(None),
     })
 }
 
@@ -438,6 +480,7 @@ fn registry_agent(seen: Arc<Mutex<Option<AgentRunRequest>>>) -> Arc<dyn AgentSer
         stop_calls: Arc::new(Mutex::new(Vec::new())),
         stop_outcome: StopRequestOutcome::Unsupported,
         status_snapshot: None,
+        event_batch: None,
     })
 }
 
@@ -593,6 +636,7 @@ async fn agent_stop_uses_stable_identity_and_records_reconciliation() {
         stop_calls: Arc::clone(&stop_calls),
         stop_outcome: StopRequestOutcome::Accepted { cooperative: true },
         status_snapshot: None,
+        event_batch: None,
     });
     let dispatcher = dispatcher(
         FakeStore(Arc::clone(&state)),
@@ -657,6 +701,7 @@ async fn agent_status_query_records_the_authoritative_remote_result() {
             status: RemoteAgentStatus::Completed,
             result: Some(result.clone()),
         }),
+        event_batch: None,
     });
     let dispatcher = dispatcher(
         FakeStore(Arc::clone(&state)),
@@ -693,6 +738,75 @@ async fn agent_status_query_records_the_authoritative_remote_result() {
     assert_eq!(recorded.status, AgentExecutionStatus::Succeeded);
     assert_eq!(recorded.result, Some(result));
     assert_eq!(recorded.next_status_poll_at, None);
+}
+
+#[tokio::test]
+async fn agent_event_read_normalizes_deduplicates_and_schedules_terminal_reconciliation() {
+    let state = state();
+    let payload = JsonPayload::from_validated_bytes(br#"{"progress":100}"#.to_vec());
+    let remote_event = NormalizedAgentEvent {
+        source_event_id: Some("remote-event-1".to_owned()),
+        source_sequence: Some(1),
+        kind: "agent.progress".to_owned(),
+        authoritative: true,
+        payload: payload.clone(),
+        raw_digest: payload_digest(&payload),
+    };
+    let agent: Arc<dyn AgentServerAdapter> = Arc::new(FakeAgentAdapter {
+        seen: Arc::new(Mutex::new(None)),
+        stop_calls: Arc::new(Mutex::new(Vec::new())),
+        stop_outcome: StopRequestOutcome::Unsupported,
+        status_snapshot: None,
+        event_batch: Some(RemoteEventBatch {
+            events: vec![remote_event.clone(), remote_event],
+            next_cursor: Some("cursor-2".to_owned()),
+            terminal: true,
+        }),
+    });
+    let dispatcher = dispatcher(
+        FakeStore(Arc::clone(&state)),
+        registry_tool(Arc::new(Mutex::new(None)), false),
+        agent,
+    );
+    let mut execution = agent_snapshot();
+    execution.status = AgentExecutionStatus::Running;
+    execution.version = 6;
+    execution.remote_run_ref = Some("remote-run-1".to_owned());
+    execution.remote_session_ref = Some("session-1".to_owned());
+    execution.remote_protocol_version = Some("test-v1".to_owned());
+    execution.status_poll_at = Some(UnixMicros::new(100));
+    execution.event_cursor = Some("cursor-1".to_owned());
+    execution.cursor_version = 2;
+    let candidate = AgentEventCandidate {
+        tenant_id: tenant_id(),
+        execution,
+        expected_run: ExpectedRun {
+            run_id: run_id(),
+            version: Some(9),
+            execution_generation: Some(7),
+        },
+    };
+
+    crate::AgentEventDispatcher::read_events(&dispatcher, candidate)
+        .await
+        .expect("event dispatch");
+
+    let recorded = state
+        .agent_event_batch
+        .lock()
+        .expect("agent event batch lock")
+        .clone()
+        .expect("recorded event batch");
+    assert_eq!(recorded.expected_cursor_version, 2);
+    assert_eq!(recorded.next_cursor.as_deref(), Some("cursor-2"));
+    assert_eq!(recorded.next_status_poll_at, Some(UnixMicros::new(30_002)));
+    assert!(recorded.remote_terminal);
+    assert_eq!(recorded.events.len(), 1);
+    assert_eq!(
+        recorded.events[0].source_cursor.as_deref(),
+        Some("cursor-2")
+    );
+    assert!(recorded.events[0].local_event_id.is_some());
 }
 
 #[tokio::test]

@@ -2392,11 +2392,12 @@ impl PostgresTransactionExecutor {
         let current_status = execution.status.as_str();
         let updated = transaction
             .execute(
-                "UPDATE agent_loom.agent_executions SET status = $3, version = $4, \
+                "UPDATE agent_loom.agent_executions SET status = $3::text, version = $4, \
                     remote_run_ref = $5, remote_session_ref = $6, \
                     remote_protocol_version = $7, error_code = $8, \
                     retry_at = to_timestamp(($9::bigint)::double precision / 1000000.0), \
-                    status_poll_at = NULL, \
+                    status_poll_at = CASE WHEN $3::text = 'running' THEN \
+                        to_timestamp(($11::bigint)::double precision / 1000000.0) ELSE NULL END, \
                     completed_at = CASE WHEN $10 THEN \
                         to_timestamp(($11::bigint)::double precision / 1000000.0) ELSE NULL END, \
                     updated_at = to_timestamp(($11::bigint)::double precision / 1000000.0) \
@@ -2483,7 +2484,8 @@ impl PostgresTransactionExecutor {
             remote_run_ref: projection.remote_run_ref.clone(),
             remote_session_ref: projection.remote_session_ref.clone(),
             remote_protocol_version: projection.remote_protocol_version.clone(),
-            status_poll_at: None,
+            status_poll_at: (effective_status == AgentExecutionStatus::Running)
+                .then_some(UnixMicros::new(db_now)),
             event_cursor: execution.event_cursor,
             cursor_version: nonnegative_u64(execution.cursor_version, "Agent cursor version")?,
             retry_at: projection.retry_at.map(UnixMicros::new),
@@ -2687,6 +2689,8 @@ impl PostgresTransactionExecutor {
             next_cursor_version,
             next_agent_version,
             projected_execution_outcome.as_ref(),
+            command.next_status_poll_at,
+            command.remote_terminal,
             db_now,
         )
         .await?;
@@ -2694,6 +2698,11 @@ impl PostgresTransactionExecutor {
             .as_ref()
             .is_some_and(|outcome| outcome.status.requires_reconciliation())
         {
+            durable_follow_ups.push(DurableFollowUp::ReconcileAgent {
+                execution_id: command.agent_execution_id,
+            });
+        }
+        if command.remote_terminal && projected_execution_outcome.is_none() {
             durable_follow_ups.push(DurableFollowUp::ReconcileAgent {
                 execution_id: command.agent_execution_id,
             });
@@ -5348,7 +5357,7 @@ async fn apply_agent_event_projection(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn update_agent_after_event_batch(
     transaction: &Transaction<'_>,
     tenant_id: Uuid,
@@ -5358,6 +5367,8 @@ async fn update_agent_after_event_batch(
     next_cursor_version: i64,
     next_agent_version: i64,
     projected_outcome: Option<&AgentEventExecutionOutcome>,
+    next_status_poll_at: Option<UnixMicros>,
+    remote_terminal: bool,
     db_now: i64,
 ) -> StoreResult<()> {
     let updated = if let Some(outcome) = projected_outcome {
@@ -5376,8 +5387,10 @@ async fn update_agent_after_event_batch(
         transaction
             .execute(
                 "UPDATE agent_loom.agent_executions SET event_cursor = $4, \
-                    cursor_version = $5, version = $6, status = $7, result_json = $8, \
+                    cursor_version = $5, version = $6, status = $7::text, result_json = $8, \
                     error_code = $9, retry_at = NULL, \
+                    status_poll_at = CASE WHEN $7::text = 'reconciling' THEN \
+                        to_timestamp(($13::bigint)::double precision / 1000000.0) ELSE NULL END, \
                     completed_at = CASE WHEN $10 THEN \
                         to_timestamp(($11::bigint)::double precision / 1000000.0) ELSE NULL END, \
                     last_synced_at = to_timestamp(($11::bigint)::double precision / 1000000.0), \
@@ -5397,19 +5410,27 @@ async fn update_agent_after_event_batch(
                     &terminal,
                     &db_now,
                     &execution.version,
+                    &next_status_poll_at.map(UnixMicros::get),
                 ],
             )
             .await
             .map_err(map_database_error)?
-    } else {
+    } else if remote_terminal {
+        if execution.status != "running" {
+            return Err(store_error(
+                StoreErrorCode::InvalidTransition,
+                "only a running Agent execution accepts a terminal event hint",
+            ));
+        }
         transaction
             .execute(
                 "UPDATE agent_loom.agent_executions SET event_cursor = $4, \
-                    cursor_version = $5, version = $6, \
-                    last_synced_at = to_timestamp(($7::bigint)::double precision / 1000000.0), \
-                    updated_at = to_timestamp(($7::bigint)::double precision / 1000000.0) \
+                    cursor_version = $5, version = $6, status = 'reconciling', \
+                    status_poll_at = to_timestamp(($7::bigint)::double precision / 1000000.0), \
+                    last_synced_at = to_timestamp(($8::bigint)::double precision / 1000000.0), \
+                    updated_at = to_timestamp(($8::bigint)::double precision / 1000000.0) \
                  WHERE tenant_id = $1 AND agent_execution_id = $2 AND cursor_version = $3 \
-                   AND version = $8",
+                   AND version = $9 AND status = 'running'",
                 &[
                     &tenant_id,
                     &execution_id,
@@ -5417,6 +5438,37 @@ async fn update_agent_after_event_batch(
                     &next_cursor,
                     &next_cursor_version,
                     &next_agent_version,
+                    &next_status_poll_at.map(UnixMicros::get),
+                    &db_now,
+                    &execution.version,
+                ],
+            )
+            .await
+            .map_err(map_database_error)?
+    } else {
+        if execution.status != "running" {
+            return Err(store_error(
+                StoreErrorCode::InvalidTransition,
+                "only a running Agent execution accepts a nonterminal event batch",
+            ));
+        }
+        transaction
+            .execute(
+                "UPDATE agent_loom.agent_executions SET event_cursor = $4, \
+                    cursor_version = $5, version = $6, \
+                    status_poll_at = to_timestamp(($7::bigint)::double precision / 1000000.0), \
+                    last_synced_at = to_timestamp(($8::bigint)::double precision / 1000000.0), \
+                    updated_at = to_timestamp(($8::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND agent_execution_id = $2 AND cursor_version = $3 \
+                   AND version = $9 AND status = 'running'",
+                &[
+                    &tenant_id,
+                    &execution_id,
+                    &execution.cursor_version,
+                    &next_cursor,
+                    &next_cursor_version,
+                    &next_agent_version,
+                    &next_status_poll_at.map(UnixMicros::get),
                     &db_now,
                     &execution.version,
                 ],

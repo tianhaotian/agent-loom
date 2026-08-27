@@ -2,8 +2,9 @@ use std::{fmt, future::Future, pin::Pin};
 
 use agent_loom_domain::TenantId;
 use agent_loom_durable_store::{
-    AgentStatusCandidate, AgentStatusPage, AgentStatusQuery, AgentStopCandidate, AgentStopPage,
-    AgentStopQuery, DurableStore, QueryContext, StoreError, StoreFuture,
+    AgentEventCandidate, AgentEventPage, AgentEventQuery, AgentStatusCandidate, AgentStatusPage,
+    AgentStatusQuery, AgentStopCandidate, AgentStopPage, AgentStopQuery, DurableStore,
+    QueryContext, StoreError, StoreFuture,
 };
 
 use crate::{PollingActivity, PollingFuture, PollingJob, PollingJobError};
@@ -36,6 +37,27 @@ pub trait AgentStatusStore: Send + Sync {
         context: &'a QueryContext,
         query: AgentStatusQuery,
     ) -> StoreFuture<'a, AgentStatusPage>;
+}
+
+pub trait AgentEventStore: Send + Sync {
+    fn scan_agent_events<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        query: AgentEventQuery,
+    ) -> StoreFuture<'a, AgentEventPage>;
+}
+
+impl<T> AgentEventStore for T
+where
+    T: DurableStore + ?Sized,
+{
+    fn scan_agent_events<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        query: AgentEventQuery,
+    ) -> StoreFuture<'a, AgentEventPage> {
+        DurableStore::scan_agent_events(self, context, query)
+    }
 }
 
 impl<T> AgentStatusStore for T
@@ -91,6 +113,26 @@ impl fmt::Display for AgentStatusDispatchError {
 }
 
 impl std::error::Error for AgentStatusDispatchError {}
+
+pub type AgentEventFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), AgentEventDispatchError>> + Send + 'a>>;
+
+pub trait AgentEventDispatcher: Send + Sync {
+    fn read_events(&self, candidate: AgentEventCandidate) -> AgentEventFuture<'_>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentEventDispatchError {
+    pub safe_message: String,
+}
+
+impl fmt::Display for AgentEventDispatchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.safe_message)
+    }
+}
+
+impl std::error::Error for AgentEventDispatchError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AgentStopWorkerConfig {
@@ -368,6 +410,140 @@ where
                     last_failure: None,
                 }),
                 AgentStatusPollOutcome::DispatchFailed { error, .. } => {
+                    Ok(PollingActivity::Progress {
+                        completed: 0,
+                        failed: 1,
+                        last_failure: Some(error.safe_message),
+                    })
+                }
+            }
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentEventWorkerConfig {
+    pub candidate_window: u32,
+}
+
+impl Default for AgentEventWorkerConfig {
+    fn default() -> Self {
+        Self {
+            candidate_window: 16,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentEventPollOutcome {
+    Idle,
+    Dispatched(AgentEventCandidate),
+    DispatchFailed {
+        candidate: AgentEventCandidate,
+        error: AgentEventDispatchError,
+    },
+}
+
+#[derive(Debug)]
+pub struct AgentEventWorker<S, D> {
+    store: S,
+    dispatcher: D,
+    query_context: QueryContext,
+    config: AgentEventWorkerConfig,
+}
+
+impl<S, D> AgentEventWorker<S, D>
+where
+    S: AgentEventStore,
+    D: AgentEventDispatcher,
+{
+    /// Builds a tenant-scoped resumable event worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the candidate window is zero.
+    pub fn new(
+        store: S,
+        dispatcher: D,
+        tenant_id: TenantId,
+        config: AgentEventWorkerConfig,
+    ) -> Result<Self, AgentStopWorkerError> {
+        if config.candidate_window == 0 {
+            return Err(AgentStopWorkerError::InvalidConfig);
+        }
+        Ok(Self {
+            store,
+            dispatcher,
+            query_context: QueryContext {
+                tenant_id,
+                actor_ref: "agent-loom-agent-events".to_owned(),
+                authoritative: true,
+            },
+            config,
+        })
+    }
+
+    /// Scans and dispatches at most one due remote event read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Store is unavailable or returns a malformed candidate.
+    pub async fn poll_once(&self) -> Result<AgentEventPollOutcome, AgentStopWorkerError> {
+        let page = self
+            .store
+            .scan_agent_events(
+                &self.query_context,
+                AgentEventQuery {
+                    limit: self.config.candidate_window,
+                },
+            )
+            .await
+            .map_err(AgentStopWorkerError::Store)?;
+        let Some(candidate) = page.candidates.into_iter().next() else {
+            return Ok(AgentEventPollOutcome::Idle);
+        };
+        if !candidate.shape_is_valid() {
+            return Err(AgentStopWorkerError::InvalidCandidate);
+        }
+        match self.dispatcher.read_events(candidate.clone()).await {
+            Ok(()) => Ok(AgentEventPollOutcome::Dispatched(candidate)),
+            Err(error) => Ok(AgentEventPollOutcome::DispatchFailed { candidate, error }),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct AgentEventPollingJob<S, D> {
+    worker: AgentEventWorker<S, D>,
+}
+
+impl<S, D> AgentEventPollingJob<S, D> {
+    pub const fn new(worker: AgentEventWorker<S, D>) -> Self {
+        Self { worker }
+    }
+}
+
+impl<S, D> PollingJob for AgentEventPollingJob<S, D>
+where
+    S: AgentEventStore,
+    D: AgentEventDispatcher,
+{
+    fn run_once(&self, _slot: u32) -> PollingFuture<'_> {
+        Box::pin(async move {
+            match self
+                .worker
+                .poll_once()
+                .await
+                .map_err(|error| PollingJobError {
+                    safe_message: error.to_string(),
+                })? {
+                AgentEventPollOutcome::Idle => Ok(PollingActivity::Idle),
+                AgentEventPollOutcome::Dispatched(_) => Ok(PollingActivity::Progress {
+                    completed: 1,
+                    failed: 0,
+                    last_failure: None,
+                }),
+                AgentEventPollOutcome::DispatchFailed { error, .. } => {
                     Ok(PollingActivity::Progress {
                         completed: 0,
                         failed: 1,

@@ -10,12 +10,12 @@ use agent_loom_adapter_core::{
 use agent_loom_domain::{
     AgentVersionId, Digest, DurationMicros, EndpointId, JsonPayload, UnixMicros,
 };
-use agent_loom_durable_store::{AgentStatusCandidate, AgentStopCandidate};
+use agent_loom_durable_store::{AgentEventCandidate, AgentStatusCandidate, AgentStopCandidate};
 use agent_loom_runtime::{
     AdapterContextFactory, AdapterContextFuture, AdapterContextSeed, AdapterRecoveryDispatcher,
-    AdapterRetrySchedule, AgentStatusDispatcher, AgentStatusFuture, AgentStopDispatcher,
-    AgentStopFuture, DispatchFuture, ExternalDispatchError, ExternalRecoveryDispatcher,
-    StartedRecovery, StaticAdapterRegistry,
+    AdapterRetrySchedule, AgentEventDispatcher, AgentEventFuture, AgentStatusDispatcher,
+    AgentStatusFuture, AgentStopDispatcher, AgentStopFuture, DispatchFuture, ExternalDispatchError,
+    ExternalRecoveryDispatcher, StartedRecovery, StaticAdapterRegistry,
 };
 use agent_loom_store_postgres::PostgresStore;
 use serde_json::json;
@@ -284,12 +284,15 @@ pub fn mock_dispatcher(
 }
 
 pub(crate) trait ExternalDispatcher:
-    ExternalRecoveryDispatcher + AgentStopDispatcher + AgentStatusDispatcher
+    ExternalRecoveryDispatcher + AgentStopDispatcher + AgentStatusDispatcher + AgentEventDispatcher
 {
 }
 
 impl<T> ExternalDispatcher for T where
-    T: ExternalRecoveryDispatcher + AgentStopDispatcher + AgentStatusDispatcher
+    T: ExternalRecoveryDispatcher
+        + AgentStopDispatcher
+        + AgentStatusDispatcher
+        + AgentEventDispatcher
 {
 }
 
@@ -325,6 +328,12 @@ impl AgentStopDispatcher for SharedExternalDispatcher {
 impl AgentStatusDispatcher for SharedExternalDispatcher {
     fn get_status(&self, candidate: AgentStatusCandidate) -> AgentStatusFuture<'_> {
         self.0.get_status(candidate)
+    }
+}
+
+impl AgentEventDispatcher for SharedExternalDispatcher {
+    fn read_events(&self, candidate: AgentEventCandidate) -> AgentEventFuture<'_> {
+        self.0.read_events(candidate)
     }
 }
 

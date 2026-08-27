@@ -4,15 +4,15 @@ use agent_loom_domain::{
     ToolExecutionSnapshot, WaitSnapshot, WorkflowId, WorkflowSnapshot,
 };
 use agent_loom_durable_store::{
-    AgentEventBatchOutcome, AgentInvocation, AgentStatusPage, AgentStatusQuery, AgentStopPage,
-    AgentStopQuery, AppendAgentEvents, ApplyDueWork, ApplyEvent, ApplyMaintenance,
-    BeginAgentResubmission, BeginToolRetryAttempt, ClaimTask, ClaimedTask, CommandContext,
-    Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome, DueWorkPage, DueWorkQuery,
-    DurableStore, EventCursor, EventPage, FailTask, LeaseReclaimOutcome, MaintenanceOutcome,
-    MaintenancePage, MaintenanceQuery, PrepareAgentExecution, PrepareToolExecution, QueryContext,
-    ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission, RecordToolOutcome,
-    RenewTaskLease, RetryClass, StoreCapabilities, StoreError, StoreErrorCode, StoreFuture,
-    StoreResult, ToolInvocation,
+    AgentEventBatchOutcome, AgentEventPage, AgentEventQuery, AgentInvocation, AgentStatusPage,
+    AgentStatusQuery, AgentStopPage, AgentStopQuery, AppendAgentEvents, ApplyDueWork, ApplyEvent,
+    ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt, ClaimTask, ClaimedTask,
+    CommandContext, Committed, CompleteTask, ControlRun, CreateRun, DueWorkOutcome, DueWorkPage,
+    DueWorkQuery, DurableStore, EventCursor, EventPage, FailTask, LeaseReclaimOutcome,
+    MaintenanceOutcome, MaintenancePage, MaintenanceQuery, PrepareAgentExecution,
+    PrepareToolExecution, QueryContext, ReclaimExpiredLease, RecordAgentOutcome,
+    RecordAgentSubmission, RecordToolOutcome, RenewTaskLease, RetryClass, StoreCapabilities,
+    StoreError, StoreErrorCode, StoreFuture, StoreResult, ToolInvocation,
 };
 use deadpool_postgres::{Object, Pool};
 
@@ -189,6 +189,19 @@ impl DurableStore for PostgresStore {
             let client = self.connection().await?;
             self.executor
                 .scan_agent_status(&client, context, query)
+                .await
+        })
+    }
+
+    fn scan_agent_events<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        query: AgentEventQuery,
+    ) -> StoreFuture<'a, AgentEventPage> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor
+                .scan_agent_events(&client, context, query)
                 .await
         })
     }

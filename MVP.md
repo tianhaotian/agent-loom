@@ -15,7 +15,7 @@
 - 部署审批 Wait、重复事件幂等消费和持久化恢复 Task；
 - 通过正式 Adapter/Execution 契约执行的 Mock Agent Server 与 Mock DevOps Tool；
 - 可通过配置切换的真实 HTTP Agent Server 与 DevOps Tool profile；
-- Scheduler、Recovery Worker、Agent Stop/Status Worker、过期 Lease 回收和 deadline/Wait/stale execution 维护服务；
+- Scheduler、Recovery Worker、Agent Event/Stop/Status Worker、过期 Lease 回收和 deadline/Wait/stale execution 维护服务；
 - 幂等命令、Run version 和 execution generation fencing；
 - JSON 结构化请求/Worker 日志和响应关联 ID；
 - 从 HTTP 创建到 PostgreSQL 终态、返工、审批、Tool 部署和 deadline 的自动化 E2E 验收。
@@ -96,6 +96,8 @@ curl -sS -X POST http://127.0.0.1:8080/v1/runs/RUN_ID/pause \
 将路径中的 `pause` 替换为 `resume` 或 `cancel` 即可执行对应操作。
 
 Pause/Cancel 会把已经提交或正在提交的远端 Agent 执行持久化为 `stopping`。后台 Agent Stop Worker 使用稳定幂等身份调用对应 Adapter；即使取消发生在提交响应返回前，迟到的远端 Run、Session 和协议版本仍会保留并继续触发停止。停止已受理或结果不确定时进入 `reconciling`，并由持久化 `status_poll_at` 驱动 Status Worker 调用 `get_status` 直到获得终态；不支持停止时进入 `manual_review`，不会把“请求已受理”误记为远端已取消。
+
+提交成功的远端 Agent 会立即获得持久化轮询时间。Agent Event Worker 调用 Adapter 的 `read_events` 并传入已提交 cursor；事件 receipt、原始 digest、本地 Event、cursor CAS 和下一次轮询时间在一个 PostgreSQL 事务内提交。相同 cursor 上的重复 Worker 调用复用 Command Receipt，重复远端事件复用确定性 receipt，因此重启和 at-least-once 读取不会重复推进。终态批次会把执行切换为 `reconciling`，Status Worker 核验最终状态后停止事件轮询。
 
 ### 注入等待事件
 

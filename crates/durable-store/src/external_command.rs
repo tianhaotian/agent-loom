@@ -216,6 +216,10 @@ pub struct AppendAgentEvents {
     pub agent_execution_id: AgentExecutionId,
     pub expected_cursor_version: u64,
     pub next_cursor: Option<String>,
+    /// Durable due time for the next event read, or immediate status
+    /// reconciliation when `remote_terminal` is true.
+    pub next_status_poll_at: Option<agent_loom_domain::UnixMicros>,
+    pub remote_terminal: bool,
     pub events: Vec<NormalizedAgentEventInput>,
 }
 
@@ -229,6 +233,9 @@ impl AppendAgentEvents {
     pub fn validate_shape(&self) -> Result<(), AgentEventBatchShapeError> {
         if self.next_cursor.as_ref().is_some_and(String::is_empty) {
             return Err(AgentEventBatchShapeError::InvalidCursor);
+        }
+        if self.next_status_poll_at.is_none() {
+            return Err(AgentEventBatchShapeError::MissingPollSchedule);
         }
         for (index, event) in self.events.iter().enumerate() {
             if event.event_kind.is_empty()
@@ -343,6 +350,7 @@ fn agent_event_outcome_shape_is_valid(outcome: &AgentEventExecutionOutcome) -> b
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentEventBatchShapeError {
     InvalidCursor,
+    MissingPollSchedule,
     InvalidEvent { index: usize },
     AuthorityMismatch { index: usize },
     DuplicateReceipt { index: usize },
@@ -410,6 +418,8 @@ mod tests {
             agent_execution_id: AgentExecutionId::from_bytes([2; 16]),
             expected_cursor_version: 0,
             next_cursor: Some("cursor-2".to_owned()),
+            next_status_poll_at: Some(agent_loom_domain::UnixMicros::new(10)),
+            remote_terminal: false,
             events: vec![event(3, 4), event(5, 6)],
         };
         batch.events[1].dedupe_key = batch.events[0].dedupe_key;
@@ -431,6 +441,8 @@ mod tests {
             agent_execution_id: AgentExecutionId::from_bytes([2; 16]),
             expected_cursor_version: 0,
             next_cursor: Some(String::new()),
+            next_status_poll_at: Some(agent_loom_domain::UnixMicros::new(10)),
+            remote_terminal: false,
             events: Vec::new(),
         };
 
@@ -538,6 +550,8 @@ mod tests {
             agent_execution_id: AgentExecutionId::from_bytes([2; 16]),
             expected_cursor_version: 0,
             next_cursor: Some("cursor-2".to_owned()),
+            next_status_poll_at: Some(agent_loom_domain::UnixMicros::new(10)),
+            remote_terminal: false,
             events,
         }
     }
