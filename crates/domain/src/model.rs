@@ -95,6 +95,16 @@ pub struct ContextSnapshot {
     pub created_at: UnixMicros,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskContextReference {
+    pub tenant_id: TenantId,
+    pub run_id: RunId,
+    pub task_id: TaskId,
+    pub context_snapshot_id: crate::ContextSnapshotId,
+    pub projection: JsonPayload,
+    pub context: JsonPayload,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextMergeStrategy {
     Replace,

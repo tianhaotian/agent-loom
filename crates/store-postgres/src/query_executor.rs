@@ -3,8 +3,8 @@ use agent_loom_domain::{
     ArtifactVersionRef, CheckpointId, ContextSnapshot, ContextSnapshotId, Digest, EndpointId,
     EventId, EventRecord, IdempotencyKey, JsonPayload, LogicalKey, PlanRevisionId,
     PlanRevisionSnapshot, RunId, RunSnapshot, ScopeKey, StageExecutionId, StageExecutionSnapshot,
-    StageStatus, TaskId, TenantId, ToolExecutionId, UnixMicros, WaitId, WaitSnapshot, WaitStatus,
-    WorkflowId, WorkflowSnapshot, WorkflowVersionId,
+    StageStatus, TaskContextReference, TaskId, TenantId, ToolExecutionId, UnixMicros, WaitId,
+    WaitSnapshot, WaitStatus, WorkflowId, WorkflowSnapshot, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
     AgentEventCandidate, AgentEventPage, AgentEventQuery, AgentInvocation, AgentStatusCandidate,
@@ -144,6 +144,50 @@ impl crate::PostgresTransactionExecutor {
             .iter()
             .map(|row| decode_context_snapshot(context.tenant_id, run_id, row))
             .collect()
+    }
+
+    /// Resolves the immutable Context reference and projection bound to a Task.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for unavailable PostgreSQL or malformed
+    /// persisted projection data.
+    pub async fn get_task_context(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        task_id: TaskId,
+    ) -> StoreResult<Option<TaskContextReference>> {
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let task_uuid = uuid(task_id.into_bytes());
+        client
+            .query_opt(
+                "SELECT r.run_id, r.context_snapshot_id, r.projection_json, s.context_json \
+                 FROM agent_loom.task_context_references r \
+                 JOIN agent_loom.context_snapshots s \
+                   ON s.tenant_id = r.tenant_id AND s.run_id = r.run_id \
+                  AND s.context_snapshot_id = r.context_snapshot_id \
+                 WHERE r.tenant_id = $1 AND r.task_id = $2",
+                &[&tenant_id, &task_uuid],
+            )
+            .await
+            .map_err(map_database_error)?
+            .map(|row| {
+                let projection: Value = row.get(2);
+                let source: Value = row.get(3);
+                let projected = project_context(&source, &projection)?;
+                Ok(TaskContextReference {
+                    tenant_id: context.tenant_id,
+                    run_id: RunId::from_bytes(row.get::<_, Uuid>(0).into_bytes()),
+                    task_id,
+                    context_snapshot_id: ContextSnapshotId::from_bytes(
+                        row.get::<_, Uuid>(1).into_bytes(),
+                    ),
+                    projection: decode_json_payload(&projection)?,
+                    context: decode_json_payload(&projected)?,
+                })
+            })
+            .transpose()
     }
 
     /// Reads the latest published/draft version of a Workflow definition.
@@ -1071,6 +1115,26 @@ fn decode_json_payload(value: &Value) -> StoreResult<JsonPayload> {
     serde_json::to_vec(value)
         .map(JsonPayload::from_validated_bytes)
         .map_err(|_| inconsistent("failed to encode persisted invocation JSON"))
+}
+
+fn project_context(source: &Value, projection: &Value) -> StoreResult<Value> {
+    let pointers = projection
+        .as_array()
+        .ok_or_else(|| inconsistent("Task ContextProjection is not an array"))?;
+    if pointers.is_empty() {
+        return Ok(source.clone());
+    }
+    let mut projected = serde_json::Map::new();
+    for pointer in pointers {
+        let pointer = pointer
+            .as_str()
+            .ok_or_else(|| inconsistent("Task ContextProjection entry is not a string"))?;
+        let value = source
+            .pointer(pointer)
+            .ok_or_else(|| inconsistent("Task ContextProjection pointer does not resolve"))?;
+        projected.insert(pointer.to_owned(), value.clone());
+    }
+    Ok(Value::Object(projected))
 }
 
 const fn due_work_kind(kind: DueWorkKind) -> &'static str {

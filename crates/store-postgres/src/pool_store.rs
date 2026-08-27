@@ -1,8 +1,8 @@
 use agent_loom_domain::{AgentExecutionId, ToolExecutionId};
 use agent_loom_domain::{
     AgentExecutionSnapshot, ArtifactRefSnapshot, ContextSnapshot, JsonPayload, OutboxMessage,
-    PlanRevisionSnapshot, RunId, RunSnapshot, StageExecutionSnapshot, ToolExecutionSnapshot,
-    WaitSnapshot, WorkflowId, WorkflowSnapshot,
+    PlanRevisionSnapshot, RunId, RunSnapshot, StageExecutionSnapshot, TaskContextReference, TaskId,
+    ToolExecutionSnapshot, WaitSnapshot, WorkflowId, WorkflowSnapshot,
 };
 use agent_loom_durable_store::{
     AgentEventBatchOutcome, AgentEventPage, AgentEventQuery, AgentInvocation, AgentStatusPage,
@@ -147,6 +147,19 @@ impl DurableStore for PostgresStore {
             let client = self.connection().await?;
             self.executor
                 .list_context_snapshots(&client, context, run_id)
+                .await
+        })
+    }
+
+    fn get_task_context<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        task_id: TaskId,
+    ) -> StoreFuture<'a, Option<TaskContextReference>> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor
+                .get_task_context(&client, context, task_id)
                 .await
         })
     }

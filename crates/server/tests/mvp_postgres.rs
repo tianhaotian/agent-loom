@@ -938,6 +938,7 @@ async fn execution_plan_dependencies_gate_task_claims_until_conditions_match() {
                 "handler": "delivery-mvp",
                 "kind": "model",
                 "join_policy": "all",
+                "context_projection": ["/goal"],
                 "depends_on": [{
                     "task": "root",
                     "condition": {
@@ -1078,6 +1079,13 @@ async fn execution_plan_dependencies_gate_task_claims_until_conditions_match() {
         .expect("claim joined Task")
         .expect("joined Task becomes claimable");
     assert_eq!(joined.value.task.logical_key.as_str(), "joined");
+    let projected_context = get_json(
+        application.router.clone(),
+        &format!("/v1/tasks/{}/context", joined.value.task.task_id),
+    )
+    .await;
+    assert_eq!(projected_context["projection"], json!(["/goal"]));
+    assert_eq!(projected_context["context"]["/goal"], "join tasks");
 }
 
 fn decode_test_id(value: &str) -> Result<[u8; 16], ()> {

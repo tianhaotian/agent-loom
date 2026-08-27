@@ -6,7 +6,7 @@
 
 已包含：
 
-- 启动时自动执行 `0000` 至 `0017` migration；
+- 启动时自动执行 `0000` 至 `0018` migration；
 - PostgreSQL 连接池与对象安全的 `DurableStore`；
 - API Key 认证边界和 tenant-scoped 查询/命令；
 - Workflow、Run、Stage、Artifact、Pending Action 和 Event HTTP 查询；
@@ -88,6 +88,8 @@ curl -sS -H 'authorization: Bearer replace-with-at-least-16-characters' \
 ### 查询和更新 Context
 
 `GET /v1/runs/RUN_ID/context-snapshots` 返回从 revision 1 开始的不可变 ContextSnapshot 历史。`POST` 要求 `Idempotency-Key`、`base_revision`、`merge_strategy`（`replace` 或 RFC 7396 `merge_patch`）和通用 JSON `patch`。Store 同时 fence Run version、execution generation 与当前 Context revision，并在一个事务中写入 ContextPatch、新 Snapshot、父级 lineage、`run.context_patched` Event、Outbox 和 Run 当前 Context 投影。
+
+ExecutionPlan Task 可声明 `context_projection` JSON Pointer 列表。每个 Task 创建时固定引用当时的 ContextSnapshot；`GET /v1/tasks/TASK_ID/context` 返回该不可变引用和投影结果。空列表表示完整 Context，非空列表返回以 Pointer 为键的投影视图，因此后续 Context Patch 不会改变已创建 Task 的输入视图。
 
 ### 暂停、恢复、取消
 

@@ -8,8 +8,8 @@ use std::{
 
 use agent_loom_domain::{
     AgentVersionId, CheckpointId, ContextMergeStrategy, ContextPatchId, ContextSnapshotId, EventId,
-    JsonPayload, LogicalKey, PlanRevisionId, RunId, RunSnapshot, RunStatus, StageStatus, TenantId,
-    UnixMicros, WaitStatus, WorkflowId,
+    JsonPayload, LogicalKey, PlanRevisionId, RunId, RunSnapshot, RunStatus, StageStatus, TaskId,
+    TenantId, UnixMicros, WaitStatus, WorkflowId,
 };
 use agent_loom_durable_store::{
     ApplyContextPatch, ApplyEvent, CommandDisposition, ControlRun, CreateRun, DurableStore,
@@ -73,6 +73,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/runs/{run_id}/context-snapshots",
             get(list_context_snapshots).post(apply_context_patch),
         )
+        .route("/v1/tasks/{task_id}/context", get(get_task_context))
         .route(
             "/v1/runs/{run_id}/events",
             get(list_events).post(apply_event),
@@ -602,6 +603,34 @@ async fn list_context_snapshots(
     Ok(Json(snapshots))
 }
 
+#[derive(Debug, Serialize)]
+struct TaskContextResponse {
+    task_id: String,
+    run_id: String,
+    context_snapshot_id: String,
+    projection: Value,
+    context: Value,
+}
+
+async fn get_task_context(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> ApiResult<Json<TaskContextResponse>> {
+    let task_id = parse_task_id(&task_id)?;
+    let reference = state
+        .store
+        .get_task_context(&query_context(&state), task_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Task ContextReference was not found"))?;
+    Ok(Json(TaskContextResponse {
+        task_id: reference.task_id.to_string(),
+        run_id: reference.run_id.to_string(),
+        context_snapshot_id: reference.context_snapshot_id.to_string(),
+        projection: serde_json::from_slice(reference.projection.as_bytes()).unwrap_or(Value::Null),
+        context: serde_json::from_slice(reference.context.as_bytes()).unwrap_or(Value::Null),
+    }))
+}
+
 const fn default_context_schema_version() -> u32 {
     1
 }
@@ -1126,6 +1155,12 @@ const fn disposition(value: CommandDisposition) -> &'static str {
 fn parse_run_id(value: &str) -> ApiResult<RunId> {
     decode_id(value)
         .map(RunId::from_bytes)
+        .map_err(ApiError::bad_request)
+}
+
+fn parse_task_id(value: &str) -> ApiResult<TaskId> {
+    decode_id(value)
+        .map(TaskId::from_bytes)
         .map_err(ApiError::bad_request)
 }
 

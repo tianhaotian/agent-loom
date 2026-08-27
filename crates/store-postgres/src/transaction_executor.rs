@@ -422,6 +422,16 @@ impl PostgresTransactionExecutor {
                 task,
             )
             .await?;
+            insert_task_context_reference(
+                &transaction,
+                tenant_id,
+                run_id,
+                initial_event_id,
+                uuid(command.initial_context.context_snapshot_id.into_bytes()),
+                db_now,
+                task,
+            )
+            .await?;
         }
 
         let snapshot = RunSnapshot {
@@ -3862,7 +3872,8 @@ impl PostgresTransactionExecutor {
                         (SELECT c.sequence FROM agent_loom.checkpoints c \
                          WHERE c.tenant_id = runs.tenant_id \
                            AND c.run_id = runs.run_id \
-                           AND c.checkpoint_id = runs.current_checkpoint_id) \
+                           AND c.checkpoint_id = runs.current_checkpoint_id), \
+                        current_context_snapshot_id \
                  FROM agent_loom.runs WHERE tenant_id = $1 AND run_id = $2 FOR UPDATE",
                 &[&tenant_id, &run_id],
             )
@@ -3946,6 +3957,16 @@ impl PostgresTransactionExecutor {
                 tenant_id,
                 run_id,
                 event_id,
+                db_now,
+                task,
+            )
+            .await?;
+            insert_task_context_reference(
+                &transaction,
+                tenant_id,
+                run_id,
+                event_id,
+                row.get::<_, Uuid>(13),
                 db_now,
                 task,
             )
@@ -7552,6 +7573,56 @@ async fn insert_initial_task_dependencies(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn insert_task_context_reference(
+    transaction: &Transaction<'_>,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    event_id: Uuid,
+    context_snapshot_id: Uuid,
+    db_now: i64,
+    task: &InitialTask,
+) -> StoreResult<()> {
+    let projection = json_value(&task.context_projection)?;
+    let Some(pointers) = projection.as_array() else {
+        return Err(invalid_command("Task ContextProjection must be an array"));
+    };
+    for (index, pointer) in pointers.iter().enumerate() {
+        let Some(pointer) = pointer.as_str() else {
+            return Err(invalid_command(
+                "Task ContextProjection entries must be JSON pointers",
+            ));
+        };
+        if !pointer.starts_with('/')
+            || pointers[index + 1..]
+                .iter()
+                .any(|other| other.as_str() == Some(pointer))
+        {
+            return Err(invalid_command("Task ContextProjection is invalid"));
+        }
+    }
+    transaction
+        .execute(
+            "INSERT INTO agent_loom.task_context_references (\
+                tenant_id, run_id, task_id, context_snapshot_id, projection_json, \
+                created_event_id, created_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, \
+                to_timestamp(($7::bigint)::double precision / 1000000.0))",
+            &[
+                &tenant_id,
+                &run_id,
+                &uuid(task.task_id.into_bytes()),
+                &context_snapshot_id,
+                &projection,
+                &event_id,
+                &db_now,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    Ok(())
+}
+
 async fn insert_initial_stage(
     transaction: &Transaction<'_>,
     tenant_id: Uuid,
@@ -10001,6 +10072,7 @@ mod tests {
                 input: payload(&json!({"prompt": "smoke"})),
                 dependencies: Vec::new(),
                 join_policy: JoinPolicy::All,
+                context_projection: payload(&json!([])),
             }],
         };
         let executor = PostgresTransactionExecutor::default();
@@ -10590,6 +10662,7 @@ mod tests {
                         input: payload(&json!({"prompt": "control-smoke"})),
                         dependencies: Vec::new(),
                         join_policy: JoinPolicy::All,
+                        context_projection: payload(&json!([])),
                     }],
                 },
             )
@@ -10881,6 +10954,7 @@ mod tests {
                 input: payload(&json!({"prompt": label})),
                 dependencies: Vec::new(),
                 join_policy: JoinPolicy::All,
+                context_projection: payload(&json!([])),
             }],
         }
     }

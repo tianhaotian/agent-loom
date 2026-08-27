@@ -543,7 +543,7 @@ mod tests {
         .migrate()
         .await
         .expect("apply MySQL migrations");
-        assert_eq!(report.target_model_version, 18);
+        assert_eq!(report.target_model_version, 19);
         drop(connection);
         pool.disconnect().await.expect("disconnect MySQL pool");
     }

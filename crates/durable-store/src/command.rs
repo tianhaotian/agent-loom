@@ -51,6 +51,7 @@ pub struct InitialTask {
     pub input: JsonPayload,
     pub dependencies: Vec<InitialTaskDependency>,
     pub join_policy: JoinPolicy,
+    pub context_projection: JsonPayload,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

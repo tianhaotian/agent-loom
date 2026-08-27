@@ -440,6 +440,7 @@ async fn create_task_run(
                     input: empty_payload(),
                     dependencies: Vec::new(),
                     join_policy: JoinPolicy::All,
+                    context_projection: JsonPayload::from_validated_bytes(b"[]".to_vec()),
                 }],
             },
         )

@@ -37,6 +37,7 @@ pub struct ExecutionTaskSpec {
     pub input: JsonPayload,
     pub dependencies: Vec<TaskDependencySpec>,
     pub join_policy: JoinPolicy,
+    pub context_projection: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +121,13 @@ impl ExecutionPlan {
                     return Err(ExecutionPlanShapeError::DuplicateDependency);
                 }
             }
+            for (projection_index, pointer) in task.context_projection.iter().enumerate() {
+                if !pointer.starts_with('/')
+                    || task.context_projection[projection_index + 1..].contains(pointer)
+                {
+                    return Err(ExecutionPlanShapeError::InvalidContextProjection);
+                }
+            }
         }
         if self.initial_tasks.iter().any(|task| {
             dependency_reaches(self, &task.logical_key, &task.logical_key, &mut Vec::new())
@@ -169,6 +177,7 @@ pub enum ExecutionPlanShapeError {
     SelfDependency,
     DuplicateDependency,
     DependencyCycle,
+    InvalidContextProjection,
 }
 
 #[cfg(test)]
@@ -190,6 +199,7 @@ mod tests {
             input: payload(),
             dependencies: Vec::new(),
             join_policy: JoinPolicy::All,
+            context_projection: Vec::new(),
         }
     }
 

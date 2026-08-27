@@ -75,6 +75,8 @@ struct TaskProfile {
     depends_on: Vec<TaskDependencyProfile>,
     #[serde(default)]
     join_policy: JoinPolicyProfile,
+    #[serde(default)]
+    context_projection: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,6 +171,7 @@ pub(crate) fn parse_execution_plan(spec: &JsonPayload) -> Result<ExecutionPlan, 
                     JoinPolicyProfile::All => JoinPolicy::All,
                     JoinPolicyProfile::Any => JoinPolicy::Any,
                 },
+                context_projection: task.context_projection,
             })
         })
         .collect::<Result<Vec<_>, PlanError>>()?;
@@ -257,6 +260,10 @@ pub(crate) fn materialize_execution_plan(
                     })
                     .collect(),
                 join_policy: task.join_policy,
+                context_projection: JsonPayload::from_validated_bytes(
+                    serde_json::to_vec(&task.context_projection)
+                        .map_err(|_| PlanError::InvalidPayload)?,
+                ),
             })
         })
         .collect::<Result<Vec<_>, PlanError>>()?;

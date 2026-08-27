@@ -3,7 +3,8 @@ use std::{future::Future, pin::Pin};
 use agent_loom_domain::{
     AgentExecutionId, AgentExecutionSnapshot, ArtifactRefSnapshot, ContextSnapshot, JsonPayload,
     OutboxMessage, PlanRevisionSnapshot, RunId, RunSnapshot, StageExecutionSnapshot,
-    ToolExecutionId, ToolExecutionSnapshot, WaitSnapshot, WorkflowId, WorkflowSnapshot,
+    TaskContextReference, TaskId, ToolExecutionId, ToolExecutionSnapshot, WaitSnapshot, WorkflowId,
+    WorkflowSnapshot,
 };
 
 use crate::{
@@ -84,6 +85,12 @@ pub trait DurableStore: Send + Sync {
         context: &'a QueryContext,
         run_id: RunId,
     ) -> StoreFuture<'a, Vec<ContextSnapshot>>;
+
+    fn get_task_context<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        task_id: TaskId,
+    ) -> StoreFuture<'a, Option<TaskContextReference>>;
 
     fn get_workflow<'a>(
         &'a self,

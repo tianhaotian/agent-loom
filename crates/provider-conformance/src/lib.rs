@@ -43,6 +43,7 @@ mod tests {
         "task_dependencies",
         "context_snapshots",
         "context_patches",
+        "task_context_references",
     ];
 
     #[test]
