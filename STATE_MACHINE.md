@@ -223,6 +223,7 @@ scheduled → queued → leased → succeeded
 - `worker_id` 必须标识一次进程启动中的具体 Worker 角色；同一 tenant 的不同进程或不同 Worker 角色不得复用该身份。进程重启必须生成新身份，不能继承旧进程持有的 Lease。
 - 领取条件必须包含 Run 非 paused/terminal、Task generation 等于 Run generation、`available_at <= database_now`。
 - 专用 Worker 必须按其可处理的 Task kind 领取；领取结果包含不可变 Task 输入及领取事务推进后的 Run version，禁止使用领取前快照构造后续 CAS。
+- Workflow Worker 的可领取 kind 必须由已验证的 Handler 注册表汇总；注册表中的 Handler key 唯一且每个 Handler 至少支持一个 kind。当前一个 tenant 调度域内的 Worker 注册表必须覆盖这些 kind 下的全部 Handler，避免在数据库尚不能按 Handler key 过滤时领取无法执行的 Task。
 - 完成和续租必须匹配 `task_id + lease_owner + lease_token + lease_expires_at > database_now`。
 - 一次成功完成只能产生一个 Task completion Event 和一组后续动作。
 - Pause 后旧 generation Task 的迟到结果只作为执行证据记录，不得更新 Run、StageExecution 或 Checkpoint。

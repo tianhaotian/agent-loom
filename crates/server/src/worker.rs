@@ -1,5 +1,7 @@
 use std::{
     fmt,
+    future::Future,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -14,10 +16,10 @@ use agent_loom_domain::{
     ToolExecutionId, UnixMicros, WaitId, WorkerId,
 };
 use agent_loom_durable_store::{
-    ClaimTask, CompleteTask, DurableStore, ExpectedRun, FinalRunResult, InitialStage, LeaseProof,
-    NewArtifactRef, NewCheckpoint, NewTask, NewWaitSubscription, NextActions,
-    PrepareAgentExecution, PrepareToolExecution, QueryContext, RecordAgentOutcome, StageMutation,
-    StoreError, TaskResult, WaitResumeTask,
+    ClaimTask, ClaimedTask, CommandContext, CompleteTask, DurableStore, ExpectedRun,
+    FinalRunResult, InitialStage, LeaseProof, NewArtifactRef, NewCheckpoint, NewTask,
+    NewWaitSubscription, NextActions, PrepareAgentExecution, PrepareToolExecution, QueryContext,
+    RecordAgentOutcome, StageMutation, StoreError, TaskResult, WaitResumeTask,
 };
 use agent_loom_runtime::{
     ExternalDispatchError, ExternalRecoveryDispatcher, RecoveryDispatchFence, StartedRecovery,
@@ -33,7 +35,7 @@ use crate::{
     task_handler::{decode_task_input, encode_task_input},
 };
 
-const ACTOR: &str = "agent-loom-mock-worker";
+const ACTOR: &str = "agent-loom-workflow-worker";
 const DELIVERY_HANDLER_KEY: &str = "delivery-mvp";
 pub(crate) const DELIVERY_STAGES: &[&str] = &[
     "requirements",
@@ -101,26 +103,105 @@ impl DeliveryTaskPayload {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RegisteredTaskHandler {
-    DeliveryMvp,
+pub struct TaskHandlerExecution<'a> {
+    pub claimed: &'a ClaimedTask,
+    pub payload: Value,
+    pub worker_id: WorkerId,
+    pub lease_token: [u8; 32],
+    pub claim_context: &'a CommandContext,
 }
 
-impl RegisteredTaskHandler {
-    fn resolve(handler_key: &LogicalKey) -> Result<Self, MockWorkerError> {
-        match handler_key.as_str() {
-            DELIVERY_HANDLER_KEY => Ok(Self::DeliveryMvp),
-            _ => Err(MockWorkerError::InvalidTask(
-                "Task input references an unregistered handler",
-            )),
+impl fmt::Debug for TaskHandlerExecution<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TaskHandlerExecution")
+            .field("task_id", &self.claimed.task.task_id)
+            .field("task_kind", &self.claimed.task.kind)
+            .field("worker_id", &self.worker_id)
+            .field("handler_payload", &"[REDACTED]")
+            .field("lease_token", &"[REDACTED]")
+            .field("claim_context", &self.claim_context)
+            .finish()
+    }
+}
+
+pub type TaskHandlerFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<MockWorkerActivity, MockWorkerError>> + Send + 'a>>;
+
+pub trait TaskHandler: Send + Sync {
+    fn key(&self) -> &LogicalKey;
+    fn supported_kinds(&self) -> &[TaskKind];
+    fn decode_legacy(&self, _input: &JsonPayload) -> Option<Value> {
+        None
+    }
+    fn execute<'a>(&'a self, execution: TaskHandlerExecution<'a>) -> TaskHandlerFuture<'a>;
+}
+
+struct TaskHandlerRegistry {
+    handlers: Vec<Arc<dyn TaskHandler>>,
+    supported_kinds: Vec<TaskKind>,
+}
+
+impl TaskHandlerRegistry {
+    fn new(handlers: Vec<Arc<dyn TaskHandler>>) -> Result<Self, MockWorkerError> {
+        if handlers.is_empty() {
+            return Err(MockWorkerError::InvalidConfiguration(
+                "Task Handler registry must not be empty",
+            ));
         }
+        let mut supported_kinds = Vec::new();
+        for (index, handler) in handlers.iter().enumerate() {
+            if handler.supported_kinds().is_empty() {
+                return Err(MockWorkerError::InvalidConfiguration(
+                    "Task Handler must support at least one Task kind",
+                ));
+            }
+            if handlers[index + 1..]
+                .iter()
+                .any(|other| other.key() == handler.key())
+            {
+                return Err(MockWorkerError::InvalidConfiguration(
+                    "Task Handler keys must be unique",
+                ));
+            }
+            for kind in handler.supported_kinds() {
+                if !supported_kinds.contains(kind) {
+                    supported_kinds.push(*kind);
+                }
+            }
+        }
+        Ok(Self {
+            handlers,
+            supported_kinds,
+        })
     }
 
-    const fn supports(self, kind: TaskKind) -> bool {
-        match self {
-            Self::DeliveryMvp => matches!(kind, TaskKind::AgentServer | TaskKind::Tool),
-        }
+    fn resolve(&self, handler_key: &LogicalKey) -> Option<&Arc<dyn TaskHandler>> {
+        self.handlers
+            .iter()
+            .find(|handler| handler.key() == handler_key)
     }
+
+    fn decode_legacy(&self, input: &JsonPayload) -> Option<crate::task_handler::RoutedTaskInput> {
+        self.handlers.iter().find_map(|handler| {
+            handler
+                .decode_legacy(input)
+                .map(|payload| crate::task_handler::RoutedTaskInput {
+                    handler_key: handler.key().clone(),
+                    payload,
+                })
+        })
+    }
+}
+
+struct DeliveryTaskHandler {
+    key: LogicalKey,
+    store: Arc<dyn DurableStore>,
+    tenant_id: TenantId,
+    worker_id: WorkerId,
+    coordinator_agent_version_id: AgentVersionId,
+    endpoint_id: EndpointId,
+    dispatcher: Arc<dyn ExternalRecoveryDispatcher>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,6 +210,9 @@ pub enum MockWorkerActivity {
     Completed { task_id: TaskId, terminal: bool },
 }
 
+/// Generic name for Worker progress; the Mock-prefixed alias remains for API compatibility.
+pub type WorkflowWorkerActivity = MockWorkerActivity;
+
 #[derive(Clone, Debug)]
 pub struct MockWorkerConfig {
     pub lease_duration: DurationMicros,
@@ -136,6 +220,9 @@ pub struct MockWorkerConfig {
     pub idle_delay: Duration,
     pub error_delay: Duration,
 }
+
+/// Generic Worker polling configuration.
+pub type WorkflowWorkerConfig = MockWorkerConfig;
 
 impl Default for MockWorkerConfig {
     fn default() -> Self {
@@ -152,12 +239,13 @@ pub struct MockWorkflowWorker {
     store: Arc<dyn DurableStore>,
     tenant_id: TenantId,
     worker_id: WorkerId,
-    coordinator_agent_version_id: AgentVersionId,
-    endpoint_id: EndpointId,
-    dispatcher: Arc<dyn ExternalRecoveryDispatcher>,
+    handlers: TaskHandlerRegistry,
     sequence: AtomicU64,
     config: MockWorkerConfig,
 }
+
+/// Registry-driven Workflow Worker; the original name is retained for compatibility.
+pub type WorkflowWorker = MockWorkflowWorker;
 
 impl fmt::Debug for MockWorkflowWorker {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -165,12 +253,19 @@ impl fmt::Debug for MockWorkflowWorker {
             .debug_struct("MockWorkflowWorker")
             .field("tenant_id", &self.tenant_id)
             .field("worker_id", &self.worker_id)
+            .field("handler_count", &self.handlers.handlers.len())
             .field("config", &self.config)
             .finish_non_exhaustive()
     }
 }
 
 impl MockWorkflowWorker {
+    /// Creates the default Worker with the built-in delivery Handler.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the compile-time delivery Handler key or its built-in
+    /// registration violates the same validation applied to external Handlers.
     pub fn new(
         store: Arc<dyn DurableStore>,
         tenant_id: TenantId,
@@ -180,23 +275,48 @@ impl MockWorkflowWorker {
         dispatcher: Arc<dyn ExternalRecoveryDispatcher>,
         config: MockWorkerConfig,
     ) -> Self {
-        Self {
-            store,
+        let delivery_handler = Arc::new(DeliveryTaskHandler {
+            key: LogicalKey::parse(DELIVERY_HANDLER_KEY)
+                .expect("built-in delivery Handler key is valid"),
+            store: Arc::clone(&store),
             tenant_id,
             worker_id,
             coordinator_agent_version_id,
             endpoint_id,
             dispatcher,
-            sequence: AtomicU64::new(0),
-            config,
-        }
+        });
+        Self::with_handlers(store, tenant_id, worker_id, vec![delivery_handler], config)
+            .expect("built-in Task Handler registry is valid")
     }
 
-    /// Claims and completes at most one deterministic mock delivery stage.
+    /// Creates a Worker backed by explicitly registered production Task Handlers.
     ///
     /// # Errors
     ///
-    /// Returns Store errors and stable validation failures for malformed mock Tasks.
+    /// Returns a configuration error when no Handler is provided, a Handler has
+    /// no supported Task kinds, or stable Handler keys collide.
+    pub fn with_handlers(
+        store: Arc<dyn DurableStore>,
+        tenant_id: TenantId,
+        worker_id: WorkerId,
+        handlers: Vec<Arc<dyn TaskHandler>>,
+        config: MockWorkerConfig,
+    ) -> Result<Self, MockWorkerError> {
+        Ok(Self {
+            store,
+            tenant_id,
+            worker_id,
+            handlers: TaskHandlerRegistry::new(handlers)?,
+            sequence: AtomicU64::new(0),
+            config,
+        })
+    }
+
+    /// Claims and dispatches at most one Task supported by the Handler registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns Store errors and stable validation failures for malformed routed Tasks.
     #[allow(clippy::too_many_lines)]
     pub async fn run_once(&self) -> Result<MockWorkerActivity, MockWorkerError> {
         let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
@@ -204,18 +324,18 @@ impl MockWorkflowWorker {
             "claim-correlation",
             &self.worker_id.to_string(),
         ));
-        let mut supported_kinds = [TaskKind::AgentServer, TaskKind::Tool];
-        if sequence % 2 == 1 {
-            supported_kinds.rotate_left(1);
-        }
+        let mut supported_kinds = self.handlers.supported_kinds.clone();
+        let kind_count = u64::try_from(supported_kinds.len()).map_err(|_| {
+            MockWorkerError::InvalidConfiguration("Task Handler kind count exceeds u64")
+        })?;
+        let first_kind = usize::try_from(sequence % kind_count).map_err(|_| {
+            MockWorkerError::InvalidConfiguration("Task Handler kind index exceeds usize")
+        })?;
+        supported_kinds.rotate_left(first_kind);
         let mut claimed_task = None;
         for kind in supported_kinds {
-            let kind_key = match kind {
-                TaskKind::AgentServer => "agent-server",
-                TaskKind::Tool => "tool",
-                _ => unreachable!("worker claim list contains only supported kinds"),
-            };
-            let claim_identity = format!("mock-claim/{}/{sequence}/{kind_key}", self.worker_id);
+            let kind_key = task_kind_key(kind);
+            let claim_identity = format!("workflow-claim/{}/{sequence}/{kind_key}", self.worker_id);
             let claim_context = command_context(
                 self.tenant_id,
                 synthetic_run,
@@ -249,24 +369,38 @@ impl MockWorkflowWorker {
         };
 
         let routed = decode_task_input(&claimed.task.input)
-            .or_else(|_| legacy_delivery_task_input(&claimed.task.input))
+            .or_else(|_| {
+                self.handlers
+                    .decode_legacy(&claimed.task.input)
+                    .ok_or(crate::task_handler::TaskInputError::InvalidEnvelope)
+            })
             .map_err(|_| {
                 MockWorkerError::InvalidTask("Task input routing envelope is malformed")
             })?;
-        let handler = RegisteredTaskHandler::resolve(&routed.handler_key)?;
-        if !handler.supports(claimed.task.kind) {
+        let handler =
+            self.handlers
+                .resolve(&routed.handler_key)
+                .ok_or(MockWorkerError::InvalidTask(
+                    "Task input references an unregistered handler",
+                ))?;
+        if !handler.supported_kinds().contains(&claimed.task.kind) {
             return Err(MockWorkerError::InvalidTask(
                 "Task kind is unsupported by its registered handler",
             ));
         }
-        match handler {
-            RegisteredTaskHandler::DeliveryMvp => {
-                self.run_delivery_handler(&claimed, routed.payload, token, &claim_context)
-                    .await
-            }
-        }
+        handler
+            .execute(TaskHandlerExecution {
+                claimed: &claimed,
+                payload: routed.payload,
+                worker_id: self.worker_id,
+                lease_token: token,
+                claim_context: &claim_context,
+            })
+            .await
     }
+}
 
+impl DeliveryTaskHandler {
     #[allow(clippy::too_many_lines)]
     async fn run_delivery_handler(
         &self,
@@ -780,7 +914,35 @@ impl MockWorkflowWorker {
             .await?;
         Ok(())
     }
+}
 
+impl TaskHandler for DeliveryTaskHandler {
+    fn key(&self) -> &LogicalKey {
+        &self.key
+    }
+
+    fn supported_kinds(&self) -> &[TaskKind] {
+        &[TaskKind::AgentServer, TaskKind::Tool]
+    }
+
+    fn decode_legacy(&self, input: &JsonPayload) -> Option<Value> {
+        legacy_delivery_payload(input).ok()
+    }
+
+    fn execute<'a>(&'a self, execution: TaskHandlerExecution<'a>) -> TaskHandlerFuture<'a> {
+        Box::pin(async move {
+            self.run_delivery_handler(
+                execution.claimed,
+                execution.payload,
+                execution.lease_token,
+                execution.claim_context,
+            )
+            .await
+        })
+    }
+}
+
+impl MockWorkflowWorker {
     pub async fn run(&self, mut shutdown: watch::Receiver<bool>) {
         while !*shutdown.borrow() {
             let delay = match self.run_once().await {
@@ -816,15 +978,21 @@ impl MockWorkflowWorker {
 pub enum MockWorkerError {
     Store(StoreError),
     Dispatch(ExternalDispatchError),
+    InvalidConfiguration(&'static str),
     InvalidTask(&'static str),
 }
+
+/// Generic Workflow Worker error.
+pub type WorkflowWorkerError = MockWorkerError;
 
 impl fmt::Display for MockWorkerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Store(error) => error.fmt(formatter),
             Self::Dispatch(error) => error.fmt(formatter),
-            Self::InvalidTask(message) => formatter.write_str(message),
+            Self::InvalidConfiguration(message) | Self::InvalidTask(message) => {
+                formatter.write_str(message)
+            }
         }
     }
 }
@@ -856,9 +1024,9 @@ fn delivery_task_input(value: Value) -> Result<JsonPayload, MockWorkerError> {
         .map_err(|_| MockWorkerError::InvalidTask("delivery Task input cannot be encoded"))
 }
 
-fn legacy_delivery_task_input(
+fn legacy_delivery_payload(
     input: &JsonPayload,
-) -> Result<crate::task_handler::RoutedTaskInput, crate::task_handler::TaskInputError> {
+) -> Result<Value, crate::task_handler::TaskInputError> {
     let mut payload: Value = serde_json::from_slice(input.as_bytes())
         .map_err(|_| crate::task_handler::TaskInputError::InvalidEnvelope)?;
     if let Some(resume_input) = payload
@@ -869,11 +1037,19 @@ fn legacy_delivery_task_input(
     }
     serde_json::from_value::<DeliveryTaskPayload>(payload.clone())
         .map_err(|_| crate::task_handler::TaskInputError::InvalidEnvelope)?;
-    Ok(crate::task_handler::RoutedTaskInput {
-        handler_key: LogicalKey::parse(DELIVERY_HANDLER_KEY)
-            .map_err(|_| crate::task_handler::TaskInputError::InvalidHandlerKey)?,
-        payload,
-    })
+    Ok(payload)
+}
+
+const fn task_kind_key(kind: TaskKind) -> &'static str {
+    match kind {
+        TaskKind::Model => "model",
+        TaskKind::Tool => "tool",
+        TaskKind::AgentServer => "agent-server",
+        TaskKind::ArtifactCheck => "artifact-check",
+        TaskKind::TimerWakeup => "timer-wakeup",
+        TaskKind::Reconcile => "reconcile",
+        TaskKind::StopExternalExecution => "stop-external-execution",
+    }
 }
 
 pub(crate) fn stage_id(run_id: agent_loom_domain::RunId, step: usize) -> StageExecutionId {
@@ -951,6 +1127,83 @@ fn rework_stages(run_id: agent_loom_domain::RunId) -> Result<Vec<InitialStage>, 
 mod tests {
     use super::*;
 
+    struct TestHandler {
+        key: LogicalKey,
+        kinds: Vec<TaskKind>,
+    }
+
+    impl TestHandler {
+        fn new(key: &str, kinds: Vec<TaskKind>) -> Self {
+            Self {
+                key: LogicalKey::parse(key).expect("test Handler key"),
+                kinds,
+            }
+        }
+    }
+
+    impl TaskHandler for TestHandler {
+        fn key(&self) -> &LogicalKey {
+            &self.key
+        }
+
+        fn supported_kinds(&self) -> &[TaskKind] {
+            &self.kinds
+        }
+
+        fn execute<'a>(&'a self, _execution: TaskHandlerExecution<'a>) -> TaskHandlerFuture<'a> {
+            Box::pin(async { Ok(MockWorkerActivity::Idle) })
+        }
+    }
+
+    #[test]
+    fn registry_routes_unique_handlers_and_deduplicates_claim_kinds() {
+        let research = Arc::new(TestHandler::new("research", vec![TaskKind::AgentServer]));
+        let operations = Arc::new(TestHandler::new(
+            "operations",
+            vec![TaskKind::AgentServer, TaskKind::Tool],
+        ));
+        let registry = TaskHandlerRegistry::new(vec![research, operations]).expect("registry");
+
+        assert_eq!(
+            registry
+                .resolve(&LogicalKey::parse("operations").expect("key"))
+                .map(|handler| handler.key().as_str()),
+            Some("operations")
+        );
+        assert_eq!(
+            registry.supported_kinds,
+            vec![TaskKind::AgentServer, TaskKind::Tool]
+        );
+        assert!(
+            registry
+                .resolve(&LogicalKey::parse("unregistered").expect("key"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn registry_rejects_duplicate_or_empty_handler_contracts() {
+        let duplicate = TaskHandlerRegistry::new(vec![
+            Arc::new(TestHandler::new("research", vec![TaskKind::AgentServer])),
+            Arc::new(TestHandler::new("research", vec![TaskKind::Tool])),
+        ]);
+        assert!(matches!(
+            duplicate,
+            Err(MockWorkerError::InvalidConfiguration(
+                "Task Handler keys must be unique"
+            ))
+        ));
+
+        let empty_kinds =
+            TaskHandlerRegistry::new(vec![Arc::new(TestHandler::new("research", Vec::new()))]);
+        assert!(matches!(
+            empty_kinds,
+            Err(MockWorkerError::InvalidConfiguration(
+                "Task Handler must support at least one Task kind"
+            ))
+        ));
+    }
+
     #[test]
     fn planned_task_envelope_starts_the_delivery_workflow() {
         let payload = delivery_task_input(json!({
@@ -982,10 +1235,8 @@ mod tests {
             "request": {"goal": "ship"}
         }))
         .expect("legacy payload");
-        let routed = legacy_delivery_task_input(&legacy).expect("legacy route");
-
-        assert_eq!(routed.handler_key.as_str(), DELIVERY_HANDLER_KEY);
-        let input = serde_json::from_value::<DeliveryTaskPayload>(routed.payload)
+        let routed = legacy_delivery_payload(&legacy).expect("legacy route");
+        let input = serde_json::from_value::<DeliveryTaskPayload>(routed)
             .expect("delivery payload")
             .into_input();
         assert_eq!(input.step, 4);

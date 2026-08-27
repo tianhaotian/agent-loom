@@ -8,8 +8,8 @@ use agent_loom_runtime::{
     RecoveryWorker, RecoveryWorkerConfig, SeededRecoveryIdentitySource,
 };
 use agent_loom_server::{
-    MaintenancePollingConfig, MaintenancePollingJob, MockWorkerConfig, MockWorkflowWorker,
-    ServerConfig, bootstrap, http_dispatcher, mock_dispatcher,
+    MaintenancePollingConfig, MaintenancePollingJob, ServerConfig, WorkflowWorker,
+    WorkflowWorkerConfig, bootstrap, http_dispatcher, mock_dispatcher,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
@@ -36,14 +36,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             application.coordinator_agent_version_id,
         )?,
     };
-    let mock_worker = Arc::new(MockWorkflowWorker::new(
+    let workflow_worker = Arc::new(WorkflowWorker::new(
         Arc::new(application.store.clone()),
         application.tenant_id,
         worker_id,
         application.coordinator_agent_version_id,
         application.endpoint_id,
         Arc::new(dispatcher.clone()),
-        MockWorkerConfig::default(),
+        WorkflowWorkerConfig::default(),
     ));
 
     let reclaim_worker_id =
@@ -137,7 +137,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let due_shutdown = shutdown_receiver.clone();
     let recovery_shutdown = shutdown_receiver.clone();
     let maintenance_shutdown = shutdown_receiver.clone();
-    let worker_task = tokio::spawn(async move { mock_worker.run(worker_shutdown).await });
+    let worker_task = tokio::spawn(async move { workflow_worker.run(worker_shutdown).await });
     let reclaim_task = tokio::spawn(async move { reclaim_service.run(reclaim_shutdown).await });
     let due_task = tokio::spawn(async move { due_service.run(due_shutdown).await });
     let recovery_task = tokio::spawn(async move { recovery_service.run(recovery_shutdown).await });

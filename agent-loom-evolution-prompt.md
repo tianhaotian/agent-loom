@@ -126,8 +126,8 @@ Agent Loom 不应该内置：
 - Phase 0 设计基本冻结
 - PostgreSQL 单租户 MVP 垂直切片可运行
 - PostgreSQL DurableStore、事务状态转换、Lease、Fence、Receipt 已有基础
-- 已有 `ExecutionPlan V1` 到 `CreateRun` 的通用初始 Stage/Task 实例化路径，以及覆盖初始、动态后继、Wait 恢复 Task 的版本化 Handler 信封和运行时路由；当前只注册 delivery Handler，其内部推进逻辑仍是固定 delivery 流程
-- server 中仍存在固定八阶段流程和 Mock Adapter
+- 已有 `ExecutionPlan V1` 到 `CreateRun` 的通用初始 Stage/Task 实例化路径，以及覆盖初始、动态后继、Wait 恢复 Task 的版本化 Handler 信封；Workflow Worker 已由注册表驱动领取和执行，当前只注册 delivery Handler
+- 固定八阶段推进已隔离在 delivery Handler，server 仍以该 Handler 和 Mock Adapter 作为默认 MVP fixture
 - MySQL 只有 migration，没有真实 Store Provider
 - Runtime Adapter Trait 已定义，但大量方法没有接入真实执行路径
 - 异步事件同步、Reconcile、request_stop 尚未形成完整闭环

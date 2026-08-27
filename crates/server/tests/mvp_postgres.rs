@@ -6,8 +6,8 @@ use std::{
 use agent_loom_domain::WorkerId;
 use agent_loom_runtime::{PollingActivity, PollingJob as _};
 use agent_loom_server::{
-    MaintenancePollingConfig, MaintenancePollingJob, MockWorkerActivity, MockWorkerConfig,
-    MockWorkflowWorker, ServerConfig, bootstrap, mock_dispatcher,
+    MaintenancePollingConfig, MaintenancePollingJob, ServerConfig, WorkflowWorker,
+    WorkflowWorkerActivity, WorkflowWorkerConfig, bootstrap, mock_dispatcher,
 };
 use axum::{
     body::{Body, to_bytes},
@@ -87,21 +87,21 @@ async fn http_to_postgres_mock_delivery_completes_when_configured() {
         application.coordinator_agent_version_id,
     )
     .expect("build Mock Agent dispatcher");
-    let worker = MockWorkflowWorker::new(
+    let worker = WorkflowWorker::new(
         Arc::new(application.store.clone()),
         application.tenant_id,
         WorkerId::from_bytes(nonce.to_be_bytes()),
         application.coordinator_agent_version_id,
         application.endpoint_id,
         Arc::new(dispatcher),
-        MockWorkerConfig::default(),
+        WorkflowWorkerConfig::default(),
     );
     for step in 0..9 {
         let activity = worker.run_once().await.expect("complete mock stage");
         assert!(
             matches!(
                 activity,
-                MockWorkerActivity::Completed {
+                WorkflowWorkerActivity::Completed {
                     terminal: false,
                     ..
                 }
@@ -161,7 +161,7 @@ async fn http_to_postgres_mock_delivery_completes_when_configured() {
             .await
             .expect("complete post-approval stage");
         assert!(
-            matches!(activity, MockWorkerActivity::Completed { terminal, .. } if terminal == (step == 10))
+            matches!(activity, WorkflowWorkerActivity::Completed { terminal, .. } if terminal == (step == 10))
         );
     }
 

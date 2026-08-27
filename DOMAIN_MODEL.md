@@ -311,9 +311,13 @@ Provider 可以调整 priority 的物理排序方向，但领取结果必须遵�
 新建 Task 的 `input_json` 使用 `agent-loom.task-input/v1` 信封，至少包含稳定的
 `handler` logical key 和 Handler 自己解释的 `payload`。ExecutionPlan 只负责把静态
 TaskSpec 与 Run input 绑定到该信封；动态后继 Task 和 Wait 恢复 Task 必须继续保留同一
-Handler key。Worker 先按已注册 Handler 支持的 Task kind 领取，再按持久化 Handler key
-路由，不能用 `kind = NULL` 的全类型领取吞掉维护或恢复 Worker 的 Task。升级期间允许
-delivery Worker 读取旧版无信封的 delivery Task，但所有新写入都必须使用 V1 信封。
+Handler key。通用 Workflow Worker 从注册表汇总可领取的 Task kind，再按持久化
+Handler key 把 Lease、不可变输入和领取后的 Run fence 交给对应 Handler；注册表拒绝
+重复 Handler key 和没有支持 kind 的 Handler。Worker 不能用 `kind = NULL` 的全类型
+领取吞掉维护或恢复 Worker 的 Task。当前同一 tenant 调度域中的 Workflow Worker 必须
+注册它所领取 kind 对应的全部 Handler；若未来需要按 Handler 拆分专用 Worker pool，
+必须先把 Handler key 提升为数据库可过滤的领取维度。升级期间允许 delivery Handler
+读取旧版无信封的 delivery Task，但所有新写入都必须使用 V1 信封。
 
 ### 7.2 `task_attempts`
 
