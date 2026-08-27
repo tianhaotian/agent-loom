@@ -360,6 +360,7 @@ pub struct RecordAgentOutcome {
     pub status: AgentExecutionStatus,
     pub result: Option<JsonPayload>,
     pub error_code: Option<String>,
+    pub next_status_poll_at: Option<agent_loom_domain::UnixMicros>,
     pub outcome_event_id: EventId,
 }
 

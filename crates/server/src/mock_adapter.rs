@@ -10,11 +10,12 @@ use agent_loom_adapter_core::{
 use agent_loom_domain::{
     AgentVersionId, Digest, DurationMicros, EndpointId, JsonPayload, UnixMicros,
 };
-use agent_loom_durable_store::AgentStopCandidate;
+use agent_loom_durable_store::{AgentStatusCandidate, AgentStopCandidate};
 use agent_loom_runtime::{
     AdapterContextFactory, AdapterContextFuture, AdapterContextSeed, AdapterRecoveryDispatcher,
-    AdapterRetrySchedule, AgentStopDispatcher, AgentStopFuture, DispatchFuture,
-    ExternalDispatchError, ExternalRecoveryDispatcher, StartedRecovery, StaticAdapterRegistry,
+    AdapterRetrySchedule, AgentStatusDispatcher, AgentStatusFuture, AgentStopDispatcher,
+    AgentStopFuture, DispatchFuture, ExternalDispatchError, ExternalRecoveryDispatcher,
+    StartedRecovery, StaticAdapterRegistry,
 };
 use agent_loom_store_postgres::PostgresStore;
 use serde_json::json;
@@ -247,6 +248,12 @@ impl AdapterRetrySchedule for MvpRetrySchedule {
             crate::identity::now_micros().saturating_add(delay),
         ))
     }
+
+    fn status_poll_at(&self, _observation: u64) -> Result<UnixMicros, ExternalDispatchError> {
+        Ok(UnixMicros::new(
+            crate::identity::now_micros().saturating_add(1_000_000),
+        ))
+    }
 }
 
 /// Builds the registered Mock Agent dispatcher used by the MVP service.
@@ -277,11 +284,14 @@ pub fn mock_dispatcher(
 }
 
 pub(crate) trait ExternalDispatcher:
-    ExternalRecoveryDispatcher + AgentStopDispatcher
+    ExternalRecoveryDispatcher + AgentStopDispatcher + AgentStatusDispatcher
 {
 }
 
-impl<T> ExternalDispatcher for T where T: ExternalRecoveryDispatcher + AgentStopDispatcher {}
+impl<T> ExternalDispatcher for T where
+    T: ExternalRecoveryDispatcher + AgentStopDispatcher + AgentStatusDispatcher
+{
+}
 
 #[derive(Clone)]
 pub struct SharedExternalDispatcher(Arc<dyn ExternalDispatcher>);
@@ -309,6 +319,12 @@ impl ExternalRecoveryDispatcher for SharedExternalDispatcher {
 impl AgentStopDispatcher for SharedExternalDispatcher {
     fn request_stop(&self, candidate: AgentStopCandidate) -> AgentStopFuture<'_> {
         self.0.request_stop(candidate)
+    }
+}
+
+impl AgentStatusDispatcher for SharedExternalDispatcher {
+    fn get_status(&self, candidate: AgentStatusCandidate) -> AgentStatusFuture<'_> {
+        self.0.get_status(candidate)
     }
 }
 

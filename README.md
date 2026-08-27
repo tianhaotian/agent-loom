@@ -20,7 +20,7 @@ Runtime 内部按职责组织：
 
 ```text
 runtime/src/adapter/    Registry、调用上下文、恢复分发与结果回写
-runtime/src/agent_control/  远端 Agent stop 扫描、幂等调度与轮询服务
+runtime/src/agent_control/  远端 Agent stop/status 扫描、幂等调度与轮询服务
 runtime/src/recovery/   reconcile Task 领取与外部执行启动事务
 runtime/src/scheduler/  due-work 扫描、确定性计划与原子应用
 runtime/src/service/    有界轮询、退避、关闭信号与 Job 接线
@@ -28,15 +28,15 @@ runtime/src/service/    有界轮询、退避、关闭信号与 Job 接线
 
 `domain`、`durable-store` 与 `adapter-core` 继续保持零外部依赖；Provider crate 可以引入各自的数据库驱动和异步运行时，但驱动类型不得泄漏到共享领域契约。`adapter-http` 使用 HTTPS/loopback HTTP 执行真实远程 I/O，`server` 是 PostgreSQL 专用的产品装配层，不改变 Runtime 与 Store 共享契约的数据库无关性。
 
-已实现 `0000_migration_meta` 至 `0011_agent_remote_protocol` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt、Checkpoint、Wait、Artifact、ToolExecution 与 AgentExecution，并持久化恢复远端 Agent 生命周期所需的协议版本。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、Wait 单次消费槽与恢复计划、Tool/Agent 重试时间、Agent 请求信封、Artifact 版本血缘、外部执行幂等与 Agent Event 去重；只依赖 `dyn DurableStore` 的黑盒行为现已覆盖 Lease 到期重试、多 Worker 同时领取、完成/取消终态竞争、Wait 单次消费，以及完成事务中途约束失败后的完整回滚。
+已实现 `0000_migration_meta` 至 `0012_agent_status_poll` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt、Checkpoint、Wait、Artifact、ToolExecution 与 AgentExecution，并持久化恢复远端 Agent 生命周期所需的协议版本和状态查询时间。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、Wait 单次消费槽与恢复计划、Tool/Agent 重试时间、Agent 请求信封、Artifact 版本血缘、外部执行幂等与 Agent Event 去重；只依赖 `dyn DurableStore` 的黑盒行为现已覆盖 Lease 到期重试、多 Worker 同时领取、完成/取消终态竞争、Wait 单次消费，以及完成事务中途约束失败后的完整回滚。
 
 PostgreSQL 已接入真实驱动执行层：migration executor 使用 SHA-256 physical checksum、session advisory lock、step journal 和逐批 schema introspection；`PostgresStore` 通过连接池完整实现对象安全的 `DurableStore`，事务垂直切片已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 准备/结果记录、AgentExecution 提交/事件/结果记录，以及 Pause/Resume/Cancel。写路径包含 receipt 并发幂等闸门、显式层级锁序、`FOR UPDATE SKIP LOCKED`、Lease fencing、Run version/generation CAS，以及 Event、Checkpoint、Stage、Artifact 和后续动作的原子提交。
 
-续租使用数据库时间校验并延长 Task/TaskAttempt 的同一 Lease，不推进 Run 版本；过期 Lease 回收使用数据库权威时间，原子结束旧 TaskAttempt、清除 Lease、追加 Event、推进 Run cursor，并转为 `retry_scheduled` 或 `dead_lettered`。失败事务会原子完成 attempt、清除 Lease、追加 Event，并区分 retry、不可重试终态与 Dead Letter。外部事件按 Event type 与 `match_key_hash` 单次消费 Wait，并实例化预存恢复计划。Tool 与 Agent 外部调用采用两阶段窗口：先提交 execution/Event 意图，再记录 adapter outcome；不确定结果持久化对账动作，backoff 必须持久化 `retry_at`。Agent 事件批次会原子完成 receipt/raw digest 去重、本地 Event 追加、远端 cursor CAS、Run 序列推进，以及规范化事件声明的 Task/Wait/Artifact/Execution outcome 投影；Pause/Cancel 后的迟到结果保留审计，但业务投影受 Run version/generation/deadline fencing。若控制命令与提交响应并发，迟到的远端引用和协议版本会保留在 `stopping` 执行中；独立 stop Worker 使用稳定幂等身份调用注册 Adapter 的 `request_stop`，并以执行版本 CAS 记录为终态、`reconciling` 或 `manual_review`，服务重启后可重新扫描未落账请求。Runtime 的有界 Scheduler tick 会为到期候选生成确定性的 Command/Event/Task/Receipt 身份，并隔离单候选失败。恢复 Worker 只领取 `reconcile` Task，领取结果携带 Task 输入和提交后的 Run version；Worker 校验恢复输入并提交 Tool retry attempt 或 Agent resubmit 启动事务，启动事务会原子完成该一次性恢复 Task，事务成功后才调用外部 dispatcher。通用 dispatcher 已实现 tenant-scoped 请求装载、Adapter Registry、临时鉴权/trace/deadline 上下文解析、幂等重放能力闸门、统一错误分类、确定性结果命令以及 Store 回写。Scheduler、Recovery Worker、Agent Stop Worker 与 Lease Reclaimer 已通过通用 `PollingService` 接入有界并发、busy/idle/error 退避和优雅停机。
+续租使用数据库时间校验并延长 Task/TaskAttempt 的同一 Lease，不推进 Run 版本；过期 Lease 回收使用数据库权威时间，原子结束旧 TaskAttempt、清除 Lease、追加 Event、推进 Run cursor，并转为 `retry_scheduled` 或 `dead_lettered`。失败事务会原子完成 attempt、清除 Lease、追加 Event，并区分 retry、不可重试终态与 Dead Letter。外部事件按 Event type 与 `match_key_hash` 单次消费 Wait，并实例化预存恢复计划。Tool 与 Agent 外部调用采用两阶段窗口：先提交 execution/Event 意图，再记录 adapter outcome；不确定结果持久化对账动作，backoff 必须持久化 `retry_at`。Agent 事件批次会原子完成 receipt/raw digest 去重、本地 Event 追加、远端 cursor CAS、Run 序列推进，以及规范化事件声明的 Task/Wait/Artifact/Execution outcome 投影；Pause/Cancel 后的迟到结果保留审计，但业务投影受 Run version/generation/deadline fencing。若控制命令与提交响应并发，迟到的远端引用和协议版本会保留在 `stopping` 执行中；独立 stop Worker 使用稳定幂等身份调用注册 Adapter 的 `request_stop`，并以执行版本 CAS 记录为终态、`reconciling` 或 `manual_review`。`reconciling` 执行通过独立的 `status_poll_at` 持久化节流，Status Worker 调用 `get_status` 并记录远端终态或下一次查询时间；该时间不复用提交重试的 `retry_at`。Runtime 的有界 Scheduler tick 会为到期候选生成确定性的 Command/Event/Task/Receipt 身份，并隔离单候选失败。恢复 Worker 只领取 `reconcile` Task，领取结果携带 Task 输入和提交后的 Run version；Worker 校验恢复输入并提交 Tool retry attempt 或 Agent resubmit 启动事务，启动事务会原子完成该一次性恢复 Task，事务成功后才调用外部 dispatcher。通用 dispatcher 已实现 tenant-scoped 请求装载、Adapter Registry、临时鉴权/trace/deadline 上下文解析、幂等重放能力闸门、统一错误分类、确定性结果命令以及 Store 回写。Scheduler、Recovery Worker、Agent Stop/Status Worker 与 Lease Reclaimer 已通过通用 `PollingService` 接入有界并发、busy/idle/error 退避和优雅停机。
 
 ## MVP 快速开始
 
-MVP 会在启动时自动执行 PostgreSQL migration、创建一个由 `AGENT_LOOM_TENANT_KEY` 标识的开发 Tenant，并启动 HTTP API、交付 Worker、Scheduler、Recovery Worker、Agent Stop Worker、Lease Reclaimer 和超时维护服务。详细边界与 API 示例见 [MVP 使用说明](./MVP.md)。
+MVP 会在启动时自动执行 PostgreSQL migration、创建一个由 `AGENT_LOOM_TENANT_KEY` 标识的开发 Tenant，并启动 HTTP API、交付 Worker、Scheduler、Recovery Worker、Agent Stop/Status Worker、Lease Reclaimer 和超时维护服务。详细边界与 API 示例见 [MVP 使用说明](./MVP.md)。
 
 ```bash
 export AGENT_LOOM_DATABASE_URL='postgresql://agent_loom:agent_loom@127.0.0.1:5432/agent_loom'

@@ -489,6 +489,7 @@ mod tests {
                         remote_run_ref: None,
                         remote_session_ref: None,
                         remote_protocol_version: None,
+                        status_poll_at: None,
                         event_cursor: None,
                         cursor_version: 0,
                         retry_at: None,

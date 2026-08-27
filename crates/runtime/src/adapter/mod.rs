@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, fmt, future::Future, pin::Pin, sync::Arc};
 
 use agent_loom_adapter_core::{
     AdapterCallContext, AdapterError, AdapterRetryClass, AgentRunRequest, AgentServerAdapter,
-    ExecutionBudget, ExecutionId, RemoteAgentRef, RemoteAgentStatus, StopRequestOutcome,
-    SubmitAgentOutcome, ToolAdapter, ToolCallOutcome, ToolRequest,
+    ExecutionBudget, ExecutionId, RemoteAgentRef, RemoteAgentSnapshot, RemoteAgentStatus,
+    StopRequestOutcome, SubmitAgentOutcome, ToolAdapter, ToolCallOutcome, ToolRequest,
 };
 use agent_loom_domain::{
     AgentExecutionId, AgentExecutionStatus, AgentVersionId, CommandId, CorrelationId, Digest,
@@ -11,9 +11,9 @@ use agent_loom_domain::{
     UnixMicros,
 };
 use agent_loom_durable_store::{
-    AgentInvocation, AgentStopCandidate, AgentSubmissionOutcome, CommandContext, DurableStore,
-    ExecutionRetryClass, QueryContext, RecordAgentOutcome, RecordAgentSubmission,
-    RecordToolOutcome, StoreFuture, ToolInvocation, ToolRecordedOutcome,
+    AgentInvocation, AgentStatusCandidate, AgentStopCandidate, AgentSubmissionOutcome,
+    CommandContext, DurableStore, ExecutionRetryClass, QueryContext, RecordAgentOutcome,
+    RecordAgentSubmission, RecordToolOutcome, StoreFuture, ToolInvocation, ToolRecordedOutcome,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -262,6 +262,13 @@ pub trait AdapterRetrySchedule: Send + Sync {
         error: &AdapterError,
         attempt: u64,
     ) -> Result<UnixMicros, ExternalDispatchError>;
+
+    /// Returns the next durable due time for a nonterminal remote status.
+    ///
+    /// # Errors
+    ///
+    /// Returns a dispatch error when the timestamp cannot be represented safely.
+    fn status_poll_at(&self, observation: u64) -> Result<UnixMicros, ExternalDispatchError>;
 }
 
 pub struct AdapterRecoveryDispatcher<S> {
@@ -704,6 +711,15 @@ where
             execution.agent_execution_id, execution.version
         );
         let request_hash = stop_projection_digest(status, error_code.as_deref());
+        let next_status_poll_at = if status == AgentExecutionStatus::Reconciling {
+            Some(
+                self.retry_schedule
+                    .status_poll_at(execution.version)
+                    .map_err(|error| stop_dispatch_error(&error.safe_message))?,
+            )
+        } else {
+            None
+        };
         let context = outcome_context(candidate.tenant_id, fence, &identity, request_hash)
             .map_err(|error| stop_dispatch_error(&error.safe_message))?;
         self.store
@@ -716,11 +732,169 @@ where
                     status,
                     result: None,
                     error_code,
+                    next_status_poll_at,
                     outcome_event_id: EventId::from_bytes(derived_id("event", &identity)),
                 },
             )
             .await
             .map_err(|error| stop_dispatch_error(&error.to_string()))?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn dispatch_agent_status(
+        &self,
+        candidate: AgentStatusCandidate,
+    ) -> Result<(), crate::AgentStatusDispatchError> {
+        if !candidate.shape_is_valid() {
+            return Err(status_dispatch_error("Agent status candidate is malformed"));
+        }
+        let execution = &candidate.execution;
+        let correlation_id = CorrelationId::from_bytes(derived_id(
+            "agent-status-correlation",
+            &execution.agent_execution_id.to_string(),
+        ));
+        let fence = RecoveryDispatchFence {
+            expected_run: candidate.expected_run,
+            execution_generation: candidate
+                .expected_run
+                .execution_generation
+                .unwrap_or_default(),
+            correlation_id,
+            actor_ref: "agent-loom-agent-status".to_owned(),
+        };
+        let query = query_context(candidate.tenant_id, &fence);
+        let invocation = self
+            .store
+            .get_agent_invocation(&query, execution.agent_execution_id)
+            .await
+            .map_err(|error| status_dispatch_error(&error.to_string()))?;
+        let Some(invocation) = invocation else {
+            return self
+                .record_status_projection(
+                    &candidate,
+                    &fence,
+                    AgentExecutionStatus::ManualReview,
+                    None,
+                    Some("INVOCATION_ENVELOPE_MISSING".to_owned()),
+                )
+                .await;
+        };
+        if validate_agent_invocation(&invocation, execution).is_err() {
+            return self
+                .record_status_projection(
+                    &candidate,
+                    &fence,
+                    AgentExecutionStatus::ManualReview,
+                    None,
+                    Some("INVOCATION_ENVELOPE_MISMATCH".to_owned()),
+                )
+                .await;
+        }
+        let Some(adapter) = self
+            .registry
+            .agent(invocation.endpoint_id, invocation.agent_version_id)
+        else {
+            return self
+                .record_status_projection(
+                    &candidate,
+                    &fence,
+                    AgentExecutionStatus::ManualReview,
+                    None,
+                    Some("ADAPTER_NOT_REGISTERED".to_owned()),
+                )
+                .await;
+        };
+        let Ok(remote) = remote_ref(execution) else {
+            return self
+                .record_status_projection(
+                    &candidate,
+                    &fence,
+                    AgentExecutionStatus::ManualReview,
+                    None,
+                    Some("REMOTE_IDENTITY_MISSING".to_owned()),
+                )
+                .await;
+        };
+        let seed = status_context_seed(&invocation, &remote, correlation_id, execution.version)?;
+        let context = match self.context_factory.create(seed.clone()).await {
+            Ok(context) => context,
+            Err(error) => {
+                let (status, error_code) = stop_error_projection(&error);
+                return self
+                    .record_status_projection(&candidate, &fence, status, None, error_code)
+                    .await;
+            }
+        };
+        if let Err(error) = validate_adapter_context(&context, &seed) {
+            let (status, error_code) = stop_error_projection(&error);
+            return self
+                .record_status_projection(&candidate, &fence, status, None, error_code)
+                .await;
+        }
+        let (status, result, error_code) = match adapter.get_status(&context, &remote).await {
+            Ok(snapshot) => match project_remote_status(&remote, snapshot) {
+                Ok(projected) => projected,
+                Err(_) => (
+                    AgentExecutionStatus::ManualReview,
+                    None,
+                    Some("REMOTE_IDENTITY_MISMATCH".to_owned()),
+                ),
+            },
+            Err(error) => {
+                let (status, error_code) = stop_error_projection(&error);
+                (status, None, error_code)
+            }
+        };
+        self.record_status_projection(&candidate, &fence, status, result, error_code)
+            .await
+    }
+
+    async fn record_status_projection(
+        &self,
+        candidate: &AgentStatusCandidate,
+        fence: &RecoveryDispatchFence,
+        status: AgentExecutionStatus,
+        result: Option<JsonPayload>,
+        error_code: Option<String>,
+    ) -> Result<(), crate::AgentStatusDispatchError> {
+        let execution = &candidate.execution;
+        let next_status_poll_at = if status == AgentExecutionStatus::Reconciling {
+            Some(
+                self.retry_schedule
+                    .status_poll_at(execution.version)
+                    .map_err(|error| status_dispatch_error(&error.safe_message))?,
+            )
+        } else {
+            None
+        };
+        let identity = format!(
+            "agent-status/{}/version/{}",
+            execution.agent_execution_id, execution.version
+        );
+        let context = outcome_context(
+            candidate.tenant_id,
+            fence,
+            &identity,
+            stop_projection_digest(status, error_code.as_deref()),
+        )
+        .map_err(|error| status_dispatch_error(&error.safe_message))?;
+        self.store
+            .record_agent_outcome(
+                &context,
+                RecordAgentOutcome {
+                    expected_run: candidate.expected_run,
+                    agent_execution_id: execution.agent_execution_id,
+                    expected_version: execution.version,
+                    status,
+                    result,
+                    error_code,
+                    next_status_poll_at,
+                    outcome_event_id: EventId::from_bytes(derived_id("event", &identity)),
+                },
+            )
+            .await
+            .map_err(|error| status_dispatch_error(&error.to_string()))?;
         Ok(())
     }
 }
@@ -749,6 +923,15 @@ where
 {
     fn request_stop(&self, candidate: AgentStopCandidate) -> crate::AgentStopFuture<'_> {
         Box::pin(async move { self.dispatch_agent_stop(candidate).await })
+    }
+}
+
+impl<S> crate::AgentStatusDispatcher for AdapterRecoveryDispatcher<S>
+where
+    S: AdapterDispatchStore,
+{
+    fn get_status(&self, candidate: AgentStatusCandidate) -> crate::AgentStatusFuture<'_> {
+        Box::pin(async move { self.dispatch_agent_status(candidate).await })
     }
 }
 
@@ -912,6 +1095,84 @@ fn stop_context_seed(
         idempotency_key: IdempotencyKey::parse(identity)
             .map_err(|_| stop_dispatch_error("generated Agent stop identity is invalid"))?,
         request_hash: Digest::from_bytes(hasher.finalize().into()),
+    })
+}
+
+fn status_context_seed(
+    invocation: &AgentInvocation,
+    remote: &RemoteAgentRef,
+    correlation_id: CorrelationId,
+    version: u64,
+) -> Result<AdapterContextSeed, crate::AgentStatusDispatchError> {
+    let identity = format!("agent-status-{}-{version}", invocation.agent_execution_id);
+    let mut hasher = Sha256::new();
+    hasher.update(b"agent-status\0");
+    hasher.update(remote.remote_run_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(remote.protocol_version.as_bytes());
+    Ok(AdapterContextSeed {
+        tenant_id: invocation.tenant_id,
+        execution_id: ExecutionId::Agent(invocation.agent_execution_id),
+        correlation_id,
+        idempotency_key: IdempotencyKey::parse(identity)
+            .map_err(|_| status_dispatch_error("generated Agent status identity is invalid"))?,
+        request_hash: Digest::from_bytes(hasher.finalize().into()),
+    })
+}
+
+fn remote_ref(
+    execution: &agent_loom_domain::AgentExecutionSnapshot,
+) -> Result<RemoteAgentRef, String> {
+    Ok(RemoteAgentRef {
+        remote_run_id: execution
+            .remote_run_ref
+            .clone()
+            .ok_or_else(|| "Agent execution has no remote Run identity".to_owned())?,
+        remote_session_id: execution.remote_session_ref.clone(),
+        protocol_version: execution
+            .remote_protocol_version
+            .clone()
+            .ok_or_else(|| "Agent execution has no remote protocol version".to_owned())?,
+    })
+}
+
+fn project_remote_status(
+    expected: &RemoteAgentRef,
+    snapshot: RemoteAgentSnapshot,
+) -> Result<
+    (AgentExecutionStatus, Option<JsonPayload>, Option<String>),
+    crate::AgentStatusDispatchError,
+> {
+    if snapshot.remote != *expected {
+        return Err(status_dispatch_error(
+            "Agent status response changed the remote execution identity",
+        ));
+    }
+    Ok(match snapshot.status {
+        RemoteAgentStatus::Completed => match snapshot.result {
+            Some(result) => (AgentExecutionStatus::Succeeded, Some(result), None),
+            None => (
+                AgentExecutionStatus::ManualReview,
+                None,
+                Some("REMOTE_RESULT_MISSING".to_owned()),
+            ),
+        },
+        RemoteAgentStatus::Failed => (
+            AgentExecutionStatus::Failed,
+            None,
+            Some("REMOTE_AGENT_FAILED".to_owned()),
+        ),
+        RemoteAgentStatus::Cancelled => (AgentExecutionStatus::Cancelled, None, None),
+        RemoteAgentStatus::Unknown => (
+            AgentExecutionStatus::Reconciling,
+            None,
+            Some("REMOTE_STATUS_UNKNOWN".to_owned()),
+        ),
+        RemoteAgentStatus::Accepted
+        | RemoteAgentStatus::Running
+        | RemoteAgentStatus::WaitingForApproval
+        | RemoteAgentStatus::WaitingForInput
+        | RemoteAgentStatus::Stopping => (AgentExecutionStatus::Reconciling, None, None),
     })
 }
 
@@ -1150,6 +1411,12 @@ fn dispatch_error(message: &str) -> ExternalDispatchError {
 
 fn stop_dispatch_error(message: &str) -> crate::AgentStopDispatchError {
     crate::AgentStopDispatchError {
+        safe_message: message.to_owned(),
+    }
+}
+
+fn status_dispatch_error(message: &str) -> crate::AgentStatusDispatchError {
+    crate::AgentStatusDispatchError {
         safe_message: message.to_owned(),
     }
 }

@@ -2098,6 +2098,7 @@ impl PostgresTransactionExecutor {
             remote_run_ref: None,
             remote_session_ref: None,
             remote_protocol_version: None,
+            status_poll_at: None,
             event_cursor: None,
             cursor_version: 0,
             retry_at: None,
@@ -2208,6 +2209,7 @@ impl PostgresTransactionExecutor {
             .execute(
                 "UPDATE agent_loom.agent_executions SET status = 'submitting', version = $3, \
                     error_code = NULL, result_json = NULL, completed_at = NULL, \
+                    status_poll_at = NULL, \
                     updated_at = to_timestamp(($5::bigint)::double precision / 1000000.0) \
                  WHERE tenant_id = $1 AND agent_execution_id = $2 \
                    AND status = 'reconciling' AND version = $4 AND retry_at IS NULL \
@@ -2286,6 +2288,7 @@ impl PostgresTransactionExecutor {
             remote_run_ref: None,
             remote_session_ref: execution.remote_session_ref,
             remote_protocol_version: execution.remote_protocol_version,
+            status_poll_at: None,
             event_cursor: execution.event_cursor,
             cursor_version: nonnegative_u64(execution.cursor_version, "Agent cursor version")?,
             retry_at: None,
@@ -2393,6 +2396,7 @@ impl PostgresTransactionExecutor {
                     remote_run_ref = $5, remote_session_ref = $6, \
                     remote_protocol_version = $7, error_code = $8, \
                     retry_at = to_timestamp(($9::bigint)::double precision / 1000000.0), \
+                    status_poll_at = NULL, \
                     completed_at = CASE WHEN $10 THEN \
                         to_timestamp(($11::bigint)::double precision / 1000000.0) ELSE NULL END, \
                     updated_at = to_timestamp(($11::bigint)::double precision / 1000000.0) \
@@ -2479,6 +2483,7 @@ impl PostgresTransactionExecutor {
             remote_run_ref: projection.remote_run_ref.clone(),
             remote_session_ref: projection.remote_session_ref.clone(),
             remote_protocol_version: projection.remote_protocol_version.clone(),
+            status_poll_at: None,
             event_cursor: execution.event_cursor,
             cursor_version: nonnegative_u64(execution.cursor_version, "Agent cursor version")?,
             retry_at: projection.retry_at.map(UnixMicros::new),
@@ -2802,10 +2807,11 @@ impl PostgresTransactionExecutor {
             .execute(
                 "UPDATE agent_loom.agent_executions SET status = $3, version = $4, \
                     result_json = $5, error_code = $6, retry_at = NULL, \
-                    completed_at = CASE WHEN $7 THEN \
-                        to_timestamp(($8::bigint)::double precision / 1000000.0) ELSE NULL END, \
-                    updated_at = to_timestamp(($8::bigint)::double precision / 1000000.0) \
-                 WHERE tenant_id = $1 AND agent_execution_id = $2 AND version = $9 \
+                    status_poll_at = to_timestamp(($7::bigint)::double precision / 1000000.0), \
+                    completed_at = CASE WHEN $8 THEN \
+                        to_timestamp(($9::bigint)::double precision / 1000000.0) ELSE NULL END, \
+                    updated_at = to_timestamp(($9::bigint)::double precision / 1000000.0) \
+                 WHERE tenant_id = $1 AND agent_execution_id = $2 AND version = $10 \
                    AND status IN ('running', 'stopping', 'outcome_unknown', \
                                   'reconciling', 'manual_review')",
                 &[
@@ -2815,6 +2821,7 @@ impl PostgresTransactionExecutor {
                     &next_version,
                     &result,
                     &command.error_code,
+                    &command.next_status_poll_at.map(UnixMicros::get),
                     &terminal,
                     &db_now,
                     &execution.version,
@@ -2845,6 +2852,7 @@ impl PostgresTransactionExecutor {
             "status": status,
             "version": next_version,
             "error_code": &command.error_code,
+            "next_status_poll_at_micros": command.next_status_poll_at.map(UnixMicros::get),
             "fenced": fenced,
         });
         insert_event(
@@ -2887,6 +2895,7 @@ impl PostgresTransactionExecutor {
             remote_run_ref: execution.remote_run_ref,
             remote_session_ref: execution.remote_session_ref,
             remote_protocol_version: execution.remote_protocol_version,
+            status_poll_at: command.next_status_poll_at,
             event_cursor: execution.event_cursor,
             cursor_version: nonnegative_u64(execution.cursor_version, "Agent cursor version")?,
             retry_at: None,
@@ -3200,12 +3209,17 @@ impl PostgresTransactionExecutor {
                 let updated = transaction
                     .execute(
                         "UPDATE agent_loom.agent_executions SET status = 'reconciling', \
-                            retry_at = to_timestamp(($6::bigint)::double precision / 1000000.0), \
+                            retry_at = CASE WHEN remote_run_ref IS NULL THEN \
+                                to_timestamp(($6::bigint)::double precision / 1000000.0) \
+                                ELSE NULL END, \
+                            status_poll_at = CASE WHEN remote_run_ref IS NOT NULL THEN \
+                                to_timestamp(($6::bigint)::double precision / 1000000.0) \
+                                ELSE NULL END, \
                             version = version + 1, \
                             updated_at = to_timestamp(($6::bigint)::double precision / 1000000.0) \
                          WHERE tenant_id = $1 AND agent_execution_id = $2 AND run_id = $3 \
                            AND version = $4 \
-                           AND status IN ('submitting', 'running', 'stopping', 'outcome_unknown') \
+                           AND status IN ('submitting', 'running', 'outcome_unknown') \
                            AND updated_at <= to_timestamp(($5::bigint)::double precision / 1000000.0)",
                         &[
                             &tenant_id,
@@ -4819,6 +4833,7 @@ struct LockedAgentExecution {
     remote_run_ref: Option<String>,
     remote_session_ref: Option<String>,
     remote_protocol_version: Option<String>,
+    status_poll_at: Option<i64>,
     event_cursor: Option<String>,
     cursor_version: i64,
     retry_at: Option<i64>,
@@ -4840,6 +4855,7 @@ impl LockedAgentExecution {
             remote_run_ref: self.remote_run_ref.clone(),
             remote_session_ref: self.remote_session_ref.clone(),
             remote_protocol_version: self.remote_protocol_version.clone(),
+            status_poll_at: self.status_poll_at.map(UnixMicros::new),
             event_cursor: self.event_cursor.clone(),
             cursor_version: nonnegative_u64(self.cursor_version, "Agent cursor version")?,
             retry_at: self.retry_at.map(UnixMicros::new),
@@ -4856,7 +4872,10 @@ fn validate_prepare_agent(command: &PrepareAgentExecution) -> StoreResult<()> {
 
 const AGENT_EXECUTION_SELECT: &str = "SELECT agent_execution_id, run_id, stage_execution_id, task_id, endpoint_id, \
             agent_version_id, request_hash, status, version, remote_run_ref, \
-            remote_session_ref, remote_protocol_version, event_cursor, cursor_version, \
+            remote_session_ref, remote_protocol_version, \
+            CASE WHEN status_poll_at IS NULL THEN NULL \
+                ELSE (extract(epoch FROM status_poll_at) * 1000000)::bigint END, \
+            event_cursor, cursor_version, \
             CASE WHEN retry_at IS NULL THEN NULL \
                 ELSE (extract(epoch FROM retry_at) * 1000000)::bigint END, \
             (extract(epoch FROM updated_at) * 1000000)::bigint \
@@ -4876,10 +4895,11 @@ fn decode_locked_agent(row: &Row) -> LockedAgentExecution {
         remote_run_ref: row.get(9),
         remote_session_ref: row.get(10),
         remote_protocol_version: row.get(11),
-        event_cursor: row.get(12),
-        cursor_version: row.get(13),
-        retry_at: row.get(14),
-        updated_at: row.get(15),
+        status_poll_at: row.get(12),
+        event_cursor: row.get(13),
+        cursor_version: row.get(14),
+        retry_at: row.get(15),
+        updated_at: row.get(16),
     }
 }
 
@@ -5203,6 +5223,12 @@ fn validate_agent_outcome(command: &RecordAgentOutcome) -> StoreResult<()> {
     }
     if command.error_code.as_ref().is_some_and(String::is_empty) {
         return Err(invalid_command("Agent outcome has an empty error code"));
+    }
+    if command.status != AgentExecutionStatus::Reconciling && command.next_status_poll_at.is_some()
+    {
+        return Err(invalid_command(
+            "Agent status polling is only valid while reconciling",
+        ));
     }
     let shape_is_valid = match command.status {
         AgentExecutionStatus::Succeeded => command.result.is_some() && command.error_code.is_none(),
@@ -7839,6 +7865,8 @@ struct AgentReceipt {
     remote_session_ref: Option<String>,
     #[serde(default)]
     remote_protocol_version: Option<String>,
+    #[serde(default)]
+    status_poll_at: Option<i64>,
     event_cursor: Option<String>,
     cursor_version: u64,
     retry_at: Option<i64>,
@@ -7861,6 +7889,7 @@ fn encode_agent_receipt(snapshot: &AgentExecutionSnapshot) -> StoreResult<Value>
         remote_run_ref: snapshot.remote_run_ref.clone(),
         remote_session_ref: snapshot.remote_session_ref.clone(),
         remote_protocol_version: snapshot.remote_protocol_version.clone(),
+        status_poll_at: snapshot.status_poll_at.map(UnixMicros::get),
         event_cursor: snapshot.event_cursor.clone(),
         cursor_version: snapshot.cursor_version,
         retry_at: snapshot.retry_at.map(UnixMicros::get),
@@ -7890,6 +7919,7 @@ fn decode_agent_receipt(tenant_id: TenantId, value: &Value) -> StoreResult<Agent
         remote_run_ref: receipt.remote_run_ref,
         remote_session_ref: receipt.remote_session_ref,
         remote_protocol_version: receipt.remote_protocol_version,
+        status_poll_at: receipt.status_poll_at.map(UnixMicros::new),
         event_cursor: receipt.event_cursor,
         cursor_version: receipt.cursor_version,
         retry_at: receipt.retry_at.map(UnixMicros::new),
@@ -8439,6 +8469,7 @@ mod tests {
             remote_run_ref: Some("remote-run".to_owned()),
             remote_session_ref: Some("remote-session".to_owned()),
             remote_protocol_version: Some("1".to_owned()),
+            status_poll_at: Some(UnixMicros::new(450)),
             event_cursor: Some("cursor-4".to_owned()),
             cursor_version: 4,
             retry_at: Some(UnixMicros::new(500)),

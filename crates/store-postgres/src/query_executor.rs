@@ -6,10 +6,11 @@ use agent_loom_domain::{
     WaitSnapshot, WaitStatus, WorkflowId, WorkflowSnapshot, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
-    AgentInvocation, AgentStopCandidate, AgentStopPage, AgentStopQuery, DueWorkCandidate,
-    DueWorkKind, DueWorkPage, DueWorkQuery, DueWorkTarget, EventCursor, EventPage,
-    MaintenanceCandidate, MaintenanceKind, MaintenancePage, MaintenanceQuery, MaintenanceTarget,
-    QueryContext, StoreError, StoreErrorCode, StoreResult, ToolInvocation,
+    AgentInvocation, AgentStatusCandidate, AgentStatusPage, AgentStatusQuery, AgentStopCandidate,
+    AgentStopPage, AgentStopQuery, DueWorkCandidate, DueWorkKind, DueWorkPage, DueWorkQuery,
+    DueWorkTarget, EventCursor, EventPage, MaintenanceCandidate, MaintenanceKind, MaintenancePage,
+    MaintenanceQuery, MaintenanceTarget, QueryContext, StoreError, StoreErrorCode, StoreResult,
+    ToolInvocation,
 };
 use serde_json::Value;
 use tokio_postgres::{Client, Row};
@@ -24,6 +25,7 @@ const MAX_EVENT_PAGE_SIZE: u32 = 1_000;
 const MAX_DUE_WORK_PAGE_SIZE: u32 = 1_000;
 const MAX_MAINTENANCE_PAGE_SIZE: u32 = 1_000;
 const MAX_AGENT_STOP_PAGE_SIZE: u32 = 1_000;
+const MAX_AGENT_STATUS_PAGE_SIZE: u32 = 1_000;
 
 impl crate::PostgresTransactionExecutor {
     /// Reads the authoritative Run projection for one tenant.
@@ -399,7 +401,7 @@ impl crate::PostgresTransactionExecutor {
                     FROM agent_loom.agent_executions x \
                     JOIN agent_loom.runs r ON r.tenant_id = x.tenant_id AND r.run_id = x.run_id \
                     WHERE x.tenant_id = $1 \
-                      AND x.status IN ('submitting', 'running', 'stopping', 'outcome_unknown') \
+                      AND x.status IN ('submitting', 'running', 'outcome_unknown') \
                       AND x.updated_at <= transaction_timestamp() - ($5::bigint * interval '1 microsecond') \
                       AND r.status IN ('queued', 'running', 'waiting', 'approval_required', \
                                        'retrying', 'paused')\
@@ -475,6 +477,56 @@ impl crate::PostgresTransactionExecutor {
             .map(|row| decode_agent_stop(context.tenant_id, row))
             .collect::<StoreResult<Vec<_>>>()?;
         Ok(AgentStopPage { candidates })
+    }
+
+    /// Returns due remote status polls using PostgreSQL transaction time.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error for an invalid limit, database failure, or
+    /// malformed persisted Agent state.
+    pub async fn scan_agent_status(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        query: AgentStatusQuery,
+    ) -> StoreResult<AgentStatusPage> {
+        if query.limit == 0 {
+            return Err(StoreError::new(
+                StoreErrorCode::ConstraintViolation,
+                agent_loom_durable_store::RetryClass::Never,
+                "agent status page limit must be positive",
+            ));
+        }
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let limit = i64::from(query.limit.min(MAX_AGENT_STATUS_PAGE_SIZE));
+        let rows = client
+            .query(
+                "SELECT x.agent_execution_id, x.run_id, x.stage_execution_id, x.task_id, \
+                        x.endpoint_id, x.agent_version_id, x.status, x.version, \
+                        x.remote_run_ref, x.remote_session_ref, x.remote_protocol_version, \
+                        x.event_cursor, x.cursor_version, \
+                        CASE WHEN x.retry_at IS NULL THEN NULL ELSE \
+                            (extract(epoch FROM x.retry_at) * 1000000)::bigint END, \
+                        (extract(epoch FROM x.updated_at) * 1000000)::bigint, \
+                        r.version, r.execution_generation, \
+                        (extract(epoch FROM x.status_poll_at) * 1000000)::bigint \
+                 FROM agent_loom.agent_executions x \
+                 JOIN agent_loom.runs r ON r.tenant_id = x.tenant_id AND r.run_id = x.run_id \
+                 WHERE x.tenant_id = $1 AND x.status = 'reconciling' \
+                   AND x.remote_run_ref IS NOT NULL \
+                   AND x.remote_protocol_version IS NOT NULL \
+                   AND x.status_poll_at <= transaction_timestamp() \
+                 ORDER BY x.status_poll_at, x.agent_execution_id LIMIT $2",
+                &[&tenant_id, &limit],
+            )
+            .await
+            .map_err(map_database_error)?;
+        let candidates = rows
+            .iter()
+            .map(|row| decode_agent_status(context.tenant_id, row))
+            .collect::<StoreResult<Vec<_>>>()?;
+        Ok(AgentStatusPage { candidates })
     }
 
     /// Loads the immutable Tool Adapter invocation envelope for one execution.
@@ -570,6 +622,27 @@ fn decode_digest(value: Vec<u8>, field: &str) -> StoreResult<Digest> {
 }
 
 fn decode_agent_stop(tenant_id: TenantId, row: &Row) -> StoreResult<AgentStopCandidate> {
+    let (execution, expected_run) = decode_agent_control_execution(tenant_id, row)?;
+    let candidate = AgentStopCandidate {
+        tenant_id,
+        execution,
+        expected_run,
+    };
+    if !candidate.shape_is_valid() {
+        return Err(inconsistent(
+            "Agent stop candidate violates its durable shape",
+        ));
+    }
+    Ok(candidate)
+}
+
+fn decode_agent_control_execution(
+    tenant_id: TenantId,
+    row: &Row,
+) -> StoreResult<(
+    AgentExecutionSnapshot,
+    agent_loom_durable_store::ExpectedRun,
+)> {
     let execution_id: Uuid = row.get(0);
     let run_uuid: Uuid = row.get(1);
     let stage_id: Option<Uuid> = row.get(2);
@@ -577,9 +650,8 @@ fn decode_agent_stop(tenant_id: TenantId, row: &Row) -> StoreResult<AgentStopCan
     let endpoint_id: Uuid = row.get(4);
     let agent_version_id: Uuid = row.get(5);
     let run_id = run_id_from_uuid(run_uuid);
-    let candidate = AgentStopCandidate {
-        tenant_id,
-        execution: AgentExecutionSnapshot {
+    Ok((
+        AgentExecutionSnapshot {
             tenant_id,
             agent_execution_id: AgentExecutionId::from_bytes(execution_id.into_bytes()),
             run_id,
@@ -593,20 +665,31 @@ fn decode_agent_stop(tenant_id: TenantId, row: &Row) -> StoreResult<AgentStopCan
             remote_run_ref: row.get(8),
             remote_session_ref: row.get(9),
             remote_protocol_version: row.get(10),
+            status_poll_at: None,
             event_cursor: row.get(11),
             cursor_version: nonnegative_u64(row.get(12), "Agent cursor version")?,
             retry_at: row.get::<_, Option<i64>>(13).map(UnixMicros::new),
             updated_at: UnixMicros::new(row.get(14)),
         },
-        expected_run: agent_loom_durable_store::ExpectedRun {
+        agent_loom_durable_store::ExpectedRun {
             run_id,
             version: Some(nonnegative_u64(row.get(15), "Run version")?),
             execution_generation: Some(nonnegative_u64(row.get(16), "Run execution generation")?),
         },
+    ))
+}
+
+fn decode_agent_status(tenant_id: TenantId, row: &Row) -> StoreResult<AgentStatusCandidate> {
+    let (mut execution, expected_run) = decode_agent_control_execution(tenant_id, row)?;
+    execution.status_poll_at = Some(UnixMicros::new(row.get(17)));
+    let candidate = AgentStatusCandidate {
+        tenant_id,
+        execution,
+        expected_run,
     };
     if !candidate.shape_is_valid() {
         return Err(inconsistent(
-            "Agent stop candidate violates its durable shape",
+            "Agent status candidate violates its durable shape",
         ));
     }
     Ok(candidate)

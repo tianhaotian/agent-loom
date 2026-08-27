@@ -12,7 +12,8 @@ use agent_loom_durable_store::{
     LeaseProof, PrepareAgentExecution, QueryContext, RecordAgentSubmission,
 };
 use agent_loom_runtime::{
-    AgentStopPollOutcome, AgentStopWorker, AgentStopWorkerConfig, PollingActivity, PollingJob as _,
+    AgentStatusPollOutcome, AgentStatusWorker, AgentStatusWorkerConfig, AgentStopPollOutcome,
+    AgentStopWorker, AgentStopWorkerConfig, PollingActivity, PollingJob as _,
 };
 use agent_loom_server::{
     MaintenancePollingConfig, MaintenancePollingJob, ServerConfig, WorkflowWorker,
@@ -529,6 +530,38 @@ async fn cancel_before_submission_response_still_stops_the_remote_agent() {
         .expect("query stopped Agent execution");
     assert_eq!(row.get::<_, String>(0), "reconciling");
     assert_eq!(row.get::<_, Option<String>>(1).as_deref(), Some("1"));
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let dispatcher = mock_dispatcher(
+        application.store.clone(),
+        application.endpoint_id,
+        application.coordinator_agent_version_id,
+    )
+    .expect("build status Mock Agent dispatcher");
+    let status_worker = AgentStatusWorker::new(
+        application.store.clone(),
+        dispatcher,
+        application.tenant_id,
+        AgentStatusWorkerConfig::default(),
+    )
+    .expect("build Agent status worker");
+    assert!(matches!(
+        status_worker.poll_once().await.expect("query remote status"),
+        AgentStatusPollOutcome::Dispatched(candidate)
+            if candidate.execution.agent_execution_id == execution_id
+    ));
+    let status: String = client
+        .query_one(
+            "SELECT status FROM agent_loom.agent_executions \
+             WHERE tenant_id = $1 AND agent_execution_id = $2",
+            &[
+                &uuid::Uuid::from_bytes(application.tenant_id.into_bytes()),
+                &uuid::Uuid::from_bytes(execution_id.into_bytes()),
+            ],
+        )
+        .await
+        .expect("query reconciled Agent execution")
+        .get(0);
+    assert_eq!(status, "succeeded");
 }
 
 fn test_id(nonce: u128, label: &str) -> [u8; 16] {

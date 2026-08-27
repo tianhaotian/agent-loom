@@ -172,6 +172,7 @@ struct FakeAgentAdapter {
     seen: Arc<Mutex<Option<AgentRunRequest>>>,
     stop_calls: SeenStopCalls,
     stop_outcome: StopRequestOutcome,
+    status_snapshot: Option<RemoteAgentSnapshot>,
 }
 
 impl AgentServerAdapter for FakeAgentAdapter {
@@ -219,7 +220,8 @@ impl AgentServerAdapter for FakeAgentAdapter {
         _context: &'a AdapterCallContext,
         _remote: &'a RemoteAgentRef,
     ) -> AdapterFuture<'a, RemoteAgentSnapshot> {
-        Box::pin(async { panic!("status is not used by submission tests") })
+        let snapshot = self.status_snapshot.clone();
+        Box::pin(async move { Ok(snapshot.expect("status is configured for this test")) })
     }
 
     fn read_events<'a>(
@@ -307,6 +309,12 @@ impl AdapterRetrySchedule for FakeRetrySchedule {
             20_000 + i64::try_from(attempt).expect("attempt range"),
         ))
     }
+
+    fn status_poll_at(&self, observation: u64) -> Result<UnixMicros, ExternalDispatchError> {
+        Ok(UnixMicros::new(
+            30_000 + i64::try_from(observation).expect("observation range"),
+        ))
+    }
 }
 
 fn dispatcher(
@@ -387,6 +395,7 @@ fn agent_snapshot() -> AgentExecutionSnapshot {
         remote_run_ref: None,
         remote_session_ref: None,
         remote_protocol_version: None,
+        status_poll_at: None,
         event_cursor: None,
         cursor_version: 0,
         retry_at: None,
@@ -428,6 +437,7 @@ fn registry_agent(seen: Arc<Mutex<Option<AgentRunRequest>>>) -> Arc<dyn AgentSer
         seen,
         stop_calls: Arc::new(Mutex::new(Vec::new())),
         stop_outcome: StopRequestOutcome::Unsupported,
+        status_snapshot: None,
     })
 }
 
@@ -582,6 +592,7 @@ async fn agent_stop_uses_stable_identity_and_records_reconciliation() {
         seen: Arc::new(Mutex::new(None)),
         stop_calls: Arc::clone(&stop_calls),
         stop_outcome: StopRequestOutcome::Accepted { cooperative: true },
+        status_snapshot: None,
     });
     let dispatcher = dispatcher(
         FakeStore(Arc::clone(&state)),
@@ -625,6 +636,63 @@ async fn agent_stop_uses_stable_identity_and_records_reconciliation() {
         .expect("recorded stop outcome");
     assert_eq!(recorded.status, AgentExecutionStatus::Reconciling);
     assert_eq!(recorded.expected_version, 5);
+    assert_eq!(recorded.next_status_poll_at, Some(UnixMicros::new(30_005)));
+}
+
+#[tokio::test]
+async fn agent_status_query_records_the_authoritative_remote_result() {
+    let state = state();
+    let remote = RemoteAgentRef {
+        remote_run_id: "remote-run-1".to_owned(),
+        remote_session_id: Some("session-1".to_owned()),
+        protocol_version: "test-v1".to_owned(),
+    };
+    let result = JsonPayload::from_validated_bytes(br#"{"answer":42}"#.to_vec());
+    let agent: Arc<dyn AgentServerAdapter> = Arc::new(FakeAgentAdapter {
+        seen: Arc::new(Mutex::new(None)),
+        stop_calls: Arc::new(Mutex::new(Vec::new())),
+        stop_outcome: StopRequestOutcome::Unsupported,
+        status_snapshot: Some(RemoteAgentSnapshot {
+            remote: remote.clone(),
+            status: RemoteAgentStatus::Completed,
+            result: Some(result.clone()),
+        }),
+    });
+    let dispatcher = dispatcher(
+        FakeStore(Arc::clone(&state)),
+        registry_tool(Arc::new(Mutex::new(None)), false),
+        agent,
+    );
+    let mut execution = agent_snapshot();
+    execution.status = AgentExecutionStatus::Reconciling;
+    execution.version = 6;
+    execution.remote_run_ref = Some(remote.remote_run_id);
+    execution.remote_session_ref = remote.remote_session_id;
+    execution.remote_protocol_version = Some(remote.protocol_version);
+    execution.status_poll_at = Some(UnixMicros::new(100));
+    let candidate = AgentStatusCandidate {
+        tenant_id: tenant_id(),
+        execution,
+        expected_run: ExpectedRun {
+            run_id: run_id(),
+            version: Some(9),
+            execution_generation: Some(7),
+        },
+    };
+
+    crate::AgentStatusDispatcher::get_status(&dispatcher, candidate)
+        .await
+        .expect("status dispatch");
+
+    let recorded = state
+        .agent_stop_outcome
+        .lock()
+        .expect("agent status outcome lock")
+        .clone()
+        .expect("recorded status outcome");
+    assert_eq!(recorded.status, AgentExecutionStatus::Succeeded);
+    assert_eq!(recorded.result, Some(result));
+    assert_eq!(recorded.next_status_poll_at, None);
 }
 
 #[tokio::test]

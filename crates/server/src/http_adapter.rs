@@ -104,6 +104,12 @@ impl AdapterRetrySchedule for HttpRetrySchedule {
         })?;
         Ok(UnixMicros::new(now_micros().saturating_add(delay)))
     }
+
+    fn status_poll_at(&self, observation: u64) -> Result<UnixMicros, ExternalDispatchError> {
+        let exponent = u32::try_from(observation.min(5)).unwrap_or(5);
+        let delay = 1_000_000_i64.saturating_mul(2_i64.saturating_pow(exponent));
+        Ok(UnixMicros::new(now_micros().saturating_add(delay)))
+    }
 }
 
 /// Registers the production HTTP Agent Server and DevOps Tool profiles.

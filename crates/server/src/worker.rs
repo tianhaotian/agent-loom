@@ -823,6 +823,7 @@ impl DeliveryTaskHandler {
                     status: AgentExecutionStatus::Succeeded,
                     result: Some(outcome),
                     error_code: None,
+                    next_status_poll_at: None,
                     outcome_event_id: EventId::from_bytes(derived_id("outcome-event", &identity)),
                 },
             )

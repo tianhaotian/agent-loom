@@ -30,6 +30,35 @@ pub struct AgentStopPage {
     pub candidates: Vec<AgentStopCandidate>,
 }
 
+/// One due remote status reconciliation backed by an Agent execution version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentStatusCandidate {
+    pub tenant_id: TenantId,
+    pub execution: AgentExecutionSnapshot,
+    pub expected_run: ExpectedRun,
+}
+
+impl AgentStatusCandidate {
+    pub fn shape_is_valid(&self) -> bool {
+        self.tenant_id == self.execution.tenant_id
+            && self.execution.status == agent_loom_domain::AgentExecutionStatus::Reconciling
+            && self.execution.remote_run_ref.is_some()
+            && self.execution.remote_protocol_version.is_some()
+            && self.execution.status_poll_at.is_some()
+            && self.expected_run.run_id == self.execution.run_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentStatusQuery {
+    pub limit: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentStatusPage {
+    pub candidates: Vec<AgentStatusCandidate>,
+}
+
 #[cfg(test)]
 mod tests {
     use agent_loom_domain::{
@@ -58,6 +87,7 @@ mod tests {
                 remote_run_ref: Some("remote-run".to_owned()),
                 remote_session_ref: None,
                 remote_protocol_version: Some("1".to_owned()),
+                status_poll_at: None,
                 event_cursor: None,
                 cursor_version: 0,
                 retry_at: None,
