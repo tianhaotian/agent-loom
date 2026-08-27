@@ -55,6 +55,7 @@ pub enum TaskStatus {
     Succeeded,
     Failed,
     DeadLettered,
+    Skipped,
     Cancelled,
 }
 
@@ -62,7 +63,7 @@ impl TaskStatus {
     pub const fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Succeeded | Self::Failed | Self::DeadLettered | Self::Cancelled
+            Self::Succeeded | Self::Failed | Self::DeadLettered | Self::Skipped | Self::Cancelled
         )
     }
 }
@@ -141,6 +142,12 @@ mod tests {
         assert!(RunStatus::Retrying.accepts_task_claim());
         assert!(!RunStatus::Waiting.accepts_task_claim());
         assert!(!RunStatus::Paused.accepts_task_claim());
+    }
+
+    #[test]
+    fn skipped_task_is_terminal() {
+        assert!(TaskStatus::Skipped.is_terminal());
+        assert!(!TaskStatus::Scheduled.is_terminal());
     }
 
     #[test]

@@ -28,7 +28,7 @@ runtime/src/service/    有界轮询、退避、关闭信号与 Job 接线
 
 `domain`、`durable-store` 与 `adapter-core` 继续保持零外部依赖；Provider crate 可以引入各自的数据库驱动和异步运行时，但驱动类型不得泄漏到共享领域契约。`adapter-http` 使用 HTTPS/loopback HTTP 执行真实远程 I/O，`server` 是 PostgreSQL 专用的产品装配层，不改变 Runtime 与 Store 共享契约的数据库无关性。
 
-已实现 `0000_migration_meta` 至 `0018_task_context_references` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt、Checkpoint、Wait、Artifact、ToolExecution、AgentExecution、Outbox、PlanRevision、Task Dependency、ContextSnapshot、ContextPatch 与 Task ContextReference，并持久化恢复远端 Agent 生命周期所需的协议版本和状态查询时间。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、Wait 单次消费槽与恢复计划、Tool/Agent 重试时间、Agent 请求信封、Artifact 版本血缘、外部执行幂等与 Agent Event 去重；只依赖 `dyn DurableStore` 的黑盒行为现已覆盖 Lease 到期重试、多 Worker 同时领取、完成/取消终态竞争、Wait 单次消费，以及完成事务中途约束失败后的完整回滚。
+已实现 `0000_migration_meta` 至 `0019_task_skipped_status` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt、Checkpoint、Wait、Artifact、ToolExecution、AgentExecution、Outbox、PlanRevision、Task Dependency、ContextSnapshot、ContextPatch、Task ContextReference 与条件分支 `skipped` 终态，并持久化恢复远端 Agent 生命周期所需的协议版本和状态查询时间。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、Wait 单次消费槽与恢复计划、Tool/Agent 重试时间、Agent 请求信封、Artifact 版本血缘、外部执行幂等与 Agent Event 去重；只依赖 `dyn DurableStore` 的黑盒行为现已覆盖 Lease 到期重试、多 Worker 同时领取、完成/取消终态竞争、Wait 单次消费，以及完成事务中途约束失败后的完整回滚。
 
 PostgreSQL 已接入真实驱动执行层：migration executor 使用 SHA-256 physical checksum、session advisory lock、step journal 和逐批 schema introspection；`PostgresStore` 通过连接池完整实现对象安全的 `DurableStore`，事务垂直切片已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 准备/结果记录、AgentExecution 提交/事件/结果记录，以及 Pause/Resume/Cancel。写路径包含 receipt 并发幂等闸门、显式层级锁序、`FOR UPDATE SKIP LOCKED`、Lease fencing、Run version/generation CAS，以及 Event、Checkpoint、Stage、Artifact 和后续动作的原子提交。
 
@@ -38,7 +38,7 @@ PostgreSQL 已接入真实驱动执行层：migration executor 使用 SHA-256 ph
 
 Run 创建事务同时保存不可变 PlanRevision 1。后续完整 ExecutionPlan 快照可通过 `/v1/runs/{run_id}/plan-revisions` 幂等提交和查询；Store 同时 fence Run version、execution generation 与当前 Plan revision，并原子追加 `run.plan_revised` Event/Outbox 和 append-only 新 Task，因此并发或过期 Replan 不会覆盖已提交计划。既有 Task/Stage 不允许被 revision 静默删除或改写，新增 Task 绑定原始 Run input，并使用 revision Event 作为可追踪的创建因果。
 
-ExecutionPlan 的初始 Task 可以声明有向无环依赖、`all`/`any` JoinPolicy，以及成功状态或结果 JSON Pointer 等值条件。根 Task 直接入队，其余 Task 保持 `scheduled`；前置 Task 完成时，Store 在同一事务锁定并评估依赖，只把满足条件的后继 Task 原子切换为 `queued`，重复完成或并发检查不会重复激活。
+ExecutionPlan 的初始 Task 可以声明有向无环依赖、`all`/`any` JoinPolicy，以及成功状态或结果 JSON Pointer 等值条件。根 Task 直接入队，其余 Task 保持 `scheduled`；前置 Task 完成时，Store 在同一事务锁定并评估依赖，只把满足条件的后继 Task 原子切换为 `queued`。当全部前置均已终态且条件不可能再满足时，分支会递归收敛为 `skipped`，重复完成或并发检查不会重复激活。
 
 每个 Run 创建时同时保存 ContextSnapshot 1。后续通用 JSON Context 可用 `replace` 或 RFC 7396 `merge_patch` 更新；Store 以 Run/Context 双重版本 fence 原子保存 Patch、新 Snapshot、父 Snapshot lineage、Event/Outbox 和当前 Context 投影，重复请求不会生成重复 revision。
 

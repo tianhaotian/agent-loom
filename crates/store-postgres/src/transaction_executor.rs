@@ -3758,7 +3758,7 @@ impl PostgresTransactionExecutor {
         )
         .await?;
         let activated_tasks =
-            activate_dependent_tasks(&transaction, tenant_id, run_id, task_id, db_now).await?;
+            resolve_dependent_tasks(&transaction, tenant_id, run_id, task_id, db_now).await?;
         apply_stage_mutation(
             &transaction,
             tenant_id,
@@ -4307,7 +4307,7 @@ impl PostgresTransactionExecutor {
             .collect::<HashSet<_>>()
         {
             follow_up_ids.extend(
-                activate_dependent_tasks(
+                resolve_dependent_tasks(
                     &transaction,
                     tenant_id,
                     run_id,
@@ -8467,74 +8467,91 @@ async fn apply_next_actions(
     }
 }
 
-async fn activate_dependent_tasks(
+async fn resolve_dependent_tasks(
     transaction: &Transaction<'_>,
     tenant_id: Uuid,
     run_id: Uuid,
-    completed_task_id: Uuid,
+    terminal_task_id: Uuid,
     db_now: i64,
 ) -> StoreResult<Vec<TaskId>> {
-    let rows = transaction
-        .query(
-            "SELECT t.task_id, t.join_policy \
-             FROM agent_loom.task_dependencies d \
-             JOIN agent_loom.tasks t ON t.tenant_id = d.tenant_id \
-               AND t.run_id = d.run_id AND t.task_id = d.task_id \
-             WHERE d.tenant_id = $1 AND d.run_id = $2 \
-               AND d.prerequisite_task_id = $3 AND t.status = 'scheduled' \
-             ORDER BY t.task_id FOR UPDATE OF t",
-            &[&tenant_id, &run_id, &completed_task_id],
-        )
-        .await
-        .map_err(map_database_error)?;
     let mut activated = Vec::new();
-    for row in rows {
-        let task_id: Uuid = row.get(0);
-        let join_policy: String = row.get(1);
-        let dependencies = transaction
+    let mut terminal_tasks = vec![terminal_task_id];
+    while let Some(completed_task_id) = terminal_tasks.pop() {
+        let rows = transaction
             .query(
-                "SELECT p.status, p.result_json, d.condition_json \
+                "SELECT t.task_id, t.join_policy \
                  FROM agent_loom.task_dependencies d \
-                 JOIN agent_loom.tasks p ON p.tenant_id = d.tenant_id \
-                   AND p.run_id = d.run_id AND p.task_id = d.prerequisite_task_id \
-                 WHERE d.tenant_id = $1 AND d.run_id = $2 AND d.task_id = $3 \
-                 ORDER BY d.prerequisite_task_id",
-                &[&tenant_id, &run_id, &task_id],
+                 JOIN agent_loom.tasks t ON t.tenant_id = d.tenant_id \
+                   AND t.run_id = d.run_id AND t.task_id = d.task_id \
+                 WHERE d.tenant_id = $1 AND d.run_id = $2 \
+                   AND d.prerequisite_task_id = $3 AND t.status = 'scheduled' \
+                 ORDER BY t.task_id FOR UPDATE OF t",
+                &[&tenant_id, &run_id, &completed_task_id],
             )
             .await
             .map_err(map_database_error)?;
-        let satisfied = dependencies
-            .iter()
-            .map(|dependency| {
-                let result: Option<Value> = dependency.get(1);
-                dependency_condition_satisfied(
-                    dependency.get(0),
-                    result.as_ref(),
-                    &dependency.get(2),
+        for row in rows {
+            let task_id: Uuid = row.get(0);
+            let join_policy: String = row.get(1);
+            let dependencies = transaction
+                .query(
+                    "SELECT p.status, p.result_json, d.condition_json \
+                     FROM agent_loom.task_dependencies d \
+                     JOIN agent_loom.tasks p ON p.tenant_id = d.tenant_id \
+                       AND p.run_id = d.run_id AND p.task_id = d.prerequisite_task_id \
+                     WHERE d.tenant_id = $1 AND d.run_id = $2 AND d.task_id = $3 \
+                     ORDER BY d.prerequisite_task_id",
+                    &[&tenant_id, &run_id, &task_id],
                 )
-            })
-            .collect::<StoreResult<Vec<_>>>()?;
-        let ready = match join_policy.as_str() {
-            "all" => !satisfied.is_empty() && satisfied.iter().all(|value| *value),
-            "any" => satisfied.iter().any(|value| *value),
-            _ => return Err(inconsistent("Task has an invalid JoinPolicy")),
-        };
-        if !ready {
-            continue;
-        }
-        let updated = transaction
-            .execute(
-                "UPDATE agent_loom.tasks SET status = 'queued', \
-                    available_at = to_timestamp(($4::bigint)::double precision / 1000000.0), \
-                    updated_at = to_timestamp(($4::bigint)::double precision / 1000000.0) \
-                 WHERE tenant_id = $1 AND run_id = $2 AND task_id = $3 \
-                   AND status = 'scheduled'",
-                &[&tenant_id, &run_id, &task_id, &db_now],
-            )
-            .await
-            .map_err(map_database_error)?;
-        if updated == 1 {
-            activated.push(task_id_from_uuid(task_id));
+                .await
+                .map_err(map_database_error)?;
+            let satisfied = dependencies
+                .iter()
+                .map(|dependency| {
+                    let result: Option<Value> = dependency.get(1);
+                    dependency_condition_satisfied(
+                        dependency.get(0),
+                        result.as_ref(),
+                        &dependency.get(2),
+                    )
+                })
+                .collect::<StoreResult<Vec<_>>>()?;
+            let ready = match join_policy.as_str() {
+                "all" => !satisfied.is_empty() && satisfied.iter().all(|value| *value),
+                "any" => satisfied.iter().any(|value| *value),
+                _ => return Err(inconsistent("Task has an invalid JoinPolicy")),
+            };
+            let settled = dependencies.iter().all(|dependency| {
+                matches!(
+                    dependency.get::<_, &str>(0),
+                    "succeeded" | "failed" | "dead_lettered" | "skipped" | "cancelled"
+                )
+            });
+            if !ready && !settled {
+                continue;
+            }
+            let next_status = if ready { "queued" } else { "skipped" };
+            let updated = transaction
+                .execute(
+                    "UPDATE agent_loom.tasks SET status = $4::varchar, \
+                        available_at = CASE WHEN $4::varchar = 'queued' THEN \
+                            to_timestamp(($5::bigint)::double precision / 1000000.0) \
+                            ELSE available_at END, \
+                        completed_at = CASE WHEN $4::varchar = 'skipped' THEN \
+                            to_timestamp(($5::bigint)::double precision / 1000000.0) \
+                            ELSE NULL END, \
+                        updated_at = to_timestamp(($5::bigint)::double precision / 1000000.0) \
+                     WHERE tenant_id = $1 AND run_id = $2 AND task_id = $3 \
+                       AND status = 'scheduled'",
+                    &[&tenant_id, &run_id, &task_id, &next_status, &db_now],
+                )
+                .await
+                .map_err(map_database_error)?;
+            if updated == 1 && ready {
+                activated.push(task_id_from_uuid(task_id));
+            } else if updated == 1 {
+                terminal_tasks.push(task_id);
+            }
         }
     }
     Ok(activated)

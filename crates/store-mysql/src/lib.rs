@@ -138,6 +138,12 @@ pub const MIGRATIONS: &[EmbeddedMigration] = &[
         created_tables: &["task_context_references"],
         sql: include_str!("../migrations/0018_task_context_references.sql"),
     },
+    EmbeddedMigration {
+        logical_id: "0019_task_skipped_status",
+        logical_model_version: 20,
+        created_tables: &[],
+        sql: include_str!("../migrations/0019_task_skipped_status.sql"),
+    },
 ];
 
 pub const fn capabilities() -> StoreCapabilities {
@@ -167,7 +173,7 @@ mod tests {
 
     #[test]
     fn migration_batch_is_embedded() {
-        assert_eq!(MIGRATIONS.len(), 19);
+        assert_eq!(MIGRATIONS.len(), 20);
         assert_eq!(MIGRATIONS[0].logical_id, "0000_migration_meta");
         assert!(MIGRATIONS[0].sql.contains("schema_migrations"));
         assert!(MIGRATIONS[0].sql.contains("ENGINE=InnoDB"));

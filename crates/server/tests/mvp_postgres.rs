@@ -945,6 +945,17 @@ async fn execution_plan_dependencies_gate_task_claims_until_conditions_match() {
                         "result_equals": {"pointer": "/approved", "value": true}
                     }
                 }]
+            },
+            {
+                "key": "rejected",
+                "handler": "delivery-mvp",
+                "kind": "model",
+                "depends_on": [{
+                    "task": "root",
+                    "condition": {
+                        "result_equals": {"pointer": "/approved", "value": false}
+                    }
+                }]
             }
         ]
     });
@@ -1086,6 +1097,29 @@ async fn execution_plan_dependencies_gate_task_claims_until_conditions_match() {
     .await;
     assert_eq!(projected_context["projection"], json!(["/goal"]));
     assert_eq!(projected_context["context"]["/goal"], "join tasks");
+
+    let (client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+        .await
+        .expect("reconnect dependency fixture database");
+    let connection_task = tokio::spawn(connection);
+    let rejected_status: String = client
+        .query_one(
+            "SELECT status FROM agent_loom.tasks \
+             WHERE tenant_id = $1 AND run_id = $2 AND logical_key = 'rejected'",
+            &[
+                &uuid::Uuid::from_bytes(application.tenant_id.into_bytes()),
+                &uuid::Uuid::from_bytes(run_id.into_bytes()),
+            ],
+        )
+        .await
+        .expect("query rejected branch")
+        .get(0);
+    assert_eq!(rejected_status, "skipped");
+    drop(client);
+    connection_task
+        .await
+        .expect("join dependency verification connection")
+        .expect("dependency verification connection remains healthy");
 }
 
 fn decode_test_id(value: &str) -> Result<[u8; 16], ()> {

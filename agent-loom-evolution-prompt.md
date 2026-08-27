@@ -129,13 +129,13 @@ Agent Loom 不应该内置：
 - 已有 `ExecutionPlan V1` 到 `CreateRun` 的通用初始 Stage/Task 实例化路径，以及覆盖初始、动态后继、Wait 恢复 Task 的版本化 Handler 信封；Workflow Worker 已由注册表驱动领取和执行，当前只注册 delivery Handler
 - 固定八阶段推进已隔离在 delivery Handler，server 仍以该 Handler 和 Mock Adapter 作为默认 MVP fixture
 - MySQL 只有 migration，没有真实 Store Provider
-- Runtime Adapter Trait 已定义，但大量方法没有接入真实执行路径
+- P0 要求的 Runtime Adapter `submit`、`read_events`、`get_status`、`reconcile_submission` 和 `request_stop` 均已接入真实执行路径；其余非 P0 Adapter 能力仍按具体集成扩展
 - `submit`、提交结果未知时的 `reconcile_submission`、`read_events`、`request_stop` 和远端引用已知时的 `get_status` 已形成生产闭环，并覆盖持久化 event cursor、事件去重、重复 Worker cursor fencing、终态核验以及 Cancel 与提交响应竞态
 - Worker 仍偏单进程 MVP
-- Wait 主要验证了 approval
-- Child Run、Fan-out 和显式 `all/any` Child Join Fan-in 已完成；后台自动 Child Join 轮询和 Handoff 尚未完成
+- 通用 External Signal/Wait 已持久化并支持匹配/单次消费/恢复；当前 HTTP E2E 重点覆盖 approval，更多信号类型可继续扩展验收
+- Child Run、Fan-out 和显式 `all/any` Child Join Fan-in 核心语义已完成；后台自动触发 Child Join 属于生产调度增强，Handoff 属于 P2
 - Transactional Outbox 已对所有权威 Event 形成事务写入、Lease 发布、失败重试和崩溃接管闭环，当前真实 Publisher 为结构化 JSON 日志
-- PlanRevision 已覆盖初始 revision、完整快照历史、HTTP 幂等提交、Run/Plan 双重 fencing、Event/Outbox 审计，以及 append-only 动态 Task 的同事务实例化；ExecutionPlan 已支持无环 Dependency、`all/any` JoinPolicy、成功/结果投影 Condition 和事务内唯一激活。Context 已覆盖初始 Snapshot、replace/merge-patch、Run/Context fencing、不可变 Patch/Snapshot、父级 lineage，以及 Task 创建时固定的 ContextReference/JSON Pointer Projection；Child Run/Fan-out 已覆盖父 Run/Task 校验、幂等创建和直接子 Run 查询，显式 Child Join 可按 `all/any` 终态策略唯一激活父 Task。动态 Stage 删除/改写、后台 Child Join 轮询、Cron、外部 Broker、多租户和生产可观测性尚不完整
+- P0 与 P1 清单中的核心能力均已完成。PlanRevision 已覆盖初始 revision、完整快照历史、HTTP 幂等提交、Run/Plan 双重 fencing、Event/Outbox 审计，以及 append-only 动态 Task 的同事务实例化；ExecutionPlan 已支持无环 Dependency、`all`/`any` JoinPolicy、成功/结果投影 Condition、事务内唯一激活和不可达分支递归 `skipped`。Context 已覆盖初始 Snapshot、replace/merge-patch、Run/Context fencing、不可变 Patch/Snapshot、父级 lineage，以及 Task 创建时固定的 ContextReference/JSON Pointer Projection；Artifact 引用/版本血缘已持久化；Child Run/Fan-out 已覆盖父 Run/Task 校验、幂等创建和直接子 Run 查询，显式 Child Join 可按 `all`/`any` 终态策略唯一激活父 Task。append-only 是 V1 动态计划的有意约束；动态 Stage 删除/改写、后台 Child Join 自动触发、Cron、Handoff、外部 Broker、MySQL 事务 Provider、多租户和生产可观测性属于 Phase 2B、P2 或更后续范围
 
 首先检查当前代码和 git 状态，不要仅依赖上述描述。若描述已经过时，以当前代码和测试为准。
 

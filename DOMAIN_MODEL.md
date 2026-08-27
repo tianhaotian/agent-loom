@@ -331,7 +331,7 @@ Handler key 把 Lease、不可变输入和领取后的 Run fence 交给对应 Ha
 必须先把 Handler key 提升为数据库可过滤的领取维度。升级期间允许 delivery Handler
 读取旧版无信封的 delivery Task，但所有新写入都必须使用 V1 信封。
 
-`task_dependencies` 保存同一 Run 内 Task 到前置 Task 的边以及版本化条件 JSON。创建 Run 前必须拒绝未知节点、自依赖、重复边和环。空条件与 `{"status":"succeeded"}` 等价；`{"result_equals":{"pointer":"/path","value":...}}` 在前置 Task 成功后比较结果 JSON Pointer。完成前置 Task 的事务锁定仍为 `scheduled` 的后继任务，按后继的 JoinPolicy 评估全部边并以状态 CAS 至多激活一次。
+`task_dependencies` 保存同一 Run 内 Task 到前置 Task 的边以及版本化条件 JSON。创建 Run 前必须拒绝未知节点、自依赖、重复边和环。空条件与 `{"status":"succeeded"}` 等价；`{"result_equals":{"pointer":"/path","value":...}}` 在前置 Task 成功后比较结果 JSON Pointer。完成前置 Task 的事务锁定仍为 `scheduled` 的后继任务，按后继的 JoinPolicy 评估全部边并以状态 CAS 至多激活一次；若全部前置均已终态且条件仍不满足，则原子标记后继为 `skipped`，并递归收敛不可达分支。
 
 ### 7.2 `task_attempts`
 
