@@ -2,17 +2,18 @@ use agent_loom_domain::{
     AgentExecutionId, AgentExecutionSnapshot, AgentVersionId, ArtifactId, ArtifactRefSnapshot,
     ArtifactVersionRef, CheckpointId, ContextSnapshot, ContextSnapshotId, Digest, EndpointId,
     EventId, EventRecord, IdempotencyKey, JsonPayload, LogicalKey, PlanRevisionId,
-    PlanRevisionSnapshot, RunId, RunSnapshot, ScheduleId, ScheduleSnapshot, ScheduleStatus,
-    ScopeKey, StageExecutionId, StageExecutionSnapshot, StageStatus, TaskContextReference, TaskId,
-    TenantId, ToolExecutionId, UnixMicros, WaitId, WaitSnapshot, WaitStatus, WorkflowId,
-    WorkflowSnapshot, WorkflowVersionId,
+    PlanRevisionSnapshot, RunId, RunSnapshot, ScheduleId, ScheduleMisfirePolicy, ScheduleSnapshot,
+    ScheduleStatus, ScopeKey, StageExecutionId, StageExecutionSnapshot, StageStatus,
+    TaskContextReference, TaskId, TenantId, ToolExecutionId, UnixMicros, WaitId, WaitSnapshot,
+    WaitStatus, WorkflowId, WorkflowSnapshot, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
-    AgentEventCandidate, AgentEventPage, AgentEventQuery, AgentInvocation, AgentStatusCandidate,
-    AgentStatusPage, AgentStatusQuery, AgentStopCandidate, AgentStopPage, AgentStopQuery,
-    DueWorkCandidate, DueWorkKind, DueWorkPage, DueWorkQuery, DueWorkTarget, EventCursor,
-    EventPage, MaintenanceCandidate, MaintenanceKind, MaintenancePage, MaintenanceQuery,
-    MaintenanceTarget, QueryContext, StoreError, StoreErrorCode, StoreResult, ToolInvocation,
+    AdvanceSchedule, AgentEventCandidate, AgentEventPage, AgentEventQuery, AgentInvocation,
+    AgentStatusCandidate, AgentStatusPage, AgentStatusQuery, AgentStopCandidate, AgentStopPage,
+    AgentStopQuery, DueSchedulePage, DueScheduleQuery, DueWorkCandidate, DueWorkKind, DueWorkPage,
+    DueWorkQuery, DueWorkTarget, EventCursor, EventPage, MaintenanceCandidate, MaintenanceKind,
+    MaintenancePage, MaintenanceQuery, MaintenanceTarget, QueryContext, StoreError, StoreErrorCode,
+    StoreResult, ToolInvocation,
 };
 use serde_json::Value;
 use tokio_postgres::{Client, Row};
@@ -47,7 +48,10 @@ impl crate::PostgresTransactionExecutor {
         client
             .query_opt(
                 "SELECT schedule_id, workflow_version_id, cron_expression, timezone, \
-                        input_json, status, \
+                        input_json, status, misfire_policy, catch_up_limit, \
+                        (extract(epoch FROM next_fire_at) * 1000000)::bigint, \
+                        CASE WHEN last_fire_at IS NULL THEN NULL ELSE \
+                            (extract(epoch FROM last_fire_at) * 1000000)::bigint END, version, \
                         (extract(epoch FROM created_at) * 1000000)::bigint, \
                         (extract(epoch FROM updated_at) * 1000000)::bigint \
                  FROM agent_loom.schedules WHERE tenant_id = $1 AND schedule_id = $2",
@@ -73,7 +77,10 @@ impl crate::PostgresTransactionExecutor {
         client
             .query(
                 "SELECT schedule_id, workflow_version_id, cron_expression, timezone, \
-                        input_json, status, \
+                        input_json, status, misfire_policy, catch_up_limit, \
+                        (extract(epoch FROM next_fire_at) * 1000000)::bigint, \
+                        CASE WHEN last_fire_at IS NULL THEN NULL ELSE \
+                            (extract(epoch FROM last_fire_at) * 1000000)::bigint END, version, \
                         (extract(epoch FROM created_at) * 1000000)::bigint, \
                         (extract(epoch FROM updated_at) * 1000000)::bigint \
                  FROM agent_loom.schedules WHERE tenant_id = $1 \
@@ -85,6 +92,93 @@ impl crate::PostgresTransactionExecutor {
             .iter()
             .map(|row| decode_schedule(context.tenant_id, row))
             .collect()
+    }
+
+    /// Scans active Schedules whose durable cursor is due according to database time.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error when PostgreSQL is unavailable or persisted data is invalid.
+    pub async fn scan_due_schedules(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        query: DueScheduleQuery,
+    ) -> StoreResult<DueSchedulePage> {
+        let limit = i64::from(query.limit.clamp(1, 1_000));
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let database_now: i64 = client
+            .query_one(
+                "SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint",
+                &[],
+            )
+            .await
+            .map_err(map_database_error)?
+            .get(0);
+        let schedules = client
+            .query(
+                "SELECT schedule_id, workflow_version_id, cron_expression, timezone, \
+                        input_json, status, misfire_policy, catch_up_limit, \
+                        (extract(epoch FROM next_fire_at) * 1000000)::bigint, \
+                        CASE WHEN last_fire_at IS NULL THEN NULL ELSE \
+                            (extract(epoch FROM last_fire_at) * 1000000)::bigint END, version, \
+                        (extract(epoch FROM created_at) * 1000000)::bigint, \
+                        (extract(epoch FROM updated_at) * 1000000)::bigint \
+                 FROM agent_loom.schedules \
+                 WHERE tenant_id = $1 AND status = 'active' \
+                    AND next_fire_at <= to_timestamp(($2::bigint)::double precision / 1000000.0) \
+                 ORDER BY next_fire_at, schedule_id LIMIT $3",
+                &[&tenant_id, &database_now, &limit],
+            )
+            .await
+            .map_err(map_database_error)?
+            .iter()
+            .map(|row| decode_schedule(context.tenant_id, row))
+            .collect::<StoreResult<Vec<_>>>()?;
+        Ok(DueSchedulePage {
+            database_now: UnixMicros::new(database_now),
+            schedules,
+        })
+    }
+
+    /// Advances a Schedule cursor only when the scanned version and due instant still match.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error when PostgreSQL is unavailable or the version is out of range.
+    pub async fn advance_schedule(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        command: AdvanceSchedule,
+    ) -> StoreResult<bool> {
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let schedule_id = uuid(command.schedule_id.into_bytes());
+        let version = i64::try_from(command.expected_version)
+            .map_err(|_| inconsistent("Schedule version exceeds database range"))?;
+        let last_fire_at = command.last_fire_at.map(UnixMicros::get);
+        let updated = client
+            .execute(
+                "UPDATE agent_loom.schedules SET \
+                    last_fire_at = CASE WHEN $5::bigint IS NULL THEN last_fire_at ELSE \
+                        to_timestamp(($5::bigint)::double precision / 1000000.0) END, \
+                    next_fire_at = to_timestamp(($6::bigint)::double precision / 1000000.0), \
+                    version = version + 1, updated_at = transaction_timestamp() \
+                 WHERE tenant_id = $1 AND schedule_id = $2 AND status = 'active' \
+                    AND version = $3 \
+                    AND next_fire_at = to_timestamp(($4::bigint)::double precision / 1000000.0)",
+                &[
+                    &tenant_id,
+                    &schedule_id,
+                    &version,
+                    &command.expected_next_fire_at.get(),
+                    &last_fire_at,
+                    &command.next_fire_at.get(),
+                ],
+            )
+            .await
+            .map_err(map_database_error)?;
+        Ok(updated == 1)
     }
 
     /// Reads the authoritative Run projection for one tenant.
@@ -891,6 +985,14 @@ fn decode_schedule(tenant_id: TenantId, row: &Row) -> StoreResult<ScheduleSnapsh
         "paused" => ScheduleStatus::Paused,
         _ => return Err(inconsistent("database returned an unknown Schedule status")),
     };
+    let misfire_policy = match row.get::<_, &str>(6) {
+        "skip" => ScheduleMisfirePolicy::Skip,
+        "fire_once" => ScheduleMisfirePolicy::FireOnce,
+        "catch_up" => ScheduleMisfirePolicy::CatchUp,
+        _ => return Err(inconsistent("database returned an unknown misfire policy")),
+    };
+    let catch_up_limit = u32::try_from(row.get::<_, i64>(7))
+        .map_err(|_| inconsistent("Schedule catch-up limit exceeds u32 range"))?;
     Ok(ScheduleSnapshot {
         tenant_id,
         schedule_id: ScheduleId::from_bytes(row.get::<_, Uuid>(0).into_bytes()),
@@ -899,8 +1001,13 @@ fn decode_schedule(tenant_id: TenantId, row: &Row) -> StoreResult<ScheduleSnapsh
         timezone: row.get(3),
         input: decode_json_payload(&row.get(4))?,
         status,
-        created_at: UnixMicros::new(row.get(6)),
-        updated_at: UnixMicros::new(row.get(7)),
+        misfire_policy,
+        catch_up_limit,
+        next_fire_at: UnixMicros::new(row.get(8)),
+        last_fire_at: row.get::<_, Option<i64>>(9).map(UnixMicros::new),
+        version: nonnegative_u64(row.get(10), "Schedule version")?,
+        created_at: UnixMicros::new(row.get(11)),
+        updated_at: UnixMicros::new(row.get(12)),
     })
 }
 

@@ -8,6 +8,7 @@ mod identity;
 mod maintenance;
 mod mock_adapter;
 mod outbox;
+mod schedule;
 mod task_handler;
 mod worker;
 
@@ -17,4 +18,5 @@ pub use http_adapter::*;
 pub use maintenance::*;
 pub use mock_adapter::*;
 pub use outbox::*;
+pub use schedule::*;
 pub use worker::*;

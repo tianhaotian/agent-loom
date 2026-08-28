@@ -11,8 +11,9 @@ use agent_loom_runtime::{
     RecoveryWorkerConfig, SeededRecoveryIdentitySource,
 };
 use agent_loom_server::{
-    JsonLogOutboxPublisher, MaintenancePollingConfig, MaintenancePollingJob, ServerConfig,
-    WorkflowWorker, WorkflowWorkerConfig, bootstrap, http_dispatcher, mock_dispatcher,
+    AppState, JsonLogOutboxPublisher, MaintenancePollingConfig, MaintenancePollingJob,
+    SchedulePollingConfig, SchedulePollingJob, ServerConfig, WorkflowWorker, WorkflowWorkerConfig,
+    bootstrap, http_dispatcher, mock_dispatcher,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
@@ -133,6 +134,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
             error_delay: Duration::from_secs(2),
         },
     )?;
+    let schedule_service = PollingService::new(
+        SchedulePollingJob::new(
+            AppState {
+                store: Arc::new(application.store.clone()),
+                tenant_id: application.tenant_id,
+                workflow_id: application.workflow_id,
+                coordinator_agent_version_id: application.coordinator_agent_version_id,
+                api_key: Arc::<str>::from(config.api_key.clone()),
+            },
+            application.tenant_id,
+            SchedulePollingConfig::default(),
+        ),
+        PollingServiceConfig {
+            concurrency: 1,
+            busy_delay: Duration::from_millis(10),
+            idle_delay: Duration::from_millis(250),
+            error_delay: Duration::from_secs(2),
+        },
+    )?;
     let agent_stop_service = PollingService::new(
         AgentStopPollingJob::new(AgentStopWorker::new(
             application.store.clone(),
@@ -198,6 +218,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let due_shutdown = shutdown_receiver.clone();
     let recovery_shutdown = shutdown_receiver.clone();
     let maintenance_shutdown = shutdown_receiver.clone();
+    let schedule_shutdown = shutdown_receiver.clone();
     let agent_stop_shutdown = shutdown_receiver.clone();
     let agent_status_shutdown = shutdown_receiver.clone();
     let agent_event_shutdown = shutdown_receiver.clone();
@@ -208,6 +229,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let recovery_task = tokio::spawn(async move { recovery_service.run(recovery_shutdown).await });
     let maintenance_task =
         tokio::spawn(async move { maintenance_service.run(maintenance_shutdown).await });
+    let schedule_task = tokio::spawn(async move { schedule_service.run(schedule_shutdown).await });
     let agent_stop_task =
         tokio::spawn(async move { agent_stop_service.run(agent_stop_shutdown).await });
     let agent_status_task =
@@ -248,6 +270,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = due_task.await;
     let _ = recovery_task.await;
     let _ = maintenance_task.await;
+    let _ = schedule_task.await;
     let _ = agent_stop_task.await;
     let _ = agent_status_task.await;
     let _ = agent_event_task.await;

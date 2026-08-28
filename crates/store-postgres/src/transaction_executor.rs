@@ -2,9 +2,9 @@ use agent_loom_domain::{
     AgentEventReceiptId, AgentExecutionId, AgentExecutionSnapshot, AgentExecutionStatus,
     AgentVersionId, CheckpointId, ContextMergeStrategy, ContextSnapshotId, EndpointId, EventId,
     JoinPolicy, JsonPayload, LogicalKey, OutboxId, OutboxMessage, PlanRevisionId, RunId,
-    RunSnapshot, RunStatus, ScheduleId, ScheduleSnapshot, ScheduleStatus, StageExecutionId,
-    StageStatus, TaskId, TaskKind, TaskSnapshot, TaskStatus, TenantId, ToolExecutionId,
-    ToolExecutionSnapshot, ToolExecutionStatus, UnixMicros, WorkflowVersionId,
+    RunSnapshot, RunStatus, ScheduleId, ScheduleMisfirePolicy, ScheduleSnapshot, ScheduleStatus,
+    StageExecutionId, StageStatus, TaskId, TaskKind, TaskSnapshot, TaskStatus, TenantId,
+    ToolExecutionId, ToolExecutionSnapshot, ToolExecutionStatus, UnixMicros, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
     AgentEventBatchOutcome, AgentEventExecutionOutcome, AgentSubmissionOutcome,
@@ -57,6 +57,7 @@ impl PostgresTransactionExecutor {
     /// # Errors
     ///
     /// Returns a stable Store error for invalid metadata, idempotency misuse, or database failure.
+    #[allow(clippy::too_many_lines)]
     pub async fn create_schedule(
         &self,
         client: &mut Client,
@@ -68,6 +69,9 @@ impl PostgresTransactionExecutor {
             || command.cron_expression.len() > 255
             || command.timezone.is_empty()
             || command.timezone.len() > 128
+            || command.catch_up_limit == 0
+            || command.catch_up_limit > 100
+            || command.next_fire_at.get() <= 0
         {
             return Err(invalid_command("Schedule metadata is invalid"));
         }
@@ -99,14 +103,18 @@ impl PostgresTransactionExecutor {
         let schedule_id = uuid(command.schedule_id.into_bytes());
         let workflow_version_id = uuid(command.workflow_version_id.into_bytes());
         let input = json_value(&command.input)?;
+        let misfire_policy = misfire_policy_value(command.misfire_policy);
+        let catch_up_limit = i64::from(command.catch_up_limit);
         transaction
             .execute(
                 "INSERT INTO agent_loom.schedules (schedule_id, tenant_id, \
                     workflow_version_id, cron_expression, timezone, input_json, status, \
+                    misfire_policy, catch_up_limit, next_fire_at, version, \
                     created_by, created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, \
-                    to_timestamp(($8::bigint)::double precision / 1000000.0), \
-                    to_timestamp(($8::bigint)::double precision / 1000000.0))",
+                 VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8, \
+                    to_timestamp(($9::bigint)::double precision / 1000000.0), 0, $10, \
+                    to_timestamp(($11::bigint)::double precision / 1000000.0), \
+                    to_timestamp(($11::bigint)::double precision / 1000000.0))",
                 &[
                     &schedule_id,
                     &tenant_id,
@@ -114,6 +122,9 @@ impl PostgresTransactionExecutor {
                     &command.cron_expression,
                     &command.timezone,
                     &input,
+                    &misfire_policy,
+                    &catch_up_limit,
+                    &command.next_fire_at.get(),
                     &context.actor_ref,
                     &db_now,
                 ],
@@ -128,6 +139,11 @@ impl PostgresTransactionExecutor {
             timezone: command.timezone,
             input: command.input,
             status: ScheduleStatus::Active,
+            misfire_policy: command.misfire_policy,
+            catch_up_limit: command.catch_up_limit,
+            next_fire_at: command.next_fire_at,
+            last_fire_at: None,
+            version: 0,
             created_at: UnixMicros::new(db_now),
             updated_at: UnixMicros::new(db_now),
         };
@@ -9556,6 +9572,11 @@ struct ScheduleReceipt {
     timezone: String,
     input: Value,
     status: String,
+    misfire_policy: String,
+    catch_up_limit: u32,
+    next_fire_at: i64,
+    last_fire_at: Option<i64>,
+    version: u64,
     created_at: i64,
     updated_at: i64,
 }
@@ -9573,6 +9594,11 @@ fn encode_schedule_receipt(snapshot: &ScheduleSnapshot) -> StoreResult<Value> {
             ScheduleStatus::Paused => "paused",
         }
         .to_owned(),
+        misfire_policy: misfire_policy_value(snapshot.misfire_policy).to_owned(),
+        catch_up_limit: snapshot.catch_up_limit,
+        next_fire_at: snapshot.next_fire_at.get(),
+        last_fire_at: snapshot.last_fire_at.map(UnixMicros::get),
+        version: snapshot.version,
         created_at: snapshot.created_at.get(),
         updated_at: snapshot.updated_at.get(),
     })
@@ -9592,6 +9618,7 @@ fn decode_schedule_receipt(tenant_id: TenantId, value: &Value) -> StoreResult<Sc
         "paused" => ScheduleStatus::Paused,
         _ => return Err(inconsistent("stored Schedule status is invalid")),
     };
+    let misfire_policy = parse_misfire_policy(&receipt.misfire_policy)?;
     Ok(ScheduleSnapshot {
         tenant_id,
         schedule_id: ScheduleId::from_bytes(receipt.schedule_id.into_bytes()),
@@ -9605,9 +9632,31 @@ fn decode_schedule_receipt(tenant_id: TenantId, value: &Value) -> StoreResult<Sc
                 .map_err(|_| inconsistent("stored Schedule input cannot be encoded"))?,
         ),
         status,
+        misfire_policy,
+        catch_up_limit: receipt.catch_up_limit,
+        next_fire_at: UnixMicros::new(receipt.next_fire_at),
+        last_fire_at: receipt.last_fire_at.map(UnixMicros::new),
+        version: receipt.version,
         created_at: UnixMicros::new(receipt.created_at),
         updated_at: UnixMicros::new(receipt.updated_at),
     })
+}
+
+const fn misfire_policy_value(policy: ScheduleMisfirePolicy) -> &'static str {
+    match policy {
+        ScheduleMisfirePolicy::Skip => "skip",
+        ScheduleMisfirePolicy::FireOnce => "fire_once",
+        ScheduleMisfirePolicy::CatchUp => "catch_up",
+    }
+}
+
+fn parse_misfire_policy(value: &str) -> StoreResult<ScheduleMisfirePolicy> {
+    match value {
+        "skip" => Ok(ScheduleMisfirePolicy::Skip),
+        "fire_once" => Ok(ScheduleMisfirePolicy::FireOnce),
+        "catch_up" => Ok(ScheduleMisfirePolicy::CatchUp),
+        _ => Err(inconsistent("stored Schedule misfire policy is invalid")),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

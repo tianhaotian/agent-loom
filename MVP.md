@@ -95,7 +95,9 @@ ExecutionPlan Task 可声明 `context_projection` JSON Pointer 列表。每个 T
 
 ### Schedule/Cron
 
-`POST /v1/schedules` 持久化五段 `cron_expression`、当前支持的 `UTC` timezone 和通用 JSON Run 输入；`GET /v1/schedules` 与 `GET /v1/schedules/SCHEDULE_ID` 查询稳定投影。`POST /v1/schedules/SCHEDULE_ID/fires` 接收非未来的 `scheduled_fire_time_micros`，以 `(schedule_id, scheduled_fire_time)` 生成稳定 Run/Command 身份；重复触发返回同一 Run，数据库唯一约束确保不会产生第二个 fire。后台 Cron 扫描、timezone/DST、misfire/catch-up/concurrency policy 属于后续 P2 切片。
+`POST /v1/schedules` 持久化五段 `cron_expression`、IANA `timezone`、通用 JSON Run 输入、`misfire_policy`（`skip`、`fire_once` 或 `catch_up`）与 1–100 的 `catch_up_limit`；默认值依次为 `UTC`、`fire_once` 和 `1`。`GET /v1/schedules` 与 `GET /v1/schedules/SCHEDULE_ID` 还会返回 `next_fire_at_micros`、`last_fire_at_micros` 和游标 `version`。
+
+后台 Schedule 扫描器使用数据库权威时间选择到期游标，Jiff 根据 IANA timezone 计算 DST gap/fold 下的触发时刻。`skip` 跳过错过的触发，`fire_once` 为当前游标补发一次并跳到未来，`catch_up` 每轮最多按 `catch_up_limit` 顺序补发。派发成功后以 `version + next_fire_at` CAS 推进游标；崩溃重试和多实例竞争都会复用 `(schedule_id, scheduled_fire_time)` 的稳定 Run/Command 身份，数据库唯一约束确保不会产生第二个 fire。显式 `POST /v1/schedules/SCHEDULE_ID/fires` 仍可用于运维触发非未来的 `scheduled_fire_time_micros`。Schedule concurrency policy 属于后续 P2 切片。
 
 ### 暂停、恢复、取消
 

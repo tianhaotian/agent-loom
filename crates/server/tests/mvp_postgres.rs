@@ -21,8 +21,9 @@ use agent_loom_runtime::{
     PollingJob as _, RecoveryDispatchFence, StartedRecovery,
 };
 use agent_loom_server::{
-    MaintenancePollingConfig, MaintenancePollingJob, ServerConfig, WorkflowWorker,
-    WorkflowWorkerActivity, WorkflowWorkerConfig, bootstrap, mock_dispatcher,
+    AppState, MaintenancePollingConfig, MaintenancePollingJob, SchedulePollingConfig,
+    SchedulePollingJob, ServerConfig, WorkflowWorker, WorkflowWorkerActivity, WorkflowWorkerConfig,
+    bootstrap, mock_dispatcher,
 };
 use axum::{
     body::{Body, to_bytes},
@@ -1143,7 +1144,9 @@ async fn schedules_persist_cron_and_fire_runs_idempotently() {
     let application = bootstrap(&config).await.expect("bootstrap Schedule server");
     let schedule_request = serde_json::to_vec(&json!({
         "cron_expression": "*/5 * * * *",
-        "timezone": "UTC",
+        "timezone": "America/Chicago",
+        "misfire_policy": "catch_up",
+        "catch_up_limit": 2,
         "input": {"goal": "scheduled delivery"}
     }))
     .expect("encode Schedule request");
@@ -1179,6 +1182,17 @@ async fn schedules_persist_cron_and_fire_runs_idempotently() {
         .expect("Schedule ID")
         .to_owned();
     assert_eq!(schedule_bodies[1]["schedule"]["schedule_id"], schedule_id);
+    assert_eq!(
+        schedule_bodies[0]["schedule"]["timezone"],
+        "America/Chicago"
+    );
+    assert_eq!(schedule_bodies[0]["schedule"]["misfire_policy"], "catch_up");
+    assert_eq!(schedule_bodies[0]["schedule"]["catch_up_limit"], 2);
+    assert!(
+        schedule_bodies[0]["schedule"]["next_fire_at_micros"]
+            .as_i64()
+            .is_some_and(|value| value > 0)
+    );
     let schedules = get_json(application.router.clone(), "/v1/schedules").await;
     assert!(
         schedules
@@ -1271,6 +1285,77 @@ async fn schedules_persist_cron_and_fire_runs_idempotently() {
         .expect("count persisted Schedule fires")
         .get(0);
     assert_eq!(fire_count, 1);
+
+    let due_fire_at: i64 = client
+        .query_one(
+            "UPDATE agent_loom.schedules SET \
+                next_fire_at = to_timestamp(\
+                    floor(extract(epoch FROM transaction_timestamp()) / 300) * 300 - 300\
+                ), version = 0 \
+             WHERE tenant_id = $1 AND schedule_id = $2 \
+             RETURNING (extract(epoch FROM next_fire_at) * 1000000)::bigint",
+            &[
+                &uuid::Uuid::from_bytes(application.tenant_id.into_bytes()),
+                &uuid::Uuid::from_bytes(decode_test_id(&schedule_id).expect("decode Schedule ID")),
+            ],
+        )
+        .await
+        .expect("make Schedule cursor due")
+        .get(0);
+    let polling = SchedulePollingJob::new(
+        AppState {
+            store: Arc::new(application.store.clone()),
+            tenant_id: application.tenant_id,
+            workflow_id: application.workflow_id,
+            coordinator_agent_version_id: application.coordinator_agent_version_id,
+            api_key: Arc::<str>::from("mvp-e2e-api-key"),
+        },
+        application.tenant_id,
+        SchedulePollingConfig::default(),
+    )
+    .run_once(0)
+    .await
+    .expect("scan and dispatch due Schedule");
+    assert!(matches!(
+        polling,
+        PollingActivity::Progress {
+            completed: 1,
+            failed: 0,
+            ..
+        }
+    ));
+    let automated_fire_count: i64 = client
+        .query_one(
+            "SELECT count(*) FROM agent_loom.runs \
+             WHERE tenant_id = $1 AND schedule_id = $2 AND (\
+                scheduled_fire_at = to_timestamp(($3::bigint)::double precision / 1000000.0) \
+                OR scheduled_fire_at = \
+                    to_timestamp(($3::bigint)::double precision / 1000000.0) + interval '5 minutes'\
+             )",
+            &[
+                &uuid::Uuid::from_bytes(application.tenant_id.into_bytes()),
+                &uuid::Uuid::from_bytes(decode_test_id(&schedule_id).expect("decode Schedule ID")),
+                &due_fire_at,
+            ],
+        )
+        .await
+        .expect("count automatically dispatched Schedule fires")
+        .get(0);
+    assert_eq!(automated_fire_count, 2);
+    let cursor_advanced: bool = client
+        .query_one(
+            "SELECT version = 1 AND last_fire_at IS NOT NULL \
+                AND next_fire_at > transaction_timestamp() \
+             FROM agent_loom.schedules WHERE tenant_id = $1 AND schedule_id = $2",
+            &[
+                &uuid::Uuid::from_bytes(application.tenant_id.into_bytes()),
+                &uuid::Uuid::from_bytes(decode_test_id(&schedule_id).expect("decode Schedule ID")),
+            ],
+        )
+        .await
+        .expect("verify Schedule cursor advance")
+        .get(0);
+    assert!(cursor_advanced);
     drop(client);
     connection_task
         .await

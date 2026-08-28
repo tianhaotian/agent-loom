@@ -8,15 +8,16 @@ use agent_loom_domain::{
 };
 
 use crate::{
-    AgentEventBatchOutcome, AgentEventPage, AgentEventQuery, AgentInvocation, AgentStatusPage,
-    AgentStatusQuery, AgentStopPage, AgentStopQuery, AppendAgentEvents, ApplyContextPatch,
-    ApplyDueWork, ApplyEvent, ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt,
-    ClaimOutbox, ClaimTask, ClaimedTask, CommandContext, Committed, CompleteTask, ControlRun,
-    CreateRun, CreateSchedule, DueWorkOutcome, DueWorkPage, DueWorkQuery, EvaluateChildRunJoin,
-    EventCursor, EventPage, FailTask, LeaseReclaimOutcome, MaintenanceOutcome, MaintenancePage,
-    MaintenanceQuery, PrepareAgentExecution, PrepareToolExecution, QueryContext,
-    ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission, RecordOutboxDelivery,
-    RecordToolOutcome, RenewTaskLease, RevisePlan, StoreResult, ToolInvocation,
+    AdvanceSchedule, AgentEventBatchOutcome, AgentEventPage, AgentEventQuery, AgentInvocation,
+    AgentStatusPage, AgentStatusQuery, AgentStopPage, AgentStopQuery, AppendAgentEvents,
+    ApplyContextPatch, ApplyDueWork, ApplyEvent, ApplyMaintenance, BeginAgentResubmission,
+    BeginToolRetryAttempt, ClaimOutbox, ClaimTask, ClaimedTask, CommandContext, Committed,
+    CompleteTask, ControlRun, CreateRun, CreateSchedule, DueSchedulePage, DueScheduleQuery,
+    DueWorkOutcome, DueWorkPage, DueWorkQuery, EvaluateChildRunJoin, EventCursor, EventPage,
+    FailTask, LeaseReclaimOutcome, MaintenanceOutcome, MaintenancePage, MaintenanceQuery,
+    PrepareAgentExecution, PrepareToolExecution, QueryContext, ReclaimExpiredLease,
+    RecordAgentOutcome, RecordAgentSubmission, RecordOutboxDelivery, RecordToolOutcome,
+    RenewTaskLease, RevisePlan, StoreResult, ToolInvocation,
 };
 
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = StoreResult<T>> + Send + 'a>>;
@@ -60,6 +61,18 @@ pub trait DurableStore: Send + Sync {
         &'a self,
         context: &'a QueryContext,
     ) -> StoreFuture<'a, Vec<ScheduleSnapshot>>;
+
+    fn scan_due_schedules<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        query: DueScheduleQuery,
+    ) -> StoreFuture<'a, DueSchedulePage>;
+
+    fn advance_schedule<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        command: AdvanceSchedule,
+    ) -> StoreFuture<'a, bool>;
 
     fn create_run<'a>(
         &'a self,

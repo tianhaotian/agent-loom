@@ -9,8 +9,8 @@ use std::{
 use agent_loom_domain::{
     AgentVersionId, CheckpointId, ContextMergeStrategy, ContextPatchId, ContextSnapshotId, EventId,
     JoinPolicy, JsonPayload, LogicalKey, PlanRevisionId, RunId, RunSnapshot, RunStatus, ScheduleId,
-    ScheduleSnapshot, ScheduleStatus, StageStatus, TaskId, TenantId, UnixMicros, WaitStatus,
-    WorkflowId,
+    ScheduleMisfirePolicy, ScheduleSnapshot, ScheduleStatus, StageStatus, TaskId, TenantId,
+    UnixMicros, WaitStatus, WorkflowId,
 };
 use agent_loom_durable_store::{
     ApplyContextPatch, ApplyEvent, CommandDisposition, ControlRun, CreateRun, CreateSchedule,
@@ -39,6 +39,7 @@ use crate::{
         materialize_execution_plan, materialize_plan_task_additions, parse_execution_plan,
     },
     identity::{command_context, decode_id, hash_bytes, now_micros, random_id},
+    schedule::{next_fire_after, validate_schedule_definition},
 };
 
 const API_ACTOR: &str = "agent-loom-http-api";
@@ -211,7 +212,20 @@ struct CreateScheduleRequest {
     cron_expression: String,
     #[serde(default = "utc_timezone")]
     timezone: String,
+    #[serde(default)]
+    misfire_policy: ScheduleMisfirePolicyRequest,
+    #[serde(default = "default_catch_up_limit")]
+    catch_up_limit: u32,
     input: Value,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ScheduleMisfirePolicyRequest {
+    Skip,
+    #[default]
+    FireOnce,
+    CatchUp,
 }
 
 #[derive(Debug, Serialize)]
@@ -222,6 +236,11 @@ struct ScheduleResponse {
     timezone: String,
     input: Value,
     status: &'static str,
+    misfire_policy: &'static str,
+    catch_up_limit: u32,
+    next_fire_at_micros: i64,
+    last_fire_at_micros: Option<i64>,
+    version: u64,
     created_at_micros: i64,
     updated_at_micros: i64,
 }
@@ -238,6 +257,15 @@ impl From<ScheduleSnapshot> for ScheduleResponse {
                 ScheduleStatus::Active => "active",
                 ScheduleStatus::Paused => "paused",
             },
+            misfire_policy: match schedule.misfire_policy {
+                ScheduleMisfirePolicy::Skip => "skip",
+                ScheduleMisfirePolicy::FireOnce => "fire_once",
+                ScheduleMisfirePolicy::CatchUp => "catch_up",
+            },
+            catch_up_limit: schedule.catch_up_limit,
+            next_fire_at_micros: schedule.next_fire_at.get(),
+            last_fire_at_micros: schedule.last_fire_at.map(UnixMicros::get),
+            version: schedule.version,
             created_at_micros: schedule.created_at.get(),
             updated_at_micros: schedule.updated_at.get(),
         }
@@ -255,12 +283,19 @@ async fn create_schedule(
     headers: HeaderMap,
     Json(request): Json<CreateScheduleRequest>,
 ) -> ApiResult<(StatusCode, Json<CreateScheduleResponse>)> {
-    validate_cron_v1(&request.cron_expression)?;
-    if request.timezone != "UTC" {
+    validate_schedule_definition(&request.cron_expression, &request.timezone)
+        .map_err(ApiError::bad_request)?;
+    if request.catch_up_limit == 0 || request.catch_up_limit > 100 {
         return Err(ApiError::bad_request(
-            "Schedule V1 supports only the UTC timezone",
+            "catch_up_limit must be between 1 and 100",
         ));
     }
+    let next_fire_at = next_fire_after(
+        &request.cron_expression,
+        &request.timezone,
+        UnixMicros::new(now_micros()),
+    )
+    .map_err(ApiError::bad_request)?;
     let schedule_id = ScheduleId::from_bytes(random_id());
     let idempotency = headers
         .get("idempotency-key")
@@ -297,6 +332,13 @@ async fn create_schedule(
                 cron_expression: request.cron_expression,
                 timezone: request.timezone,
                 input: payload(&request.input)?,
+                misfire_policy: match request.misfire_policy {
+                    ScheduleMisfirePolicyRequest::Skip => ScheduleMisfirePolicy::Skip,
+                    ScheduleMisfirePolicyRequest::FireOnce => ScheduleMisfirePolicy::FireOnce,
+                    ScheduleMisfirePolicyRequest::CatchUp => ScheduleMisfirePolicy::CatchUp,
+                },
+                catch_up_limit: request.catch_up_limit,
+                next_fire_at,
             },
         )
         .await?;
@@ -393,52 +435,8 @@ fn utc_timezone() -> String {
     "UTC".to_owned()
 }
 
-fn validate_cron_v1(expression: &str) -> ApiResult<()> {
-    let fields = expression.split_ascii_whitespace().collect::<Vec<_>>();
-    let bounds = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)];
-    if fields.len() != bounds.len()
-        || fields
-            .iter()
-            .zip(bounds)
-            .any(|(field, (minimum, maximum))| !cron_field_is_valid(field, minimum, maximum))
-    {
-        return Err(ApiError::bad_request(
-            "cron_expression must be a five-field Cron expression",
-        ));
-    }
-    Ok(())
-}
-
-fn cron_field_is_valid(field: &str, minimum: u16, maximum: u16) -> bool {
-    !field.is_empty()
-        && field.split(',').all(|item| {
-            let (base, step) = item
-                .split_once('/')
-                .map_or((item, None), |(base, step)| (base, Some(step)));
-            if step.is_some_and(|value| {
-                value
-                    .parse::<u16>()
-                    .map_or(true, |number| number == 0 || number > maximum - minimum + 1)
-            }) {
-                return false;
-            }
-            if base == "*" {
-                return true;
-            }
-            if let Some((start, end)) = base.split_once('-') {
-                return parse_cron_number(start, minimum, maximum).is_some_and(|start| {
-                    parse_cron_number(end, minimum, maximum).is_some_and(|end| start <= end)
-                });
-            }
-            parse_cron_number(base, minimum, maximum).is_some()
-        })
-}
-
-fn parse_cron_number(value: &str, minimum: u16, maximum: u16) -> Option<u16> {
-    value
-        .parse::<u16>()
-        .ok()
-        .filter(|number| (minimum..=maximum).contains(number))
+const fn default_catch_up_limit() -> u32 {
+    1
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -599,6 +597,29 @@ async fn create_run_impl(
             disposition: disposition(committed.disposition),
         }),
     ))
+}
+
+pub(crate) async fn dispatch_schedule_fire(
+    state: &AppState,
+    schedule: &ScheduleSnapshot,
+    fire_at: UnixMicros,
+) -> Result<(), String> {
+    let input = serde_json::from_slice(schedule.input.as_bytes())
+        .map_err(|_| "persisted Schedule input is not valid JSON".to_owned())?;
+    create_run_impl(
+        state.clone(),
+        HeaderMap::new(),
+        CreateRunRequest {
+            input,
+            deadline_micros: None,
+            parent_run_id: None,
+            parent_task_id: None,
+        },
+        Some((schedule.schedule_id, fire_at)),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| error.message)
 }
 
 async fn get_run(
@@ -1689,12 +1710,13 @@ mod tests {
     }
 
     #[test]
-    fn schedule_v1_accepts_only_five_field_cron_shape() {
-        assert!(validate_cron_v1("*/5 * * * *").is_ok());
-        assert!(validate_cron_v1("0 9 * * 1-5").is_ok());
-        assert!(validate_cron_v1("*/5 * * *").is_err());
-        assert!(validate_cron_v1("@daily").is_err());
-        assert!(validate_cron_v1("60 * * * *").is_err());
-        assert!(validate_cron_v1("*/0 * * * *").is_err());
+    fn schedule_accepts_five_field_cron_and_iana_timezone() {
+        assert!(validate_schedule_definition("*/5 * * * *", "UTC").is_ok());
+        assert!(validate_schedule_definition("0 9 * * 1-5", "Asia/Shanghai").is_ok());
+        assert!(validate_schedule_definition("*/5 * * *", "UTC").is_err());
+        assert!(validate_schedule_definition("@daily", "UTC").is_err());
+        assert!(validate_schedule_definition("60 * * * *", "UTC").is_err());
+        assert!(validate_schedule_definition("*/0 * * * *", "UTC").is_err());
+        assert!(validate_schedule_definition("0 9 * * *", "Mars/Olympus").is_err());
     }
 }

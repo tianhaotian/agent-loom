@@ -18,6 +18,13 @@ pub enum ScheduleStatus {
     Paused,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScheduleMisfirePolicy {
+    Skip,
+    FireOnce,
+    CatchUp,
+}
+
 impl RunStatus {
     pub const fn is_terminal(self) -> bool {
         matches!(

@@ -6,17 +6,17 @@ use agent_loom_domain::{
     WorkflowSnapshot,
 };
 use agent_loom_durable_store::{
-    AgentEventBatchOutcome, AgentEventPage, AgentEventQuery, AgentInvocation, AgentStatusPage,
-    AgentStatusQuery, AgentStopPage, AgentStopQuery, AppendAgentEvents, ApplyContextPatch,
-    ApplyDueWork, ApplyEvent, ApplyMaintenance, BeginAgentResubmission, BeginToolRetryAttempt,
-    ClaimOutbox, ClaimTask, ClaimedTask, CommandContext, Committed, CompleteTask, ControlRun,
-    CreateRun, CreateSchedule, DueWorkOutcome, DueWorkPage, DueWorkQuery, DurableStore,
-    EvaluateChildRunJoin, EventCursor, EventPage, FailTask, LeaseReclaimOutcome,
-    MaintenanceOutcome, MaintenancePage, MaintenanceQuery, PrepareAgentExecution,
-    PrepareToolExecution, QueryContext, ReclaimExpiredLease, RecordAgentOutcome,
-    RecordAgentSubmission, RecordOutboxDelivery, RecordToolOutcome, RenewTaskLease, RetryClass,
-    RevisePlan, StoreCapabilities, StoreError, StoreErrorCode, StoreFuture, StoreResult,
-    ToolInvocation,
+    AdvanceSchedule, AgentEventBatchOutcome, AgentEventPage, AgentEventQuery, AgentInvocation,
+    AgentStatusPage, AgentStatusQuery, AgentStopPage, AgentStopQuery, AppendAgentEvents,
+    ApplyContextPatch, ApplyDueWork, ApplyEvent, ApplyMaintenance, BeginAgentResubmission,
+    BeginToolRetryAttempt, ClaimOutbox, ClaimTask, ClaimedTask, CommandContext, Committed,
+    CompleteTask, ControlRun, CreateRun, CreateSchedule, DueSchedulePage, DueScheduleQuery,
+    DueWorkOutcome, DueWorkPage, DueWorkQuery, DurableStore, EvaluateChildRunJoin, EventCursor,
+    EventPage, FailTask, LeaseReclaimOutcome, MaintenanceOutcome, MaintenancePage,
+    MaintenanceQuery, PrepareAgentExecution, PrepareToolExecution, QueryContext,
+    ReclaimExpiredLease, RecordAgentOutcome, RecordAgentSubmission, RecordOutboxDelivery,
+    RecordToolOutcome, RenewTaskLease, RetryClass, RevisePlan, StoreCapabilities, StoreError,
+    StoreErrorCode, StoreFuture, StoreResult, ToolInvocation,
 };
 use deadpool_postgres::{Object, Pool};
 
@@ -99,6 +99,32 @@ impl DurableStore for PostgresStore {
         Box::pin(async move {
             let client = self.connection().await?;
             self.executor.list_schedules(&client, context).await
+        })
+    }
+
+    fn scan_due_schedules<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        query: DueScheduleQuery,
+    ) -> StoreFuture<'a, DueSchedulePage> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor
+                .scan_due_schedules(&client, context, query)
+                .await
+        })
+    }
+
+    fn advance_schedule<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        command: AdvanceSchedule,
+    ) -> StoreFuture<'a, bool> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor
+                .advance_schedule(&client, context, command)
+                .await
         })
     }
 
