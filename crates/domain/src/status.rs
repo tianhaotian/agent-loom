@@ -25,6 +25,12 @@ pub enum ScheduleMisfirePolicy {
     CatchUp,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScheduleConcurrencyPolicy {
+    Allow,
+    Forbid,
+}
+
 impl RunStatus {
     pub const fn is_terminal(self) -> bool {
         matches!(

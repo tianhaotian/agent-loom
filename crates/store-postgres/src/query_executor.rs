@@ -2,10 +2,10 @@ use agent_loom_domain::{
     AgentExecutionId, AgentExecutionSnapshot, AgentVersionId, ArtifactId, ArtifactRefSnapshot,
     ArtifactVersionRef, CheckpointId, ContextSnapshot, ContextSnapshotId, Digest, EndpointId,
     EventId, EventRecord, IdempotencyKey, JsonPayload, LogicalKey, PlanRevisionId,
-    PlanRevisionSnapshot, RunId, RunSnapshot, ScheduleId, ScheduleMisfirePolicy, ScheduleSnapshot,
-    ScheduleStatus, ScopeKey, StageExecutionId, StageExecutionSnapshot, StageStatus,
-    TaskContextReference, TaskId, TenantId, ToolExecutionId, UnixMicros, WaitId, WaitSnapshot,
-    WaitStatus, WorkflowId, WorkflowSnapshot, WorkflowVersionId,
+    PlanRevisionSnapshot, RunId, RunSnapshot, ScheduleConcurrencyPolicy, ScheduleId,
+    ScheduleMisfirePolicy, ScheduleSnapshot, ScheduleStatus, ScopeKey, StageExecutionId,
+    StageExecutionSnapshot, StageStatus, TaskContextReference, TaskId, TenantId, ToolExecutionId,
+    UnixMicros, WaitId, WaitSnapshot, WaitStatus, WorkflowId, WorkflowSnapshot, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
     AdvanceSchedule, AgentEventCandidate, AgentEventPage, AgentEventQuery, AgentInvocation,
@@ -48,7 +48,7 @@ impl crate::PostgresTransactionExecutor {
         client
             .query_opt(
                 "SELECT schedule_id, workflow_version_id, cron_expression, timezone, \
-                        input_json, status, misfire_policy, catch_up_limit, \
+                        input_json, status, misfire_policy, concurrency_policy, catch_up_limit, \
                         (extract(epoch FROM next_fire_at) * 1000000)::bigint, \
                         CASE WHEN last_fire_at IS NULL THEN NULL ELSE \
                             (extract(epoch FROM last_fire_at) * 1000000)::bigint END, version, \
@@ -77,7 +77,7 @@ impl crate::PostgresTransactionExecutor {
         client
             .query(
                 "SELECT schedule_id, workflow_version_id, cron_expression, timezone, \
-                        input_json, status, misfire_policy, catch_up_limit, \
+                        input_json, status, misfire_policy, concurrency_policy, catch_up_limit, \
                         (extract(epoch FROM next_fire_at) * 1000000)::bigint, \
                         CASE WHEN last_fire_at IS NULL THEN NULL ELSE \
                             (extract(epoch FROM last_fire_at) * 1000000)::bigint END, version, \
@@ -118,7 +118,7 @@ impl crate::PostgresTransactionExecutor {
         let schedules = client
             .query(
                 "SELECT schedule_id, workflow_version_id, cron_expression, timezone, \
-                        input_json, status, misfire_policy, catch_up_limit, \
+                        input_json, status, misfire_policy, concurrency_policy, catch_up_limit, \
                         (extract(epoch FROM next_fire_at) * 1000000)::bigint, \
                         CASE WHEN last_fire_at IS NULL THEN NULL ELSE \
                             (extract(epoch FROM last_fire_at) * 1000000)::bigint END, version, \
@@ -179,6 +179,32 @@ impl crate::PostgresTransactionExecutor {
             .await
             .map_err(map_database_error)?;
         Ok(updated == 1)
+    }
+
+    /// Reports whether a Schedule currently owns any non-terminal Run.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Store error when PostgreSQL is unavailable.
+    pub async fn has_active_schedule_runs(
+        &self,
+        client: &Client,
+        context: &QueryContext,
+        schedule_id: ScheduleId,
+    ) -> StoreResult<bool> {
+        let tenant_id = uuid(context.tenant_id.into_bytes());
+        let schedule_id = uuid(schedule_id.into_bytes());
+        client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM agent_loom.runs \
+                 WHERE tenant_id = $1 AND schedule_id = $2 \
+                   AND status IN ('queued', 'running', 'waiting', \
+                                  'approval_required', 'retrying', 'paused'))",
+                &[&tenant_id, &schedule_id],
+            )
+            .await
+            .map(|row| row.get(0))
+            .map_err(map_database_error)
     }
 
     /// Reads the authoritative Run projection for one tenant.
@@ -991,7 +1017,16 @@ fn decode_schedule(tenant_id: TenantId, row: &Row) -> StoreResult<ScheduleSnapsh
         "catch_up" => ScheduleMisfirePolicy::CatchUp,
         _ => return Err(inconsistent("database returned an unknown misfire policy")),
     };
-    let catch_up_limit = u32::try_from(row.get::<_, i64>(7))
+    let concurrency_policy = match row.get::<_, &str>(7) {
+        "allow" => ScheduleConcurrencyPolicy::Allow,
+        "forbid" => ScheduleConcurrencyPolicy::Forbid,
+        _ => {
+            return Err(inconsistent(
+                "database returned an unknown concurrency policy",
+            ));
+        }
+    };
+    let catch_up_limit = u32::try_from(row.get::<_, i64>(8))
         .map_err(|_| inconsistent("Schedule catch-up limit exceeds u32 range"))?;
     Ok(ScheduleSnapshot {
         tenant_id,
@@ -1002,12 +1037,13 @@ fn decode_schedule(tenant_id: TenantId, row: &Row) -> StoreResult<ScheduleSnapsh
         input: decode_json_payload(&row.get(4))?,
         status,
         misfire_policy,
+        concurrency_policy,
         catch_up_limit,
-        next_fire_at: UnixMicros::new(row.get(8)),
-        last_fire_at: row.get::<_, Option<i64>>(9).map(UnixMicros::new),
-        version: nonnegative_u64(row.get(10), "Schedule version")?,
-        created_at: UnixMicros::new(row.get(11)),
-        updated_at: UnixMicros::new(row.get(12)),
+        next_fire_at: UnixMicros::new(row.get(9)),
+        last_fire_at: row.get::<_, Option<i64>>(10).map(UnixMicros::new),
+        version: nonnegative_u64(row.get(11), "Schedule version")?,
+        created_at: UnixMicros::new(row.get(12)),
+        updated_at: UnixMicros::new(row.get(13)),
     })
 }
 

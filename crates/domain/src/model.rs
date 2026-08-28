@@ -1,9 +1,9 @@
 use crate::{
     AgentEventReceiptId, AgentExecutionId, AgentExecutionStatus, AgentVersionId, ArtifactId,
     CheckpointId, Digest, EndpointId, EventId, JsonPayload, LogicalKey, PlanRevisionId, RunId,
-    RunStatus, ScheduleId, ScheduleMisfirePolicy, ScheduleStatus, StageExecutionId, StageStatus,
-    TaskId, TaskStatus, TenantId, ToolExecutionId, ToolExecutionStatus, UnixMicros, WaitId,
-    WaitStatus, WorkflowId, WorkflowVersionId,
+    RunStatus, ScheduleConcurrencyPolicy, ScheduleId, ScheduleMisfirePolicy, ScheduleStatus,
+    StageExecutionId, StageStatus, TaskId, TaskStatus, TenantId, ToolExecutionId,
+    ToolExecutionStatus, UnixMicros, WaitId, WaitStatus, WorkflowId, WorkflowVersionId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +32,7 @@ pub struct ScheduleSnapshot {
     pub input: JsonPayload,
     pub status: ScheduleStatus,
     pub misfire_policy: ScheduleMisfirePolicy,
+    pub concurrency_policy: ScheduleConcurrencyPolicy,
     pub catch_up_limit: u32,
     pub next_fire_at: UnixMicros,
     pub last_fire_at: Option<UnixMicros>,

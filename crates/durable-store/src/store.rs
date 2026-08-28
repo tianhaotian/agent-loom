@@ -74,6 +74,12 @@ pub trait DurableStore: Send + Sync {
         command: AdvanceSchedule,
     ) -> StoreFuture<'a, bool>;
 
+    fn has_active_schedule_runs<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        schedule_id: ScheduleId,
+    ) -> StoreFuture<'a, bool>;
+
     fn create_run<'a>(
         &'a self,
         context: &'a crate::CommandContext,

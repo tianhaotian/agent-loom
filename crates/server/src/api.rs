@@ -8,9 +8,9 @@ use std::{
 
 use agent_loom_domain::{
     AgentVersionId, CheckpointId, ContextMergeStrategy, ContextPatchId, ContextSnapshotId, EventId,
-    JoinPolicy, JsonPayload, LogicalKey, PlanRevisionId, RunId, RunSnapshot, RunStatus, ScheduleId,
-    ScheduleMisfirePolicy, ScheduleSnapshot, ScheduleStatus, StageStatus, TaskId, TenantId,
-    UnixMicros, WaitStatus, WorkflowId,
+    JoinPolicy, JsonPayload, LogicalKey, PlanRevisionId, RunId, RunSnapshot, RunStatus,
+    ScheduleConcurrencyPolicy, ScheduleId, ScheduleMisfirePolicy, ScheduleSnapshot, ScheduleStatus,
+    StageStatus, TaskId, TenantId, UnixMicros, WaitStatus, WorkflowId,
 };
 use agent_loom_durable_store::{
     ApplyContextPatch, ApplyEvent, CommandDisposition, ControlRun, CreateRun, CreateSchedule,
@@ -72,6 +72,17 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs", post(create_run))
         .route("/v1/runs/{run_id}", get(get_run))
         .route("/v1/runs/{run_id}/children", get(list_child_runs))
+        .route("/v1/runs/{run_id}/replay", post(replay_run))
+        .route(
+            "/v1/runs/{run_id}/manual-interventions",
+            post(open_manual_intervention),
+        )
+        .route(
+            "/v1/runs/{run_id}/manual-interventions/resolve",
+            post(resolve_manual_intervention),
+        )
+        .route("/v1/runs/{run_id}/handoffs", post(handoff_run))
+        .route("/v1/runs/{run_id}/compensations", post(compensate_run))
         .route(
             "/v1/runs/{run_id}/child-joins/{task_id}",
             post(evaluate_child_run_join),
@@ -214,6 +225,8 @@ struct CreateScheduleRequest {
     timezone: String,
     #[serde(default)]
     misfire_policy: ScheduleMisfirePolicyRequest,
+    #[serde(default)]
+    concurrency_policy: ScheduleConcurrencyPolicyRequest,
     #[serde(default = "default_catch_up_limit")]
     catch_up_limit: u32,
     input: Value,
@@ -228,6 +241,14 @@ enum ScheduleMisfirePolicyRequest {
     CatchUp,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ScheduleConcurrencyPolicyRequest {
+    #[default]
+    Allow,
+    Forbid,
+}
+
 #[derive(Debug, Serialize)]
 struct ScheduleResponse {
     schedule_id: String,
@@ -237,6 +258,7 @@ struct ScheduleResponse {
     input: Value,
     status: &'static str,
     misfire_policy: &'static str,
+    concurrency_policy: &'static str,
     catch_up_limit: u32,
     next_fire_at_micros: i64,
     last_fire_at_micros: Option<i64>,
@@ -261,6 +283,10 @@ impl From<ScheduleSnapshot> for ScheduleResponse {
                 ScheduleMisfirePolicy::Skip => "skip",
                 ScheduleMisfirePolicy::FireOnce => "fire_once",
                 ScheduleMisfirePolicy::CatchUp => "catch_up",
+            },
+            concurrency_policy: match schedule.concurrency_policy {
+                ScheduleConcurrencyPolicy::Allow => "allow",
+                ScheduleConcurrencyPolicy::Forbid => "forbid",
             },
             catch_up_limit: schedule.catch_up_limit,
             next_fire_at_micros: schedule.next_fire_at.get(),
@@ -337,6 +363,10 @@ async fn create_schedule(
                     ScheduleMisfirePolicyRequest::FireOnce => ScheduleMisfirePolicy::FireOnce,
                     ScheduleMisfirePolicyRequest::CatchUp => ScheduleMisfirePolicy::CatchUp,
                 },
+                concurrency_policy: match request.concurrency_policy {
+                    ScheduleConcurrencyPolicyRequest::Allow => ScheduleConcurrencyPolicy::Allow,
+                    ScheduleConcurrencyPolicyRequest::Forbid => ScheduleConcurrencyPolicy::Forbid,
+                },
                 catch_up_limit: request.catch_up_limit,
                 next_fire_at,
             },
@@ -402,6 +432,16 @@ async fn fire_schedule(
     if schedule.status != ScheduleStatus::Active {
         return Err(ApiError::conflict("Schedule is not active"));
     }
+    if schedule.concurrency_policy == ScheduleConcurrencyPolicy::Forbid
+        && state
+            .store
+            .has_active_schedule_runs(&query_context(&state), schedule_id)
+            .await?
+    {
+        return Err(ApiError::conflict(
+            "Schedule concurrency policy forbids overlapping Runs",
+        ));
+    }
     let workflow = state
         .store
         .get_workflow(&query_context(&state), state.workflow_id)
@@ -427,6 +467,7 @@ async fn fire_schedule(
             schedule_id,
             UnixMicros::new(request.scheduled_fire_time_micros),
         )),
+        None,
     )
     .await
 }
@@ -462,7 +503,7 @@ async fn create_run(
     headers: HeaderMap,
     Json(request): Json<CreateRunRequest>,
 ) -> ApiResult<(StatusCode, Json<CreateRunResponse>)> {
-    create_run_impl(state, headers, request, None).await
+    create_run_impl(state, headers, request, None, None).await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -471,6 +512,7 @@ async fn create_run_impl(
     headers: HeaderMap,
     request: CreateRunRequest,
     schedule_fire: Option<(ScheduleId, UnixMicros)>,
+    replay_of_run_id: Option<RunId>,
 ) -> ApiResult<(StatusCode, Json<CreateRunResponse>)> {
     if request
         .deadline_micros
@@ -506,10 +548,21 @@ async fn create_run_impl(
     }
     let idempotency = schedule_fire.map_or_else(
         || {
-            headers
-                .get("idempotency-key")
-                .and_then(|value| value.to_str().ok())
-                .map_or_else(|| run_id.to_string(), ToOwned::to_owned)
+            replay_of_run_id.map_or_else(
+                || {
+                    headers
+                        .get("idempotency-key")
+                        .and_then(|value| value.to_str().ok())
+                        .map_or_else(|| run_id.to_string(), ToOwned::to_owned)
+                },
+                |source| {
+                    let key = headers
+                        .get("idempotency-key")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("missing");
+                    format!("replay/{source}/{key}")
+                },
+            )
         },
         |(schedule_id, fire_at)| format!("schedule/{schedule_id}/{}", fire_at.get()),
     );
@@ -525,32 +578,53 @@ async fn create_run_impl(
         &request_bytes,
     )
     .map_err(ApiError::bad_request)?;
-    let workflow = state
-        .store
-        .get_workflow(&query_context(&state), state.workflow_id)
-        .await?
-        .ok_or_else(|| ApiError::internal("configured Workflow was not found"))?;
-    if workflow.status != "active" || workflow.lifecycle != "published" {
-        return Err(ApiError::internal(
-            "configured Workflow is not active and published",
-        ));
-    }
-    let plan = parse_execution_plan(&workflow.spec)
+    let (workflow_version_id, initial_plan, plan_digest) =
+        if let Some(source_run_id) = replay_of_run_id {
+            let source = load_run(&state, source_run_id).await?;
+            let workflow_version_id = source
+                .workflow_version_id
+                .ok_or_else(|| ApiError::conflict("Replay source Run has no Workflow version"))?;
+            let revision = state
+                .store
+                .list_plan_revisions(&query_context(&state), source_run_id)
+                .await?
+                .into_iter()
+                .max_by_key(|revision| revision.revision)
+                .ok_or_else(|| ApiError::internal("Replay source Run has no Plan revision"))?;
+            (workflow_version_id, revision.plan, revision.plan_digest)
+        } else {
+            let workflow = state
+                .store
+                .get_workflow(&query_context(&state), state.workflow_id)
+                .await?
+                .ok_or_else(|| ApiError::internal("configured Workflow was not found"))?;
+            if workflow.status != "active" || workflow.lifecycle != "published" {
+                return Err(ApiError::internal(
+                    "configured Workflow is not active and published",
+                ));
+            }
+            (
+                workflow.workflow_version_id,
+                workflow.spec,
+                workflow.spec_digest,
+            )
+        };
+    let plan = parse_execution_plan(&initial_plan)
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let materialized =
         materialize_execution_plan(&plan, run_id, &request.input, UnixMicros::new(now_micros()))
             .map_err(|error| ApiError::internal(error.to_string()))?;
     let initial_event_id = EventId::from_bytes(random_id());
-    let initial_plan = workflow.spec.clone();
     let command = CreateRun {
         run_id,
+        replay_of_run_id,
         parent_run_id,
         parent_task_id,
         parent_event_id: parent_run_id
             .map(|_| EventId::from_bytes(crate::identity::derived_id("parent-event", &identity))),
         schedule_id: schedule_fire.map(|(schedule_id, _)| schedule_id),
         scheduled_fire_at: schedule_fire.map(|(_, fire_at)| fire_at),
-        workflow_version_id: Some(workflow.workflow_version_id),
+        workflow_version_id: Some(workflow_version_id),
         coordinator_agent_version_id: Some(state.coordinator_agent_version_id),
         input: payload(&request.input)?,
         deadline: request.deadline_micros.map(UnixMicros::new),
@@ -560,8 +634,11 @@ async fn create_run_impl(
             schema_version: plan.schema_version,
             plan_key: plan.plan_key.clone(),
             plan: initial_plan,
-            plan_digest: workflow.spec_digest,
-            change_summary: payload(&json!({"kind": "initial"}))?,
+            plan_digest,
+            change_summary: payload(&json!({
+                "kind": if replay_of_run_id.is_some() { "replay" } else { "initial" },
+                "replay_of_run_id": replay_of_run_id.map(|id| id.to_string()),
+            }))?,
             created_event_id: initial_event_id,
         },
         initial_context: NewContextSnapshot {
@@ -579,7 +656,7 @@ async fn create_run_impl(
             checkpoint_id: CheckpointId::from_bytes(random_id()),
             sequence: 1,
             schema_version: plan.schema_version,
-            workflow_version_id: Some(workflow.workflow_version_id),
+            workflow_version_id: Some(workflow_version_id),
             coordinator_agent_version_id: Some(state.coordinator_agent_version_id),
             execution_generation: 0,
             state_digest: hash_bytes(materialized.checkpoint_state.as_bytes()),
@@ -616,10 +693,56 @@ pub(crate) async fn dispatch_schedule_fire(
             parent_task_id: None,
         },
         Some((schedule.schedule_id, fire_at)),
+        None,
     )
     .await
     .map(|_| ())
     .map_err(|error| error.message)
+}
+
+async fn replay_run(
+    State(state): State<AppState>,
+    Path(source_run_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<(StatusCode, Json<ReplayRunResponse>)> {
+    required_idempotency(&headers)?;
+    let source_run_id = parse_run_id(&source_run_id)?;
+    load_run(&state, source_run_id).await?;
+    let input = state
+        .store
+        .get_run_input(&query_context(&state), source_run_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Replay source Run input was not found"))?;
+    let input = serde_json::from_slice(input.as_bytes())
+        .map_err(|_| ApiError::internal("Replay source Run input is invalid"))?;
+    let (status, Json(response)) = create_run_impl(
+        state,
+        headers,
+        CreateRunRequest {
+            input,
+            deadline_micros: None,
+            parent_run_id: None,
+            parent_task_id: None,
+        },
+        None,
+        Some(source_run_id),
+    )
+    .await?;
+    Ok((
+        status,
+        Json(ReplayRunResponse {
+            source_run_id: source_run_id.to_string(),
+            run: response.run,
+            disposition: response.disposition,
+        }),
+    ))
+}
+
+#[derive(Debug, Serialize)]
+struct ReplayRunResponse {
+    source_run_id: String,
+    run: RunResponse,
+    disposition: &'static str,
 }
 
 async fn get_run(
@@ -1423,6 +1546,8 @@ enum ControlAction {
     Pause,
     Resume,
     Cancel,
+    ManualOpen,
+    ManualResolve,
 }
 
 impl ControlAction {
@@ -1431,6 +1556,8 @@ impl ControlAction {
             Self::Pause => "pause_run",
             Self::Resume => "resume_run",
             Self::Cancel => "cancel_run",
+            Self::ManualOpen => "open_manual_intervention",
+            Self::ManualResolve => "resolve_manual_intervention",
         }
     }
 }
@@ -1464,11 +1591,129 @@ async fn control(
         reason: request.reason,
     };
     let committed = match action {
-        ControlAction::Pause => state.store.pause_run(&context, command).await?,
-        ControlAction::Resume => state.store.resume_run(&context, command).await?,
+        ControlAction::Pause | ControlAction::ManualOpen => {
+            state.store.pause_run(&context, command).await?
+        }
+        ControlAction::Resume | ControlAction::ManualResolve => {
+            state.store.resume_run(&context, command).await?
+        }
         ControlAction::Cancel => state.store.cancel_run(&context, command).await?,
     };
     Ok(Json(committed.value.into()))
+}
+
+async fn open_manual_intervention(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<ControlRequest>,
+) -> ApiResult<Json<RunResponse>> {
+    control(state, run_id, headers, request, ControlAction::ManualOpen).await
+}
+
+async fn resolve_manual_intervention(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<ControlRequest>,
+) -> ApiResult<Json<RunResponse>> {
+    control(
+        state,
+        run_id,
+        headers,
+        request,
+        ControlAction::ManualResolve,
+    )
+    .await
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct AdvancedTaskRequest {
+    base_revision: u64,
+    task_key: String,
+    target_handler: String,
+    #[serde(default = "default_max_attempts_api")]
+    max_attempts: u32,
+    #[serde(default = "empty_object")]
+    input: Value,
+}
+
+const fn default_max_attempts_api() -> u32 {
+    3
+}
+
+async fn handoff_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<AdvancedTaskRequest>,
+) -> ApiResult<Json<RevisePlanResponse>> {
+    append_advanced_task(state, run_id, headers, request, "handoff", "agent_server").await
+}
+
+async fn compensate_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<AdvancedTaskRequest>,
+) -> ApiResult<Json<RevisePlanResponse>> {
+    append_advanced_task(state, run_id, headers, request, "compensation", "tool").await
+}
+
+async fn append_advanced_task(
+    state: AppState,
+    run_id: String,
+    headers: HeaderMap,
+    request: AdvancedTaskRequest,
+    action: &'static str,
+    kind: &'static str,
+) -> ApiResult<Json<RevisePlanResponse>> {
+    if request.base_revision == 0
+        || request.task_key.trim().is_empty()
+        || request.target_handler.trim().is_empty()
+        || request.max_attempts == 0
+    {
+        return Err(ApiError::bad_request(
+            "advanced Task metadata must be non-empty and positive",
+        ));
+    }
+    let parsed_run_id = parse_run_id(&run_id)?;
+    let revision = state
+        .store
+        .list_plan_revisions(&query_context(&state), parsed_run_id)
+        .await?
+        .into_iter()
+        .find(|revision| revision.revision == request.base_revision)
+        .ok_or_else(|| ApiError::conflict("base Plan revision was not found"))?;
+    let mut plan: Value = serde_json::from_slice(revision.plan.as_bytes())
+        .map_err(|_| ApiError::internal("persisted Plan revision is invalid"))?;
+    let tasks = plan
+        .get_mut("initial_tasks")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| ApiError::internal("persisted Plan has no initial_tasks array"))?;
+    let task_key = request.task_key;
+    tasks.push(json!({
+        "key": task_key,
+        "handler": request.target_handler,
+        "kind": kind,
+        "priority": 0,
+        "max_attempts": request.max_attempts,
+        "input": request.input,
+    }));
+    revise_plan(
+        State(state),
+        Path(run_id),
+        headers,
+        Json(RevisePlanRequest {
+            base_revision: request.base_revision,
+            plan,
+            change_summary: json!({
+                "kind": action,
+                "task_key": task_key,
+            }),
+        }),
+    )
+    .await
 }
 
 #[derive(Debug, Serialize)]

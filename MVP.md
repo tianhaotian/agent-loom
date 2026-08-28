@@ -6,7 +6,7 @@
 
 已包含：
 
-- 启动时自动执行 `0000` 至 `0020` migration；
+- 启动时自动执行 `0000` 至 `0023` migration；
 - PostgreSQL 连接池与对象安全的 `DurableStore`；
 - API Key 认证边界和 tenant-scoped 查询/命令；
 - Workflow、Run、Stage、Artifact、Pending Action 和 Event HTTP 查询；
@@ -95,9 +95,15 @@ ExecutionPlan Task 可声明 `context_projection` JSON Pointer 列表。每个 T
 
 ### Schedule/Cron
 
-`POST /v1/schedules` 持久化五段 `cron_expression`、IANA `timezone`、通用 JSON Run 输入、`misfire_policy`（`skip`、`fire_once` 或 `catch_up`）与 1–100 的 `catch_up_limit`；默认值依次为 `UTC`、`fire_once` 和 `1`。`GET /v1/schedules` 与 `GET /v1/schedules/SCHEDULE_ID` 还会返回 `next_fire_at_micros`、`last_fire_at_micros` 和游标 `version`。
+`POST /v1/schedules` 持久化五段 `cron_expression`、IANA `timezone`、通用 JSON Run 输入、`misfire_policy`（`skip`、`fire_once` 或 `catch_up`）、`concurrency_policy`（`allow` 或 `forbid`）与 1–100 的 `catch_up_limit`；默认值依次为 `UTC`、`fire_once`、`allow` 和 `1`。`GET /v1/schedules` 与 `GET /v1/schedules/SCHEDULE_ID` 还会返回 `next_fire_at_micros`、`last_fire_at_micros` 和游标 `version`。
 
-后台 Schedule 扫描器使用数据库权威时间选择到期游标，Jiff 根据 IANA timezone 计算 DST gap/fold 下的触发时刻。`skip` 跳过错过的触发，`fire_once` 为当前游标补发一次并跳到未来，`catch_up` 每轮最多按 `catch_up_limit` 顺序补发。派发成功后以 `version + next_fire_at` CAS 推进游标；崩溃重试和多实例竞争都会复用 `(schedule_id, scheduled_fire_time)` 的稳定 Run/Command 身份，数据库唯一约束确保不会产生第二个 fire。显式 `POST /v1/schedules/SCHEDULE_ID/fires` 仍可用于运维触发非未来的 `scheduled_fire_time_micros`。Schedule concurrency policy 属于后续 P2 切片。
+后台 Schedule 扫描器使用数据库权威时间选择到期游标，Jiff 根据 IANA timezone 计算 DST gap/fold 下的触发时刻。`skip` 跳过错过的触发，`fire_once` 为当前游标补发一次并跳到未来，`catch_up` 每轮最多按 `catch_up_limit` 顺序补发。派发成功后以 `version + next_fire_at` CAS 推进游标；崩溃重试和多实例竞争都会复用 `(schedule_id, scheduled_fire_time)` 的稳定 Run/Command 身份，数据库唯一约束确保不会产生第二个 fire。`forbid` 在 Schedule 行锁保护的 Run 创建事务内拒绝已有活跃 Run 时的重叠执行，后台扫描遇到重叠时仅推进游标。显式 `POST /v1/schedules/SCHEDULE_ID/fires` 仍可用于运维触发非未来的 `scheduled_fire_time_micros`。
+
+### Replay、Fallback 与高级控制
+
+`POST /v1/runs/RUN_ID/replay` 要求 `Idempotency-Key`，创建独立 Run 并保存 `replay_of_run_id`；Replay 固定使用源 Run 输入、Workflow Version 和最新不可变 PlanRevision，不会因当前 Workflow 后续发布而漂移。ExecutionPlan Dependency 的 `condition.status` 支持 `succeeded`、`failed`、`dead_lettered`、`skipped` 和 `cancelled`，可声明式表达 Fallback；前置 Task 进入最终失败状态的同一事务会唯一激活匹配分支。
+
+`POST /v1/runs/RUN_ID/manual-interventions` 与 `/manual-interventions/resolve` 分别暂停和恢复 Run，并沿用 Pause/Resume 的 Lease、远端执行和 generation fencing。`POST /v1/runs/RUN_ID/handoffs` 与 `/compensations` 接收 `base_revision`、`task_key`、`target_handler`、可选 `max_attempts` 和 `input`，通过 append-only PlanRevision 分别追加 AgentServer 与 Tool Task，并写入 `run.handoff_requested` 或 `run.compensation_requested` Event/Outbox。具体交接或补偿副作用由注册 Handler/Adapter 执行；核心保证幂等、fencing、重试和审计。
 
 ### 暂停、恢复、取消
 

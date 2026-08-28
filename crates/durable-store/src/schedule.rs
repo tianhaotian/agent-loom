@@ -1,5 +1,6 @@
 use agent_loom_domain::{
-    JsonPayload, ScheduleId, ScheduleMisfirePolicy, ScheduleSnapshot, UnixMicros, WorkflowVersionId,
+    JsonPayload, ScheduleConcurrencyPolicy, ScheduleId, ScheduleMisfirePolicy, ScheduleSnapshot,
+    UnixMicros, WorkflowVersionId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -10,6 +11,7 @@ pub struct CreateSchedule {
     pub timezone: String,
     pub input: JsonPayload,
     pub misfire_policy: ScheduleMisfirePolicy,
+    pub concurrency_policy: ScheduleConcurrencyPolicy,
     pub catch_up_limit: u32,
     pub next_fire_at: UnixMicros,
 }

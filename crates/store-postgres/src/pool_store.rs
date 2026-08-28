@@ -128,6 +128,19 @@ impl DurableStore for PostgresStore {
         })
     }
 
+    fn has_active_schedule_runs<'a>(
+        &'a self,
+        context: &'a QueryContext,
+        schedule_id: ScheduleId,
+    ) -> StoreFuture<'a, bool> {
+        Box::pin(async move {
+            let client = self.connection().await?;
+            self.executor
+                .has_active_schedule_runs(&client, context, schedule_id)
+                .await
+        })
+    }
+
     fn create_run<'a>(
         &'a self,
         context: &'a CommandContext,

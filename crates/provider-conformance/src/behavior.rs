@@ -92,6 +92,7 @@ pub async fn exercise_lease_expiry_retry(
             &create_context,
             CreateRun {
                 run_id,
+                replay_of_run_id: None,
                 parent_run_id: None,
                 parent_task_id: None,
                 parent_event_id: None,

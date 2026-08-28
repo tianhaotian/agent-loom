@@ -1,6 +1,8 @@
 use std::{fmt, str::FromStr};
 
-use agent_loom_domain::{ScheduleMisfirePolicy, ScheduleSnapshot, TenantId, UnixMicros};
+use agent_loom_domain::{
+    ScheduleConcurrencyPolicy, ScheduleMisfirePolicy, ScheduleSnapshot, TenantId, UnixMicros,
+};
 use agent_loom_durable_store::{AdvanceSchedule, DueScheduleQuery, QueryContext};
 use agent_loom_runtime::{PollingActivity, PollingFuture, PollingJob, PollingJobError};
 use jiff_cron::{
@@ -113,7 +115,19 @@ async fn dispatch_due_schedule(
     schedule: &ScheduleSnapshot,
     now: UnixMicros,
 ) -> Result<bool, String> {
-    let plan = dispatch_plan(schedule, now)?;
+    let plan = if schedule.concurrency_policy == ScheduleConcurrencyPolicy::Forbid
+        && state
+            .store
+            .has_active_schedule_runs(query_context, schedule.schedule_id)
+            .await
+            .map_err(|error| error.safe_message)?
+    {
+        let mut blocked = schedule.clone();
+        blocked.misfire_policy = ScheduleMisfirePolicy::Skip;
+        dispatch_plan(&blocked, now)?
+    } else {
+        dispatch_plan(schedule, now)?
+    };
     for fire_at in &plan.fires {
         dispatch_schedule_fire(state, schedule, *fire_at).await?;
     }
@@ -237,6 +251,7 @@ mod tests {
             input: JsonPayload::from_validated_bytes(b"{}".to_vec()),
             status: ScheduleStatus::Active,
             misfire_policy: policy,
+            concurrency_policy: ScheduleConcurrencyPolicy::Allow,
             catch_up_limit: limit,
             next_fire_at: UnixMicros::new(next_fire_at),
             last_fire_at: None,

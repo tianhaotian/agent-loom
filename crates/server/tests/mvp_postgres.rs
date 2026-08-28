@@ -10,9 +10,9 @@ use agent_loom_domain::{
 };
 use agent_loom_durable_store::{
     AgentEventQuery, AgentSubmissionOutcome, ClaimOutbox, ClaimTask, CommandContext,
-    CommandDisposition, CompleteTask, ControlRun, DurableStore as _, ExpectedRun, LeaseProof,
-    NewCheckpoint, NextActions, OutboxDeliveryOutcome, PrepareAgentExecution, QueryContext,
-    RecordAgentSubmission, RecordOutboxDelivery, TaskResult,
+    CommandDisposition, CompleteTask, ControlRun, DurableStore as _, ExpectedRun, FailTask,
+    LeaseProof, NewCheckpoint, NextActions, OutboxDeliveryOutcome, PrepareAgentExecution,
+    QueryContext, RecordAgentSubmission, RecordOutboxDelivery, TaskResult,
 };
 use agent_loom_runtime::{
     AgentEventDispatcher as _, AgentEventPollOutcome, AgentEventWorker, AgentEventWorkerConfig,
@@ -957,6 +957,15 @@ async fn execution_plan_dependencies_gate_task_claims_until_conditions_match() {
                         "result_equals": {"pointer": "/approved", "value": false}
                     }
                 }]
+            },
+            {
+                "key": "fallback",
+                "handler": "delivery-mvp",
+                "kind": "model",
+                "depends_on": [{
+                    "task": "root",
+                    "condition": {"status": "failed"}
+                }]
             }
         ]
     });
@@ -1116,11 +1125,114 @@ async fn execution_plan_dependencies_gate_task_claims_until_conditions_match() {
         .expect("query rejected branch")
         .get(0);
     assert_eq!(rejected_status, "skipped");
+    let fallback_status: String = client
+        .query_one(
+            "SELECT status FROM agent_loom.tasks \
+             WHERE tenant_id = $1 AND run_id = $2 AND logical_key = 'fallback'",
+            &[
+                &uuid::Uuid::from_bytes(application.tenant_id.into_bytes()),
+                &uuid::Uuid::from_bytes(run_id.into_bytes()),
+            ],
+        )
+        .await
+        .expect("query fallback branch")
+        .get(0);
+    assert_eq!(fallback_status, "skipped");
     drop(client);
     connection_task
         .await
         .expect("join dependency verification connection")
         .expect("dependency verification connection remains healthy");
+
+    let response = application
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/runs")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer mvp-e2e-api-key")
+                .header(
+                    "idempotency-key",
+                    format!("dependency-fallback-run-{nonce}"),
+                )
+                .body(Body::from(r#"{"input":{"goal":"activate fallback"}}"#))
+                .expect("build fallback Run request"),
+        )
+        .await
+        .expect("create fallback Run response");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let fallback_run: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read fallback Run"),
+    )
+    .expect("decode fallback Run");
+    let fallback_run_id = RunId::from_bytes(
+        decode_test_id(
+            fallback_run["run"]["run_id"]
+                .as_str()
+                .expect("fallback Run ID"),
+        )
+        .expect("decode fallback Run ID"),
+    );
+    let fallback_root_lease = LeaseToken::from_bytes([9; 32]);
+    let fallback_root = application
+        .store
+        .claim_task(
+            &test_command_context(application.tenant_id, nonce, "fallback-claim-root"),
+            ClaimTask {
+                worker_id,
+                lease_token: fallback_root_lease.clone(),
+                lease_duration: DurationMicros::new(5_000_000),
+                candidate_window: 8,
+                kind: Some(TaskKind::Model),
+            },
+        )
+        .await
+        .expect("claim fallback root")
+        .expect("fallback root is claimable");
+    assert_eq!(fallback_root.value.task.logical_key.as_str(), "root");
+    application
+        .store
+        .fail_task(
+            &test_command_context(application.tenant_id, nonce, "fallback-fail-root"),
+            FailTask {
+                expected_run: ExpectedRun {
+                    run_id: fallback_run_id,
+                    version: Some(fallback_root.value.run_version),
+                    execution_generation: Some(fallback_root.value.task.generation),
+                },
+                lease: LeaseProof {
+                    task_id: fallback_root.value.task.task_id,
+                    worker_id,
+                    token: fallback_root_lease,
+                    execution_generation: fallback_root.value.task.generation,
+                },
+                failure_event_id: EventId::from_bytes(test_id(nonce, "fallback-root-failed")),
+                error_code: "primary_unavailable".to_owned(),
+                retry_at: None,
+            },
+        )
+        .await
+        .expect("fail primary Task and activate fallback");
+    let fallback = application
+        .store
+        .claim_task(
+            &test_command_context(application.tenant_id, nonce, "fallback-claim-branch"),
+            ClaimTask {
+                worker_id,
+                lease_token: LeaseToken::from_bytes([10; 32]),
+                lease_duration: DurationMicros::new(5_000_000),
+                candidate_window: 8,
+                kind: Some(TaskKind::Model),
+            },
+        )
+        .await
+        .expect("claim fallback branch")
+        .expect("fallback branch becomes claimable");
+    assert_eq!(fallback.value.task.logical_key.as_str(), "fallback");
 }
 
 #[tokio::test]
@@ -1187,6 +1299,10 @@ async fn schedules_persist_cron_and_fire_runs_idempotently() {
         "America/Chicago"
     );
     assert_eq!(schedule_bodies[0]["schedule"]["misfire_policy"], "catch_up");
+    assert_eq!(
+        schedule_bodies[0]["schedule"]["concurrency_policy"],
+        "allow"
+    );
     assert_eq!(schedule_bodies[0]["schedule"]["catch_up_limit"], 2);
     assert!(
         schedule_bodies[0]["schedule"]["next_fire_at_micros"]
@@ -1356,6 +1472,141 @@ async fn schedules_persist_cron_and_fire_runs_idempotently() {
         .expect("verify Schedule cursor advance")
         .get(0);
     assert!(cursor_advanced);
+
+    let forbid_response = application
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/schedules")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer mvp-e2e-api-key")
+                .header("idempotency-key", format!("schedule-forbid-{nonce}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "cron_expression": "* * * * *",
+                        "timezone": "UTC",
+                        "misfire_policy": "fire_once",
+                        "concurrency_policy": "forbid",
+                        "catch_up_limit": 1,
+                        "input": {"goal": "serialize scheduled delivery"}
+                    }))
+                    .expect("encode forbid Schedule request"),
+                ))
+                .expect("build forbid Schedule request"),
+        )
+        .await
+        .expect("create forbid Schedule response");
+    assert_eq!(forbid_response.status(), StatusCode::CREATED);
+    let forbid_body: Value = serde_json::from_slice(
+        &to_bytes(forbid_response.into_body(), 64 * 1024)
+            .await
+            .expect("read forbid Schedule response"),
+    )
+    .expect("decode forbid Schedule response");
+    assert_eq!(forbid_body["schedule"]["concurrency_policy"], "forbid");
+    let forbid_schedule_id = forbid_body["schedule"]["schedule_id"]
+        .as_str()
+        .expect("forbid Schedule ID");
+    let first_forbid_fire = scheduled_fire_time_micros.saturating_sub(2_000_000);
+    let first_response = application
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/schedules/{forbid_schedule_id}/fires"))
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer mvp-e2e-api-key")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "scheduled_fire_time_micros": first_forbid_fire
+                    }))
+                    .expect("encode first forbid fire"),
+                ))
+                .expect("build first forbid fire"),
+        )
+        .await
+        .expect("first forbid fire response");
+    assert_eq!(first_response.status(), StatusCode::ACCEPTED);
+    let overlapping_response = application
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/schedules/{forbid_schedule_id}/fires"))
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer mvp-e2e-api-key")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "scheduled_fire_time_micros": first_forbid_fire + 1_000_000
+                    }))
+                    .expect("encode overlapping forbid fire"),
+                ))
+                .expect("build overlapping forbid fire"),
+        )
+        .await
+        .expect("overlapping forbid fire response");
+    assert_eq!(overlapping_response.status(), StatusCode::CONFLICT);
+
+    client
+        .execute(
+            "UPDATE agent_loom.schedules SET \
+                next_fire_at = date_trunc('minute', transaction_timestamp()) - interval '1 minute', \
+                version = 0 \
+             WHERE tenant_id = $1 AND schedule_id = $2",
+            &[
+                &uuid::Uuid::from_bytes(application.tenant_id.into_bytes()),
+                &uuid::Uuid::from_bytes(
+                    decode_test_id(forbid_schedule_id).expect("decode forbid Schedule ID"),
+                ),
+            ],
+        )
+        .await
+        .expect("make forbid Schedule due");
+    let blocked_polling = SchedulePollingJob::new(
+        AppState {
+            store: Arc::new(application.store.clone()),
+            tenant_id: application.tenant_id,
+            workflow_id: application.workflow_id,
+            coordinator_agent_version_id: application.coordinator_agent_version_id,
+            api_key: Arc::<str>::from("mvp-e2e-api-key"),
+        },
+        application.tenant_id,
+        SchedulePollingConfig::default(),
+    )
+    .run_once(0)
+    .await
+    .expect("advance blocked forbid Schedule");
+    assert!(matches!(
+        blocked_polling,
+        PollingActivity::Progress {
+            completed: 1,
+            failed: 0,
+            ..
+        }
+    ));
+    let forbid_state = client
+        .query_one(
+            "SELECT \
+                (SELECT count(*) FROM agent_loom.runs \
+                 WHERE tenant_id = $1 AND schedule_id = $2), \
+                version, next_fire_at > transaction_timestamp() \
+             FROM agent_loom.schedules WHERE tenant_id = $1 AND schedule_id = $2",
+            &[
+                &uuid::Uuid::from_bytes(application.tenant_id.into_bytes()),
+                &uuid::Uuid::from_bytes(
+                    decode_test_id(forbid_schedule_id).expect("decode forbid Schedule ID"),
+                ),
+            ],
+        )
+        .await
+        .expect("verify forbid Schedule state");
+    assert_eq!(forbid_state.get::<_, i64>(0), 1);
+    assert_eq!(forbid_state.get::<_, i64>(1), 1);
+    assert!(forbid_state.get::<_, bool>(2));
     drop(client);
     connection_task
         .await
@@ -1496,6 +1747,198 @@ async fn plan_revisions_are_version_fenced_idempotent_and_auditable() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn p2_controls_replay_handoff_and_compensation_are_durable_and_idempotent() {
+    let Ok(database_url) = std::env::var("AGENT_LOOM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos();
+    let (application, source_run_id) = bootstrap_outbox_test(&database_url, nonce).await;
+
+    let opened = post_api_json(
+        &application,
+        &format!("/v1/runs/{source_run_id}/manual-interventions"),
+        "manual-open",
+        &json!({"reason": "operator diagnosis"}),
+    )
+    .await;
+    assert_eq!(opened.status(), StatusCode::OK);
+    let opened_body: Value = serde_json::from_slice(
+        &to_bytes(opened.into_body(), 64 * 1024)
+            .await
+            .expect("read manual intervention response"),
+    )
+    .expect("decode manual intervention response");
+    assert_eq!(opened_body["status"], "paused");
+
+    let resolved = post_api_json(
+        &application,
+        &format!("/v1/runs/{source_run_id}/manual-interventions/resolve"),
+        "manual-resolve",
+        &json!({"reason": "operator approved continuation"}),
+    )
+    .await;
+    assert_eq!(resolved.status(), StatusCode::OK);
+    let resolved_body: Value = serde_json::from_slice(
+        &to_bytes(resolved.into_body(), 64 * 1024)
+            .await
+            .expect("read manual resolution response"),
+    )
+    .expect("decode manual resolution response");
+    assert_eq!(resolved_body["status"], "queued");
+
+    let handoff_request = json!({
+        "base_revision": 1,
+        "task_key": "handoff-to-specialist",
+        "target_handler": "delivery-mvp",
+        "max_attempts": 2,
+        "input": {"specialty": "recovery"}
+    });
+    let handoff = post_api_json(
+        &application,
+        &format!("/v1/runs/{source_run_id}/handoffs"),
+        "handoff-specialist",
+        &handoff_request,
+    )
+    .await;
+    assert_eq!(handoff.status(), StatusCode::OK);
+    let handoff_body: Value = serde_json::from_slice(
+        &to_bytes(handoff.into_body(), 64 * 1024)
+            .await
+            .expect("read handoff response"),
+    )
+    .expect("decode handoff response");
+    assert_eq!(handoff_body["plan_revision"], 2);
+    assert_eq!(handoff_body["disposition"], "applied");
+    let duplicate_handoff = post_api_json(
+        &application,
+        &format!("/v1/runs/{source_run_id}/handoffs"),
+        "handoff-specialist",
+        &handoff_request,
+    )
+    .await;
+    assert_eq!(duplicate_handoff.status(), StatusCode::OK);
+    let duplicate_handoff_body: Value = serde_json::from_slice(
+        &to_bytes(duplicate_handoff.into_body(), 64 * 1024)
+            .await
+            .expect("read duplicate handoff response"),
+    )
+    .expect("decode duplicate handoff response");
+    assert_eq!(duplicate_handoff_body["disposition"], "duplicate");
+
+    let compensation = post_api_json(
+        &application,
+        &format!("/v1/runs/{source_run_id}/compensations"),
+        "compensate-delivery",
+        &json!({
+            "base_revision": 2,
+            "task_key": "compensate-delivery",
+            "target_handler": "delivery-mvp",
+            "input": {"operation": "undo_delivery"}
+        }),
+    )
+    .await;
+    assert_eq!(compensation.status(), StatusCode::OK);
+    let compensation_body: Value = serde_json::from_slice(
+        &to_bytes(compensation.into_body(), 64 * 1024)
+            .await
+            .expect("read compensation response"),
+    )
+    .expect("decode compensation response");
+    assert_eq!(compensation_body["plan_revision"], 3);
+    assert_eq!(compensation_body["disposition"], "applied");
+
+    let events = get_json(
+        application.router.clone(),
+        &format!("/v1/runs/{source_run_id}/events"),
+    )
+    .await;
+    let event_types = events["events"]
+        .as_array()
+        .expect("Event history array")
+        .iter()
+        .filter_map(|event| event["event_type"].as_str())
+        .collect::<Vec<_>>();
+    assert!(event_types.contains(&"run.handoff_requested"));
+    assert!(event_types.contains(&"run.compensation_requested"));
+
+    let replay_uri = format!("/v1/runs/{source_run_id}/replay");
+    let replay = post_api_json(&application, &replay_uri, "replay-p2-controls", &json!({})).await;
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    let replay_body: Value = serde_json::from_slice(
+        &to_bytes(replay.into_body(), 64 * 1024)
+            .await
+            .expect("read Replay response"),
+    )
+    .expect("decode Replay response");
+    assert_eq!(replay_body["source_run_id"], source_run_id);
+    assert_eq!(replay_body["disposition"], "applied");
+    let replay_run_id = replay_body["run"]["run_id"]
+        .as_str()
+        .expect("Replay Run ID")
+        .to_owned();
+    let duplicate_replay =
+        post_api_json(&application, &replay_uri, "replay-p2-controls", &json!({})).await;
+    assert_eq!(duplicate_replay.status(), StatusCode::ACCEPTED);
+    let duplicate_replay_body: Value = serde_json::from_slice(
+        &to_bytes(duplicate_replay.into_body(), 64 * 1024)
+            .await
+            .expect("read duplicate Replay response"),
+    )
+    .expect("decode duplicate Replay response");
+    assert_eq!(duplicate_replay_body["disposition"], "duplicate");
+    assert_eq!(duplicate_replay_body["run"]["run_id"], replay_run_id);
+
+    let replay_revisions = get_plan_revisions(&application, &replay_run_id).await;
+    assert_eq!(replay_revisions.len(), 1);
+    assert_eq!(replay_revisions[0]["change_summary"]["kind"], "replay");
+    let replay_tasks = replay_revisions[0]["plan"]["initial_tasks"]
+        .as_array()
+        .expect("Replay Plan Tasks");
+    assert!(
+        replay_tasks.iter().any(|task| {
+            task["key"] == "handoff-to-specialist" && task["kind"] == "agent_server"
+        })
+    );
+    assert!(
+        replay_tasks
+            .iter()
+            .any(|task| task["key"] == "compensate-delivery" && task["kind"] == "tool")
+    );
+
+    let (client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+        .await
+        .expect("connect Replay verification database");
+    let connection_task = tokio::spawn(connection);
+    let replay_source: uuid::Uuid = client
+        .query_one(
+            "SELECT replay_of_run_id FROM agent_loom.runs \
+             WHERE tenant_id = $1 AND run_id = $2",
+            &[
+                &uuid::Uuid::from_bytes(application.tenant_id.into_bytes()),
+                &uuid::Uuid::from_bytes(
+                    decode_test_id(&replay_run_id).expect("decode Replay Run ID"),
+                ),
+            ],
+        )
+        .await
+        .expect("query Replay lineage")
+        .get(0);
+    assert_eq!(
+        replay_source,
+        uuid::Uuid::from_bytes(decode_test_id(&source_run_id).expect("decode source Run ID"))
+    );
+    drop(client);
+    connection_task
+        .await
+        .expect("join Replay verification connection")
+        .expect("Replay verification connection remains healthy");
 }
 
 #[tokio::test]
@@ -1785,6 +2228,31 @@ async fn post_plan_revision(
         )
         .await
         .expect("Plan revision response")
+}
+
+async fn post_api_json(
+    application: &agent_loom_server::BootstrappedServer,
+    uri: &str,
+    idempotency_key: &str,
+    request: &Value,
+) -> axum::response::Response {
+    application
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer mvp-e2e-api-key")
+                .header("idempotency-key", idempotency_key)
+                .body(Body::from(
+                    serde_json::to_vec(request).expect("encode authenticated API request"),
+                ))
+                .expect("build authenticated API request"),
+        )
+        .await
+        .expect("authenticated API response")
 }
 
 async fn bootstrap_outbox_test(

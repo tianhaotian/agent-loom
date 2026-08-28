@@ -2,9 +2,10 @@ use agent_loom_domain::{
     AgentEventReceiptId, AgentExecutionId, AgentExecutionSnapshot, AgentExecutionStatus,
     AgentVersionId, CheckpointId, ContextMergeStrategy, ContextSnapshotId, EndpointId, EventId,
     JoinPolicy, JsonPayload, LogicalKey, OutboxId, OutboxMessage, PlanRevisionId, RunId,
-    RunSnapshot, RunStatus, ScheduleId, ScheduleMisfirePolicy, ScheduleSnapshot, ScheduleStatus,
-    StageExecutionId, StageStatus, TaskId, TaskKind, TaskSnapshot, TaskStatus, TenantId,
-    ToolExecutionId, ToolExecutionSnapshot, ToolExecutionStatus, UnixMicros, WorkflowVersionId,
+    RunSnapshot, RunStatus, ScheduleConcurrencyPolicy, ScheduleId, ScheduleMisfirePolicy,
+    ScheduleSnapshot, ScheduleStatus, StageExecutionId, StageStatus, TaskId, TaskKind,
+    TaskSnapshot, TaskStatus, TenantId, ToolExecutionId, ToolExecutionSnapshot,
+    ToolExecutionStatus, UnixMicros, WorkflowVersionId,
 };
 use agent_loom_durable_store::{
     AgentEventBatchOutcome, AgentEventExecutionOutcome, AgentSubmissionOutcome,
@@ -104,17 +105,18 @@ impl PostgresTransactionExecutor {
         let workflow_version_id = uuid(command.workflow_version_id.into_bytes());
         let input = json_value(&command.input)?;
         let misfire_policy = misfire_policy_value(command.misfire_policy);
+        let concurrency_policy = concurrency_policy_value(command.concurrency_policy);
         let catch_up_limit = i64::from(command.catch_up_limit);
         transaction
             .execute(
                 "INSERT INTO agent_loom.schedules (schedule_id, tenant_id, \
                     workflow_version_id, cron_expression, timezone, input_json, status, \
-                    misfire_policy, catch_up_limit, next_fire_at, version, \
+                    misfire_policy, concurrency_policy, catch_up_limit, next_fire_at, version, \
                     created_by, created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8, \
-                    to_timestamp(($9::bigint)::double precision / 1000000.0), 0, $10, \
-                    to_timestamp(($11::bigint)::double precision / 1000000.0), \
-                    to_timestamp(($11::bigint)::double precision / 1000000.0))",
+                 VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8, $9, \
+                    to_timestamp(($10::bigint)::double precision / 1000000.0), 0, $11, \
+                    to_timestamp(($12::bigint)::double precision / 1000000.0), \
+                    to_timestamp(($12::bigint)::double precision / 1000000.0))",
                 &[
                     &schedule_id,
                     &tenant_id,
@@ -123,6 +125,7 @@ impl PostgresTransactionExecutor {
                     &command.timezone,
                     &input,
                     &misfire_policy,
+                    &concurrency_policy,
                     &catch_up_limit,
                     &command.next_fire_at.get(),
                     &context.actor_ref,
@@ -140,6 +143,7 @@ impl PostgresTransactionExecutor {
             input: command.input,
             status: ScheduleStatus::Active,
             misfire_policy: command.misfire_policy,
+            concurrency_policy: command.concurrency_policy,
             catch_up_limit: command.catch_up_limit,
             next_fire_at: command.next_fire_at,
             last_fire_at: None,
@@ -370,6 +374,7 @@ impl PostgresTransactionExecutor {
         let run_id = uuid(command.run_id.into_bytes());
         let parent_run_id = command.parent_run_id.map(|id| uuid(id.into_bytes()));
         let parent_task_id = command.parent_task_id.map(|id| uuid(id.into_bytes()));
+        let replay_of_run_id = command.replay_of_run_id.map(|id| uuid(id.into_bytes()));
         let schedule_id = command.schedule_id.map(|id| uuid(id.into_bytes()));
         let scheduled_fire_at = command.scheduled_fire_at.map(UnixMicros::get);
         let workflow_version_id = command.workflow_version_id.map(|id| uuid(id.into_bytes()));
@@ -390,10 +395,32 @@ impl PostgresTransactionExecutor {
             "execution generation",
         )?;
 
+        if let Some(source_run_id) = replay_of_run_id {
+            if source_run_id == run_id {
+                return Err(invalid_command("Run cannot replay itself"));
+            }
+            let exists = transaction
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM agent_loom.runs \
+                     WHERE tenant_id = $1 AND run_id = $2)",
+                    &[&tenant_id, &source_run_id],
+                )
+                .await
+                .map_err(map_database_error)?
+                .get::<_, bool>(0);
+            if !exists {
+                return Err(store_error(
+                    StoreErrorCode::NotFound,
+                    "Replay source Run was not found",
+                ));
+            }
+        }
+
         if let Some(schedule_id) = schedule_id {
             let schedule = transaction
                 .query_opt(
-                    "SELECT workflow_version_id, status FROM agent_loom.schedules \
+                    "SELECT workflow_version_id, status, concurrency_policy \
+                     FROM agent_loom.schedules \
                      WHERE tenant_id = $1 AND schedule_id = $2 FOR UPDATE",
                     &[&tenant_id, &schedule_id],
                 )
@@ -457,6 +484,25 @@ impl PostgresTransactionExecutor {
                     None,
                     Vec::new(),
                 ));
+            }
+            if schedule.get::<_, &str>(2) == "forbid" {
+                let active_run_exists = transaction
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1 FROM agent_loom.runs \
+                         WHERE tenant_id = $1 AND schedule_id = $2 \
+                           AND status IN ('queued', 'running', 'waiting', \
+                               'approval_required', 'retrying', 'paused'))",
+                        &[&tenant_id, &schedule_id],
+                    )
+                    .await
+                    .map_err(map_database_error)?
+                    .get::<_, bool>(0);
+                if active_run_exists {
+                    return Err(store_error(
+                        StoreErrorCode::InvalidTransition,
+                        "Schedule concurrency policy forbids overlapping Runs",
+                    ));
+                }
             }
         }
 
@@ -561,16 +607,17 @@ impl PostgresTransactionExecutor {
                 "INSERT INTO agent_loom.runs (\
                     run_id, tenant_id, workflow_version_id, coordinator_agent_version_id, \
                     parent_run_id, parent_task_id, schedule_id, scheduled_fire_at, \
+                    replay_of_run_id, \
                     status, suspended_from_status, version, \
                     execution_generation, next_event_sequence, current_checkpoint_id, \
                     terminal_event_id, input_json, state_summary_json, deadline, \
                     resume_blocked_reason, created_by, created_at, updated_at, terminal_at\
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, \
                     to_timestamp(($8::bigint)::double precision / 1000000.0), \
-                    'queued', NULL, 0, 0, 2, NULL, NULL, $9, '{}'::jsonb, \
-                    to_timestamp(($10::bigint)::double precision / 1000000.0), NULL, $11, \
-                    to_timestamp(($12::bigint)::double precision / 1000000.0), \
-                    to_timestamp(($12::bigint)::double precision / 1000000.0), NULL)",
+                    $9, 'queued', NULL, 0, 0, 2, NULL, NULL, $10, '{}'::jsonb, \
+                    to_timestamp(($11::bigint)::double precision / 1000000.0), NULL, $12, \
+                    to_timestamp(($13::bigint)::double precision / 1000000.0), \
+                    to_timestamp(($13::bigint)::double precision / 1000000.0), NULL)",
                 &[
                     &run_id,
                     &tenant_id,
@@ -580,6 +627,7 @@ impl PostgresTransactionExecutor {
                     &parent_task_id,
                     &schedule_id,
                     &scheduled_fire_at,
+                    &replay_of_run_id,
                     &input,
                     &deadline,
                     &context.actor_ref,
@@ -1406,7 +1454,7 @@ impl PostgresTransactionExecutor {
             db_now,
             "failure",
         )?;
-        let transition = FailureTransition::classify(
+        let mut transition = FailureTransition::classify(
             locked.attempt,
             locked.max_attempts,
             command.retry_at.map(UnixMicros::get),
@@ -1451,6 +1499,25 @@ impl PostgresTransactionExecutor {
         )
         .await?;
         let mut follow_ups = Vec::new();
+        if transition.task_status != "retry_scheduled" {
+            let activated = resolve_dependent_tasks(
+                &transaction,
+                tenant_id,
+                locked.run_id,
+                locked.task_id,
+                db_now,
+            )
+            .await?;
+            if !activated.is_empty() {
+                transition.run_status = "queued";
+                transition.terminal = false;
+                follow_ups.extend(
+                    activated
+                        .into_iter()
+                        .map(|task_id| DurableFollowUp::Task { task_id }),
+                );
+            }
+        }
         if transition.terminal {
             close_work_after_fatal_failure(
                 &transaction,
@@ -4419,6 +4486,20 @@ impl PostgresTransactionExecutor {
         let next_plan_revision_i64 = to_i64(next_plan_revision, "Plan revision")?;
         let event_id = uuid(command.event_id.into_bytes());
         let change_summary = json_value(&command.revision.change_summary)?;
+        let revision_kind = change_summary
+            .get("kind")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                change_summary
+                    .get("requested")
+                    .and_then(|requested| requested.get("kind"))
+                    .and_then(Value::as_str)
+            });
+        let revision_event_type = match revision_kind {
+            Some("handoff") => "run.handoff_requested",
+            Some("compensation") => "run.compensation_requested",
+            _ => "run.plan_revised",
+        };
         let event_payload = json!({
             "plan_revision_id": command.revision.plan_revision_id.to_string(),
             "parent_plan_revision_id": PlanRevisionId::from_bytes(parent_plan_revision_id.into_bytes()).to_string(),
@@ -4436,7 +4517,7 @@ impl PostgresTransactionExecutor {
                 tenant_id,
                 run_id,
                 sequence: locked.next_event_sequence_i64,
-                event_type: "run.plan_revised",
+                event_type: revision_event_type,
                 payload: &event_payload,
                 payload_schema_version: 1,
                 producer: "control-plane",
@@ -8763,8 +8844,8 @@ fn dependency_condition_satisfied(
     if object.is_empty() {
         return Ok(status == "succeeded");
     }
-    if object.get("status").is_some() {
-        return Ok(status == "succeeded");
+    if let Some(expected_status) = object.get("status").and_then(Value::as_str) {
+        return Ok(status == expected_status);
     }
     if let Some(equals) = object.get("result_equals").and_then(Value::as_object) {
         let pointer = equals
@@ -8789,8 +8870,16 @@ fn dependency_condition_shape_is_valid(condition: &Value) -> bool {
     if object.is_empty() {
         return true;
     }
-    if object.len() == 1 && object.get("status").and_then(Value::as_str) == Some("succeeded") {
-        return true;
+    if object.len() == 1 && object.contains_key("status") {
+        return object
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| {
+                matches!(
+                    status,
+                    "succeeded" | "failed" | "dead_lettered" | "skipped" | "cancelled"
+                )
+            });
     }
     object.len() == 1
         && object
@@ -8941,10 +9030,13 @@ fn validate_create_run(command: &CreateRun) -> StoreResult<()> {
     }
     if plan_revision.created_event_id != command.initial_event_id
         || command.parent_run_id == Some(command.run_id)
+        || command.replay_of_run_id == Some(command.run_id)
         || (command.parent_task_id.is_some() && command.parent_run_id.is_none())
         || (command.parent_event_id.is_some() != command.parent_run_id.is_some())
         || (command.schedule_id.is_some() != command.scheduled_fire_at.is_some())
         || (command.schedule_id.is_some() && command.parent_run_id.is_some())
+        || (command.replay_of_run_id.is_some()
+            && (command.schedule_id.is_some() || command.parent_run_id.is_some()))
         || plan_revision.plan_revision_id.is_nil()
         || plan_revision.schema_version == 0
         || computed_plan_digest != *plan_revision.plan_digest.as_bytes()
@@ -9573,6 +9665,7 @@ struct ScheduleReceipt {
     input: Value,
     status: String,
     misfire_policy: String,
+    concurrency_policy: String,
     catch_up_limit: u32,
     next_fire_at: i64,
     last_fire_at: Option<i64>,
@@ -9595,6 +9688,7 @@ fn encode_schedule_receipt(snapshot: &ScheduleSnapshot) -> StoreResult<Value> {
         }
         .to_owned(),
         misfire_policy: misfire_policy_value(snapshot.misfire_policy).to_owned(),
+        concurrency_policy: concurrency_policy_value(snapshot.concurrency_policy).to_owned(),
         catch_up_limit: snapshot.catch_up_limit,
         next_fire_at: snapshot.next_fire_at.get(),
         last_fire_at: snapshot.last_fire_at.map(UnixMicros::get),
@@ -9619,6 +9713,7 @@ fn decode_schedule_receipt(tenant_id: TenantId, value: &Value) -> StoreResult<Sc
         _ => return Err(inconsistent("stored Schedule status is invalid")),
     };
     let misfire_policy = parse_misfire_policy(&receipt.misfire_policy)?;
+    let concurrency_policy = parse_concurrency_policy(&receipt.concurrency_policy)?;
     Ok(ScheduleSnapshot {
         tenant_id,
         schedule_id: ScheduleId::from_bytes(receipt.schedule_id.into_bytes()),
@@ -9633,6 +9728,7 @@ fn decode_schedule_receipt(tenant_id: TenantId, value: &Value) -> StoreResult<Sc
         ),
         status,
         misfire_policy,
+        concurrency_policy,
         catch_up_limit: receipt.catch_up_limit,
         next_fire_at: UnixMicros::new(receipt.next_fire_at),
         last_fire_at: receipt.last_fire_at.map(UnixMicros::new),
@@ -9656,6 +9752,23 @@ fn parse_misfire_policy(value: &str) -> StoreResult<ScheduleMisfirePolicy> {
         "fire_once" => Ok(ScheduleMisfirePolicy::FireOnce),
         "catch_up" => Ok(ScheduleMisfirePolicy::CatchUp),
         _ => Err(inconsistent("stored Schedule misfire policy is invalid")),
+    }
+}
+
+const fn concurrency_policy_value(policy: ScheduleConcurrencyPolicy) -> &'static str {
+    match policy {
+        ScheduleConcurrencyPolicy::Allow => "allow",
+        ScheduleConcurrencyPolicy::Forbid => "forbid",
+    }
+}
+
+fn parse_concurrency_policy(value: &str) -> StoreResult<ScheduleConcurrencyPolicy> {
+    match value {
+        "allow" => Ok(ScheduleConcurrencyPolicy::Allow),
+        "forbid" => Ok(ScheduleConcurrencyPolicy::Forbid),
+        _ => Err(inconsistent(
+            "stored Schedule concurrency policy is invalid",
+        )),
     }
 }
 
@@ -10328,8 +10441,12 @@ mod tests {
                 .expect("status condition")
         );
         assert!(
-            dependency_condition_satisfied("succeeded", None, &json!({"status": "failed"}),)
-                .is_err()
+            dependency_condition_satisfied("failed", None, &json!({"status": "failed"}),)
+                .expect("failure fallback condition")
+        );
+        assert!(
+            !dependency_condition_satisfied("succeeded", None, &json!({"status": "failed"}),)
+                .expect("failure fallback mismatch")
         );
     }
 
@@ -10674,6 +10791,7 @@ mod tests {
         let create_context = command_context(tenant_id, ids(6), "create_run", &tenant_key, 6);
         let create = CreateRun {
             run_id,
+            replay_of_run_id: None,
             parent_run_id: None,
             parent_task_id: None,
             parent_event_id: None,
@@ -11265,6 +11383,7 @@ mod tests {
                 &control_create_context,
                 CreateRun {
                     run_id: control_run_id,
+                    replay_of_run_id: None,
                     parent_run_id: None,
                     parent_task_id: None,
                     parent_event_id: None,
@@ -11566,6 +11685,7 @@ mod tests {
     ) -> CreateRun {
         CreateRun {
             run_id,
+            replay_of_run_id: None,
             parent_run_id: None,
             parent_task_id: None,
             parent_event_id: None,

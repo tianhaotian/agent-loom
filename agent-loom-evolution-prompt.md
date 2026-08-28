@@ -135,8 +135,9 @@ Agent Loom 不应该内置：
 - 通用 External Signal/Wait 已持久化并支持匹配/单次消费/恢复；当前 HTTP E2E 重点覆盖 approval，更多信号类型可继续扩展验收
 - Child Run、Fan-out 和显式 `all/any` Child Join Fan-in 核心语义已完成；后台自动触发 Child Join 属于生产调度增强，Handoff 属于 P2
 - Transactional Outbox 已对所有权威 Event 形成事务写入、Lease 发布、失败重试和崩溃接管闭环，当前真实 Publisher 为结构化 JSON 日志
-- P2 Schedule/Cron、timezone/DST、misfire 与 catch-up 已完成：持久化五段 Cron、IANA timezone、Workflow Version/输入绑定、`skip`/`fire_once`/有界 `catch_up` policy 和查询 API；后台扫描按数据库时间选取 due cursor，Jiff 负责 DST gap/fold，版本/CAS 推进游标，并以 `(schedule_id, scheduled_fire_time)` 稳定身份与 Run 唯一约束保证崩溃重试和多实例派发幂等。Schedule concurrency policy 尚待后续切片
-- P0 与 P1 清单中的核心能力均已完成。PlanRevision 已覆盖初始 revision、完整快照历史、HTTP 幂等提交、Run/Plan 双重 fencing、Event/Outbox 审计，以及 append-only 动态 Task 的同事务实例化；ExecutionPlan 已支持无环 Dependency、`all`/`any` JoinPolicy、成功/结果投影 Condition、事务内唯一激活和不可达分支递归 `skipped`。Context 已覆盖初始 Snapshot、replace/merge-patch、Run/Context fencing、不可变 Patch/Snapshot、父级 lineage，以及 Task 创建时固定的 ContextReference/JSON Pointer Projection；Artifact 引用/版本血缘已持久化；Child Run/Fan-out 已覆盖父 Run/Task 校验、幂等创建和直接子 Run 查询，显式 Child Join 可按 `all`/`any` 终态策略唯一激活父 Task。append-only 是 V1 动态计划的有意约束；动态 Stage 删除/改写、后台 Child Join 自动触发、Schedule concurrency policy、Handoff、外部 Broker、MySQL 事务 Provider、多租户和生产可观测性属于 Phase 2B、P2 或更后续范围
+- P2 清单中的核心能力均已完成。Schedule/Cron 持久化五段 Cron、IANA timezone、Workflow Version/输入绑定、`skip`/`fire_once`/有界 `catch_up` 和 `allow`/`forbid` concurrency policy；后台扫描按数据库时间选取 due cursor，Jiff 负责 DST gap/fold，版本/CAS 推进游标，并以 `(schedule_id, scheduled_fire_time)` 稳定身份与 Run 唯一约束保证崩溃重试和多实例派发幂等。`forbid` 在 Schedule 行锁保护的创建事务内拒绝重叠 Run，后台扫描遇到仍活跃的 Run 时只推进当前游标
+- Retry 已覆盖 Task/Tool/Agent 的持久化 backoff、对账和 Dead Letter；Fallback 通过精确终态 Dependency Condition 在前置失败事务中唯一激活；Compensation 与 Handoff 通过专用幂等 API 追加受 Plan fencing 保护、带独立审计 Event 的 Tool/AgentServer Task。Run Replay 固定复用源 Run 的不可变输入、Workflow Version 和最新 PlanRevision，并保存 `replay_of_run_id` lineage；Replan 使用 append-only PlanRevision；Manual Intervention 使用专用幂等入口暂停、fence 并恢复 Run
+- P0 与 P1 清单中的核心能力均已完成。PlanRevision 已覆盖初始 revision、完整快照历史、HTTP 幂等提交、Run/Plan 双重 fencing、Event/Outbox 审计，以及 append-only 动态 Task 的同事务实例化；ExecutionPlan 已支持无环 Dependency、`all`/`any` JoinPolicy、成功/失败/Dead Letter/跳过/取消状态与结果投影 Condition、事务内唯一激活和不可达分支递归 `skipped`。Context 已覆盖初始 Snapshot、replace/merge-patch、Run/Context fencing、不可变 Patch/Snapshot、父级 lineage，以及 Task 创建时固定的 ContextReference/JSON Pointer Projection；Artifact 引用/版本血缘已持久化；Child Run/Fan-out 已覆盖父 Run/Task 校验、幂等创建和直接子 Run 查询，显式 Child Join 可按 `all`/`any` 终态策略唯一激活父 Task。append-only 是 V1 动态计划的有意约束；动态 Stage 删除/改写、后台 Child Join 自动触发、外部 Broker、MySQL 事务 Provider、多租户和生产可观测性属于 Phase 2B、P3 或更后续范围
 
 首先检查当前代码和 git 状态，不要仅依赖上述描述。若描述已经过时，以当前代码和测试为准。
 
@@ -199,6 +200,8 @@ Agent Loom 不应该内置：
 Schedule 触发必须有稳定的幂等键，例如：
 
   (schedule_id, scheduled_fire_time)
+
+完成状态：以上 10 项均已具备 PostgreSQL 权威状态、幂等/fencing、Event/Outbox 审计和行为测试。Compensation/Handoff 的具体外部业务动作由注册的 Tool/AgentServer Handler 与 Adapter 实现，核心只负责可靠编排和执行事实。
 
 ## P3：生产化和Provider扩展
 

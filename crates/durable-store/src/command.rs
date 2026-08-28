@@ -63,6 +63,7 @@ pub struct InitialTaskDependency {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateRun {
     pub run_id: RunId,
+    pub replay_of_run_id: Option<RunId>,
     pub parent_run_id: Option<RunId>,
     pub parent_task_id: Option<TaskId>,
     pub parent_event_id: Option<EventId>,

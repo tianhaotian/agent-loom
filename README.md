@@ -28,7 +28,7 @@ runtime/src/service/    有界轮询、退避、关闭信号与 Job 接线
 
 `domain`、`durable-store` 与 `adapter-core` 继续保持零外部依赖；Provider crate 可以引入各自的数据库驱动和异步运行时，但驱动类型不得泄漏到共享领域契约。`adapter-http` 使用 HTTPS/loopback HTTP 执行真实远程 I/O，`server` 是 PostgreSQL 专用的产品装配层，不改变 Runtime 与 Store 共享契约的数据库无关性。
 
-已实现 `0000_migration_meta` 至 `0021_schedule_dispatch` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt、Checkpoint、Wait、Artifact、ToolExecution、AgentExecution、Outbox、PlanRevision、Task Dependency、Context、Schedule 与条件分支 `skipped` 终态，并持久化恢复远端 Agent 生命周期所需的协议版本和状态查询时间。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、Wait 单次消费槽与恢复计划、Tool/Agent 重试时间、Agent 请求信封、Artifact 版本血缘、外部执行幂等与 Agent Event 去重；只依赖 `dyn DurableStore` 的黑盒行为现已覆盖 Lease 到期重试、多 Worker 同时领取、完成/取消终态竞争、Wait 单次消费，以及完成事务中途约束失败后的完整回滚。
+已实现 `0000_migration_meta` 至 `0023_run_replay` 的 PostgreSQL/MySQL 对等迁移，覆盖定义身份、Agent Endpoint、Run、Event、CommandReceipt、Stage、Task、TaskAttempt、Checkpoint、Wait、Artifact、ToolExecution、AgentExecution、Outbox、PlanRevision、Task Dependency、Context、Schedule、Schedule concurrency、Run Replay lineage 与条件分支 `skipped` 终态，并持久化恢复远端 Agent 生命周期所需的协议版本和状态查询时间。`provider-conformance` 会校验逻辑迁移顺序、表归属、终态 Event 与 Checkpoint 归属约束、Task Lease、Wait 单次消费槽与恢复计划、Tool/Agent 重试时间、Agent 请求信封、Artifact 版本血缘、外部执行幂等与 Agent Event 去重；只依赖 `dyn DurableStore` 的黑盒行为现已覆盖 Lease 到期重试、多 Worker 同时领取、完成/取消终态竞争、Wait 单次消费，以及完成事务中途约束失败后的完整回滚。
 
 PostgreSQL 已接入真实驱动执行层：migration executor 使用 SHA-256 physical checksum、session advisory lock、step journal 和逐批 schema introspection；`PostgresStore` 通过连接池完整实现对象安全的 `DurableStore`，事务垂直切片已覆盖 Run 创建/查询、Event 分页、Task 生命周期、Wait 事件应用、ToolExecution 准备/结果记录、AgentExecution 提交/事件/结果记录，以及 Pause/Resume/Cancel。写路径包含 receipt 并发幂等闸门、显式层级锁序、`FOR UPDATE SKIP LOCKED`、Lease fencing、Run version/generation CAS，以及 Event、Checkpoint、Stage、Artifact 和后续动作的原子提交。
 
@@ -44,7 +44,9 @@ ExecutionPlan 的初始 Task 可以声明有向无环依赖、`all`/`any` JoinPo
 
 每个 ExecutionPlan Task 还会固定引用创建时的 ContextSnapshot，并可用 JSON Pointer 列表声明 ContextProjection。空投影返回完整 Snapshot，非空投影返回稳定的 Pointer→值视图；Task 不会因后续 Context revision 漂移。
 
-Schedule 持久化五段 Cron、IANA timezone、绑定的 Workflow Version、不可变 Run 输入、misfire policy（`skip`/`fire_once`/`catch_up`）和有界 `catch_up_limit`。后台扫描器按数据库权威时间查找到期游标，使用 Jiff 计算包含 DST gap/fold 的下次触发时间，并通过版本/CAS 推进游标。每次触发以 `(schedule_id, scheduled_fire_time)` 构造稳定幂等身份，Run 表以同一组合唯一约束防止崩溃重试或多实例扫描造成重复 Run。
+Schedule 持久化五段 Cron、IANA timezone、绑定的 Workflow Version、不可变 Run 输入、misfire policy（`skip`/`fire_once`/`catch_up`）、有界 `catch_up_limit` 和 concurrency policy（`allow`/`forbid`）。后台扫描器按数据库权威时间查找到期游标，使用 Jiff 计算包含 DST gap/fold 的下次触发时间，并通过版本/CAS 推进游标。每次触发以 `(schedule_id, scheduled_fire_time)` 构造稳定幂等身份，Run 表以同一组合唯一约束防止崩溃重试或多实例扫描造成重复 Run；`forbid` 还在 Schedule 行锁保护的 Run 创建事务内拒绝重叠执行，扫描器在已有活跃 Run 时安全跳过并推进游标。
+
+P2 高级控制已形成持久化闭环：Task/Tool/Agent Retry 使用数据库 backoff、Fallback 可用精确失败终态 Dependency 原子激活，Compensation 与 Handoff 通过专用 API 追加带 Plan fencing 和审计 Event 的 Tool/AgentServer Task；Replay 固定复用源 Run 的输入、Workflow Version 和最新不可变 Plan，并保存 lineage；Replan、Manual Intervention、暂停与恢复均要求稳定 `Idempotency-Key`。
 
 创建 Run 时可指定 `parent_run_id` 与可选 `parent_task_id`。Store 在子 Run 创建事务内锁定并校验父 Run 非终态、父 Task 归属，将关联父 Task 切换为 `scheduled`，并在父 Run 写入 Child 创建 Event/Outbox；直接 Child Run 可按稳定创建顺序查询。显式 Child Join 命令以 `all`/`any` 策略计算关联子 Run的终态计数，未满足时保持等待，满足时以父 Run/Task fencing 原子激活父 Task并写入审计 Event/Outbox，形成可恢复的 Fan-out/Fan-in 闭环。
 

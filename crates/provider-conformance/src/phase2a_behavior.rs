@@ -398,6 +398,7 @@ async fn create_task_run(
             &create_context,
             CreateRun {
                 run_id,
+                replay_of_run_id: None,
                 parent_run_id: None,
                 parent_task_id: None,
                 parent_event_id: None,
